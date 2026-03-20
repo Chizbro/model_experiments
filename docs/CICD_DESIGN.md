@@ -66,6 +66,12 @@ Can be a separate job from Rust, or same workflow with multiple jobs.
 
 Once chosen, add a short “Platform” section to this doc (e.g. “We use GitHub and GitHub Actions; see `.github/workflows/`”) and implement the jobs above in that platform’s format. The design (triggers, jobs, steps) remains as above.
 
+### Why this matters for UX
+
+A visible **green CI** on every change is part of **release quality**: it catches drift between [API_OVERVIEW.md](API_OVERVIEW.md) and generated OpenAPI/types, broken Web builds, and migration mistakes before users hit them. **Treat “no CI” as a release risk**, not only a developer convenience.
+
+**After OpenAPI is checked in:** Add a CI step that **fails** when the spec and server handlers (or generated types) diverge—see [API_OVERVIEW.md — Spec delivery](API_OVERVIEW.md). Optional: lint or tests that the CLI and Web client only call documented paths (or `operationId`s).
+
 ---
 
-*See also: [Project Kickoff](PROJECT_KICKOFF.md) (CI checklist), [Decisions](DECISIONS.md) (CI platform & git host recorded when decided).*
+*See also: [Project Kickoff](PROJECT_KICKOFF.md) (CI checklist).*
