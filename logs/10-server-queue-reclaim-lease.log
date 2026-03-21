@@ -1,0 +1,204 @@
+# Task 10 — Server: task queue, pull_task, reclaim, lease — implementation log
+
+This file is a full dump of the assistant session context for plan task 10 (worker task pull, reclaim, lease, complete). It is intentionally verbose (not summarized).
+
+---
+
+## Original plan spec (from plan/10-server-queue-reclaim-lease-complete.md)
+
+# 10 — Server: task queue, pull_task, reclaim, lease
+
+**Status:** complete  
+**Dependencies:** 05, 06, 09
+
+## Objective
+
+Transactional **`POST /workers/tasks/pull`** that: reclaims jobs from **stale** workers, optionally **lease-expires** long-running assigned jobs, respects **`max_job_reclaims`**, then assigns the next **pending** job to the pulling worker (ARCHITECTURE §3b).
+
+## Scope
+
+**In scope**
+
+- **SQL** reclaim step as in architecture doc (single transaction before select pending).
+- `reclaim_count` increment; fail with `[MAX_WORKER_LOSS_RETRIES]` message when over cap.
+- `job_lease_seconds`: if > 0, fail stuck `assigned` jobs with `[JOB_LEASE_EXPIRED]` (phase 2 in architecture—implement if spec treats as required for shippable reclaim story; default 0 off).
+- **Idempotent** pull: worker gets consistent `job_id` assignment; **204** or empty when no work.
+- `task_complete` / failure endpoint from worker (API_OVERVIEW §9)—implement in same task or tightly coupled follow-up in 11 if you split; **do not** leave jobs stuck without complete path.
+
+**Out of scope**
+
+- Building full `task_input` payload for all workflows (11–13).
+
+## Acceptance criteria
+
+- Integration tests: stale worker → job returns pending; reclaim cap → failed job message; lease → expired path (if enabled).
+- All behavior covered by tests to avoid subtle transaction bugs.
+
+---
+
+## Architecture alignment (ARCHITECTURE §3b)
+
+1. **Lease reclaim** (when `job_lease_seconds > 0`): fail `assigned` jobs where `assigned_at + lease < now()`, append `[JOB_LEASE_EXPIRED]` to `error_message`, set `status = failed`, clear `worker_id`, set `completed_at`, clear `assigned_at`.
+2. **Stale worker reclaim**: `UPDATE jobs SET worker_id = NULL, status = 'pending', reclaim_count = reclaim_count + 1, assigned_at = NULL` where `status = 'assigned'` and `worker_id IN (SELECT id FROM workers WHERE last_seen_at < stale_cutoff OR last_seen_at IS NULL)` and `reclaim_count < max_job_reclaims`.
+3. **Over cap**: fail remaining assigned jobs for stale workers with `reclaim_count >= max_job_reclaims`, append `[MAX_WORKER_LOSS_RETRIES]`.
+4. **Pulling worker**: must exist; if `last_seen_at` is NULL or older than stale cutoff → **409** `worker_stale` (heartbeat required). No separate transaction rollback of reclaim steps.
+5. **Idempotent assign**: if worker already has an `assigned` job, return that row (ORDER BY created_at).
+6. **Claim pending**: `FOR UPDATE SKIP LOCKED` on oldest `pending` job, then assign.
+
+---
+
+## Config changes (`crates/server/src/config.rs`)
+
+- Removed **`job_lease_stale_threshold_secs`** and **`JOB_LEASE_STALE_THRESHOLD_SECS`** (misaligned with docs).
+- Added **`job_lease_seconds: u64`** from **`JOB_LEASE_SECONDS`**, default **`0`** (disabled). Matches GETTING_STARTED / ARCHITECTURE.
+
+---
+
+## Migration (`crates/server/migrations/20250320140000_job_completion_columns.sql`)
+
+New nullable columns on `jobs`: `branch`, `commit_ref`, `mr_title`, `mr_description`, `output_snippet`, `assistant_reply`, `sentinel_reached` for `POST /workers/tasks/:id/complete`.
+
+---
+
+## New module (`crates/server/src/worker_tasks.rs`)
+
+- **`pull_task`**: one DB transaction: lease SQL → stale reclaim SQL → stale cap-fail SQL → worker lookup → optional existing assigned row → else CTE `UPDATE ... FROM c` claim. Commit. Then outside transaction: `fetch_identity`, `maybe_refresh_oauth_git_token`, build `PullTaskResponse` (credentials from identity bytes + session `params` overrides; `task_input` from `jobs.task_input` or minimal chat `{prompt}` from params).
+- **`complete_task`**: validate UUID, `status` in {success→`completed`, failed→`failed`}, verify row `assigned`, optional `worker_id` match, `UPDATE` terminal fields, `worker_id = NULL`.
+
+---
+
+## Router (`crates/server/src/lib.rs`)
+
+- Authenticated routes: `POST /workers/tasks/pull`, `POST /workers/tasks/{id}/complete`.
+- **`health_idle`**: if `DATABASE_URL` configured, `COUNT(*) FILTER` pending/assigned on `jobs`; if total > 0 return **503** with `{ idle: false, pending_or_assigned_jobs: N }`; else **200** idle true. If DB query fails, conservative idle true.
+
+---
+
+## `delete_worker` reclaim (`crates/server/src/workers.rs`)
+
+- Reclaim `UPDATE` now sets **`assigned_at = NULL`** when returning job to `pending` (consistent with pull reclaim).
+
+---
+
+## API types (`crates/api-types/src/worker_tasks.rs`)
+
+- `PullTaskRequest`, `PullTaskResponse` (with `#[serde(rename = "ref")] git_ref`), `TaskCredentials`, `TaskCompleteRequest`, `TaskCompleteResponse`. Exported from `api-types` `lib.rs`.
+
+---
+
+## OpenAPI (`crates/server/openapi.yaml`)
+
+- Paths `/workers/tasks/pull`, `/workers/tasks/{id}/complete`.
+- Schemas: PullTaskRequest, PullTaskResponse, TaskCredentials, TaskCompleteRequest, TaskCompleteResponse.
+- operationIds: **`pullTask`**, **`completeWorkerTask`**.
+
+---
+
+## OpenAPI allowlist (`crates/server/tests/openapi_contract.rs`)
+
+- Added `completeWorkerTask`, `pullTask`.
+
+---
+
+## Integration tests (`crates/server/tests/workers_integration.rs`)
+
+All task-queue tests use **`WORKERS_DB_TEST_MUTEX`** with **`reset_worker_tables`** to avoid cross-binary Postgres races with other integration binaries when CI uses `--test-threads=1`.
+
+Tests (require `DATABASE_URL`):
+
+1. **`pull_reclaims_stale_worker_job_then_assigns_to_fresh_worker`** — stale `w-stale` holds assigned job; `w-fresh` pull gets it; `reclaim_count == 1`, `worker_id == w-fresh`.
+2. **`pull_fails_job_when_reclaim_count_at_cap_for_stale_worker`** — `reclaim_count == 3`, max 3; pull fails job with `[MAX_WORKER_LOSS_RETRIES]`; puller gets 204.
+3. **`pull_lease_expires_long_running_assigned_job`** — `job_lease_seconds = 1`, `assigned_at` 10 minutes ago; `[JOB_LEASE_EXPIRED]`; worker still “fresh” (stale threshold 3600s) so lease path is isolated.
+4. **`pull_idempotent_and_complete_releases_job`** — two pulls same `job_id`; complete success; third pull 204.
+5. **`stale_worker_cannot_pull`** — 409 `worker_stale`.
+
+Also: **`workers_endpoints_require_auth`** extended with pull and complete paths.
+
+---
+
+## API keys integration fixes (same session, required for green CI)
+
+- **`auth_accepts_x_api_key_header`**: bootstrap request missing `Content-Type: application/json` caused empty/invalid JSON body for `Json<CreateApiKeyRequest>` — added header.
+- **`bootstrap_and_db_lifecycle_with_database`**: after `DELETE` revokes the only key, listing with that Bearer token must be **401**, not 200 empty list — assertion updated.
+
+---
+
+## CI (`.github/workflows/ci.yml`)
+
+- `cargo test --all-targets -- --test-threads=1` so integration tests sharing one Postgres service do not race across separate test binaries.
+
+---
+
+## Docs
+
+- **`docs/GETTING_STARTED.md`**: removed `JOB_LEASE_STALE_THRESHOLD_SECS` row; clarified `MAX_JOB_RECLAIMS` applies to pull reclaim.
+- **`plan/README.md`**: task 10 link → `*-complete.md`.
+
+---
+
+## CLI (`crates/cli/src/main.rs`)
+
+- **`worker pull --worker-id <id>`** → `POST /workers/tasks/pull` (prints JSON body or `no task (204)`).
+- **`worker complete <task_id> [--status success|failed] [--worker-id] [--error-message]`** → `POST /workers/tasks/:id/complete`.
+
+---
+
+## Web UI (`web/src/App.tsx`)
+
+- Workers section: inputs + buttons for **`POST /workers/tasks/pull`** and **`POST /workers/tasks/:id/complete`** (success only in UI; copy notes that sessions/jobs enqueue is later plans).
+
+---
+
+## Identities (`crates/server/src/identities.rs`)
+
+- **`fetch_identity`** made **`pub(crate)`** for reuse from `worker_tasks`.
+
+---
+
+## Files touched (high level)
+
+- `crates/server/migrations/20250320140000_job_completion_columns.sql` (new)
+- `crates/server/src/worker_tasks.rs` (new)
+- `crates/server/src/lib.rs`
+- `crates/server/src/config.rs`
+- `crates/server/src/workers.rs`
+- `crates/server/src/identities.rs`
+- `crates/server/openapi.yaml`
+- `crates/server/tests/openapi_contract.rs`
+- `crates/server/tests/workers_integration.rs`
+- `crates/server/tests/api_keys_integration.rs`
+- `crates/api-types/src/worker_tasks.rs` (new)
+- `crates/api-types/src/lib.rs`
+- `crates/cli/src/main.rs`
+- `web/src/App.tsx`
+- `docs/GETTING_STARTED.md`
+- `.github/workflows/ci.yml`
+- `plan/10-server-queue-reclaim-lease-complete.md` (renamed from processing; status complete)
+- `plan/README.md`
+
+---
+
+## Commands verified locally
+
+- `cargo build --all-targets`
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `DATABASE_URL=postgres://... cargo test --all-targets -- --test-threads=1`
+- `npm run lint` && `npm run typecheck` in `web/`
+
+---
+
+## Follow-ups (not this task)
+
+- Session create / enqueue jobs (plan 11+), full `task_input` / chat history cap, personas `prompt_context`, `POST /workers/tasks/:id/logs`, session status transitions on complete.
+
+---
+
+## Model “contents window” notes (non-code)
+
+- User rules: no stubs; backend + CLI + UI; update specs; new migrations only; run commands locally.
+- Pending plan files were named `*-pending.md` not `*.pending.md`; next task was 10 by numeric sort.
+- PostgreSQL `FOR UPDATE OF j SKIP LOCKED` used inside CTE for claim.
+- Stale worker definition matches worker list: `last_seen_at IS NULL` is stale.
+- `task_id` and `job_id` in API both set to job UUID string.
+
+End of log.

@@ -81,7 +81,13 @@ The backend **does not** put the machine to sleep; it only reports whether there
 
 ---
 
-## 4b. UI hosting: public URL, client-only API access
+## 4b. Git OAuth (control plane env)
+
+Browser OAuth for **identity `git_token`** ([API_OVERVIEW.md](API_OVERVIEW.md) §4b) is configured entirely on the server. Required variables and overrides are summarized in the repo **[README.md](../README.md)** (section **Git OAuth**). Callback URLs must point at the **API** host (e.g. `http://localhost:3000/auth/github/callback`), not the Vite dev port.
+
+---
+
+## 4c. UI hosting: public URL, client-only API access
 
 When the control plane is reachable only on Tailscale (or your private network), the **Web UI can still be hosted publicly** (e.g. on your always-on host, a CDN, or any public URL). Access to the *application* remains restricted: only clients that can reach the control plane (e.g. browsers on devices that are on Tailscale) can actually use the app, because the browser must call the control plane **REST API** and **SSE** endpoints directly (v1: **SSE** for log tail and session events—no WebSocket for those streams).
 
@@ -270,7 +276,7 @@ Use this before exposing a deployment to others or to the public internet. It re
 | Check | Why |
 |--------|-----|
 | **TLS** | Terminate HTTPS at a reverse proxy or the server; browsers and tunneled setups expect consistent `https://` for OAuth redirects. |
-| **`CORS_ALLOWED_ORIGINS`** | Must include **every UI origin** (scheme + host + port) that will call the API. One missing origin → browser blocks all API calls from that UI. |
+| **`CORS_ALLOWED_ORIGINS`** | Must include **every production UI origin** (scheme + host + port). Dev: **Vite on LAN** (`vite --host`, ports **5173 / 4173 / 5174**) and loopback preview ports are **auto-allowed**; see [TROUBLESHOOTING §1a](TROUBLESHOOTING.md#1a-cors-errors-in-the-browser). |
 | **OAuth callback URLs** | `GITHUB_REDIRECT_URI` / `GITLAB_REDIRECT_URI` must match the OAuth app and the **control plane** public URL (API host), not the UI dev server port. |
 | **`REDIRECT_AFTER_AUTH`** | After Git OAuth, redirect to a real UI URL (e.g. `https://your-ui/settings`) that users can reach. |
 | **`POST /api-keys/bootstrap`** | **Dangerous** if the control plane is reachable by untrusted networks before the first key exists. Prefer: bind to localhost or VPN-only first, create a key, then widen access—or block bootstrap via firewall until configured. See [API_OVERVIEW §4c](API_OVERVIEW.md#4c-rest--api-keys-control-plane-auth). **Web UI:** show bootstrap **only** after a deliberate missing-key probe—not on every load ([CLIENT_EXPERIENCE §7](CLIENT_EXPERIENCE.md#7-first-time-setup-web-ui)). |

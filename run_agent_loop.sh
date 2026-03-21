@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: run_agent_loop.sh ITERATIONS
+# Usage: run_agent_loop.sh ITERATIONS [AGENT]
 #   ITERATIONS - positive integer, number of times to run the agent with the prompt
+#   AGENT      - optional model name for `agent --model` (default: composer-2)
 # Prompt is read from stdin (e.g. cat prompt.txt | ./run_agent_loop.sh 5)
 # Each run: prompt is piped to agent; raw agent (stream-json) is checked for terminate, then
 # passed to agent-pretty-print; pretty-printed output goes to stdout.
@@ -12,16 +13,21 @@ set -euo pipefail
 # Only assistant lines are checked so the same text in the prompt (user message) does not trigger stop.
 
 usage() {
-  echo "Usage: $0 ITERATIONS" >&2
+  echo "Usage: $0 ITERATIONS [AGENT]" >&2
   echo "  ITERATIONS  number of iterations (positive integer)" >&2
+  echo "  AGENT       model for agent --model (default: composer-2)" >&2
   echo "" >&2
   echo "Example: cat prompt.txt | $0 5" >&2
+  echo "Example: cat prompt.txt | $0 5 gpt-4o" >&2
   exit 1
 }
 
-[[ $# -eq 1 ]] || usage
+if [[ $# -lt 1 ]] || [[ $# -gt 2 ]]; then
+  usage
+fi
 
 ITERATIONS="$1"
+AGENT="${2:-composer-2}"
 
 # Validate iterations is a positive integer
 if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
@@ -42,7 +48,7 @@ run_agent() {
   # Tee raw stream-json to a checker (so we match before agent-pretty-print reformats it).
   # Cursor CLI emits NDJSON: agent text is in type=assistant lines (message.content[].text), not as a raw line.
   # Only consider assistant lines so we don't stop on the prompt (user message) which also contains the instruction.
-  printf '%s' "$PROMPT" | agent -f --model auto --print --stream-partial-output --output-format stream-json | \
+  printf '%s' "$PROMPT" | agent -f --model "$AGENT" --print --stream-partial-output --output-format stream-json | \
   tee >(while IFS= read -r line; do
     # Must be an assistant line to avoid matching the prompt
     [[ "$line" != *'"type":"assistant"'* ]] && continue

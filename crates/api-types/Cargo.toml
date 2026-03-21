@@ -1,0 +1,11 @@
+[package]
+name = "api-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared serde types and REST contract shapes for Remote Harness"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

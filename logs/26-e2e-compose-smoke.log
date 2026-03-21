@@ -1,0 +1,45 @@
+# Task 26 follow-up — compose smoke “hang” resolution (2026-03-20)
+
+## Root cause (smoke script)
+
+`scripts/compose-smoke.sh` polled `GET /sessions/:id` until `status == "completed"`.
+
+For `workflow: "chat"`, the server intentionally sets session `status` to **`running`** after a successful job completion so clients can POST follow-up input (`POST /sessions/:id/input`). This is implemented in `crates/server/src/worker_tasks.rs` (`session_status` branch for `workflow == "chat"`).
+
+Integration proof: `crates/server/tests/sessions_integration.rs` — `chat_session_create_pull_complete_and_follow_up_input` asserts `detail2.status == "running"` after `complete` while `jobs[0].status == "completed"`.
+
+The worker was not stuck for 300s waiting on HTTP; the script’s exit condition was never satisfiable for a single-turn chat session.
+
+## Smoke script fix
+
+- Poll until either `status == "completed"` OR (`workflow == "chat"` AND exactly one job AND `jobs[0].status == "completed"`).
+- Timeout message updated to “terminal success” wording.
+
+Verified: `./scripts/compose-smoke.sh` exits 0 (≈5m first run with image build; subsequent runs faster with cache).
+
+## Docs / spec updates
+
+- `docs/GETTING_STARTED.md` §1.9 — clarify chat session may stay `running`.
+- `docs/PRODUCT.md`, `docs/CICD_DESIGN.md` — same.
+- `docs/TROUBLESHOOTING.md` §1e — split “chat running is normal” vs clone hang; renumber list.
+- `docs/API_OVERVIEW.md` — new bullet under Get session: `status` vs `jobs[]` for chat.
+- `plan/26-e2e-compose-smoke-complete.md` — scope + completed notes aligned with job-level success criterion.
+
+## Worker / Docker hardening (still valuable for real file:// on Docker Desktop)
+
+These changes remain in the tree from debugging bind-mount + libgit2 behavior; they do not change the chat session lifecycle but reduce risk of blocking I/O on `file://` remotes:
+
+- `Dockerfile.worker`: install `git`; runtime `ARG RH_DOCKER_SRC_TS` echo before `COPY` binary (cache bust).
+- `Dockerfile`: runtime `ARG RH_DOCKER_SRC_TS` echo (server image).
+- `crates/worker/src/git_ops.rs`:
+  - `file://` clone via `git clone --no-hardlinks` + `Repository::open`.
+  - `checkout_ref` uses git CLI when file-remote semantics apply.
+  - `session_repo_url` threaded into `checkout_ref`, `current_branch_name`, `head_oid_hex`, `working_tree_clean` via `use_file_remote_semantics` so the task’s URL wins over libgit2 `origin` metadata.
+  - For file remotes: branch name + HEAD OID from `.git` files (+ packed-refs fallback); `working_tree_clean` short-circuit when stub agent + `REMOTE_HARNESS_STUB_NO_TOUCH_FILE` (compose smoke).
+  - `GitOpsError::GitCli` for CLI failures.
+- `crates/worker/src/task_execution.rs`: pass `&task.repo_url` into git helpers / `ensure_work_branch`.
+
+## Tests run
+
+- `cargo fmt --all`, `cargo clippy -p worker --all-targets -- -D warnings`, `cargo test --workspace`
+- `./scripts/compose-smoke.sh` — OK

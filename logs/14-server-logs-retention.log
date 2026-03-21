@@ -1,0 +1,132 @@
+=== AGENT SESSION DUMP (task 14-server-logs-retention) ===
+Generated as part of plan task completion. This file is a verbatim-style dump of working context: user instructions, task spec, implementation notes, file touch list, and representative code / command output — not a narrative summary.
+
+--- USER INSTRUCTIONS (latest task message) ---
+Find the next task spec in plan/ that is still marked 'pending.md'. Sort ascending by number.
+If no pending: output JSON terminate line only.
+If pending: rename *.pending.md -> *.processing.md, read, implement, test, build, lint, migrations, rename *.complete.md, dump context to logs/{task}.log (full context, not summarized).
+
+Workspace rules (AGENTS.md): no stubs; backend functionality in CLI + UI; update specs when changing solution; never edit existing migrations (add new only).
+
+--- SELECTED TASK ---
+Next ascending pending: plan/14-server-logs-retention-pending.md (renamed to processing, then completed as 14-server-logs-retention-complete.md).
+
+--- TASK SPEC (14) FULL TEXT ---
+# 14 — Server: log ingest, pagination, delete, retention purge
+**Status:** pending → complete
+**Dependencies:** 11, 05
+Objective: Central log store in Postgres: workers POST batches; GET paginated; DELETE; retention purge except retain_forever.
+In scope: POST worker logs batch; GET /sessions/:id/logs cursor + job_id, level, last; DELETE optional job_id; scheduled purge default 7 days; honor session/job retain_forever.
+Out of scope: SSE (15); dual-write files on server phased — document.
+Acceptance: integration tests ingest → list → delete; purge removes old, preserves retained.
+Testing: cargo test + time-mocked purge.
+
+--- REPOSITORY STATE DISCOVERED ---
+- Existing `logs` table (initial migration): id, session_id, job_id, line_seq, stream, content, ingested_at — lacked API fields level/source/worker_id/occurred_at.
+- No routes for /sessions/:id/logs or /workers/tasks/:id/logs.
+- ServerConfig had log_retention_days_default default 30 in code — task requires 7.
+
+--- NEW MIGRATION (append-only) ---
+File: crates/server/migrations/20250320160000_logs_api_fields.sql
+- ADD log_level TEXT NOT NULL DEFAULT 'info'
+- ADD log_source TEXT NOT NULL DEFAULT 'worker'
+- ADD worker_id TEXT REFERENCES workers(id) ON DELETE SET NULL
+- ADD occurred_at TIMESTAMPTZ — backfill from ingested_at, NOT NULL, DEFAULT now()
+- INDEX logs_session_occurred_id_idx ON (session_id, occurred_at ASC, id ASC)
+- INDEX logs_occurred_at_idx ON (occurred_at)
+
+--- API TYPES ---
+File: crates/api-types/src/logs.rs
+- LogEntry { id, timestamp: DateTime<Utc>, level, session_id, job_id?, worker_id?, source, message }
+- WorkerLogIngestItem { timestamp: String, level, message, source }
+- WorkerLogsAcceptedResponse { accepted: bool }
+- PaginatedLogEntries = Paginated<LogEntry>
+crates/api-types/src/lib.rs: mod logs; pub use logs::*
+
+--- SERVER MODULE crates/server/src/logs.rs (behavior summary) ---
+- list_session_logs: 404 if session missing; optional job_id UUID, level (case-insensitive via LOWER), last=N (1..500) returns N newest then sorted ascending chronologically, next_cursor always None for last mode; else cursor pagination ascending on (occurred_at, id) with opaque base64 cursor rfc3339|bigint id; limit 1..100 default 20.
+- delete_session_logs: optional job_id — if set validates job belongs to session else 404; DELETE scoped rows; else delete all logs for session.
+- post_worker_task_logs: job must exist with status='assigned'; FOR UPDATE; max line_seq per session; inserts content as message body, stream fixed 'stdout'; worker_id from job row; parses RFC3339 timestamps.
+- run_log_retention_purge(pool, retention_days): DELETE logs WHERE occurred_at < now() - N days AND session.retain_forever=false AND (job_id IS NULL OR job.retain_forever=false); uses days.max(1) internally.
+
+--- ROUTER (crates/server/src/lib.rs) ---
+- mod logs; pub use logs::run_log_retention_purge;
+- GET+DELETE /sessions/{id}/logs
+- POST /workers/tasks/{id}/logs
+(all behind API key middleware)
+
+--- MAIN PURGE LOOP (crates/server/src/main.rs) ---
+- If db Some(pool): tokio::spawn interval Duration::from_secs(config.log_purge_interval_secs.max(60)); run_log_retention_purge(&pool, config.log_retention_days_default); log stderr on rows removed or error.
+
+--- CONFIG (crates/server/src/config.rs) ---
+- log_retention_days_default: test 7, from_env default 7 (was 30)
+- log_purge_interval_secs: test 3600, env LOG_PURGE_INTERVAL_SECS default 3600
+
+--- OPENAPI ---
+crates/server/openapi.yaml: paths /sessions/{id}/logs (get listSessionLogs, delete deleteSessionLogs), /workers/tasks/{id}/logs (post postWorkerTaskLogs); schemas WorkerLogIngestItem, WorkerLogsAcceptedResponse, LogEntry, PaginatedLogEntries.
+crates/server/tests/openapi_contract.rs: added deleteSessionLogs, listSessionLogs, postWorkerTaskLogs to EXPECTED_OPERATION_IDS sorted set equality.
+
+--- INTEGRATION TEST ---
+crates/server/tests/sessions_integration.rs — new test logs_ingest_list_delete_last_filter_and_retention_purge (uses SESSIONS_DB_TEST_MUTEX):
+- bootstrap key, seed identity tokens, chat session, register worker w-logs, pull, POST logs batch, complete job, GET list (2 lines asc), GET level=error (1), GET last=1 (newest only), UPDATE occurred_at -30d, run_log_retention_purge(7) assert rows gone
+- Second session retain_forever true: pull, ingest, backdate, purge keeps row; DELETE with job_id clears; complete job
+- Third session: pull, set session retain false, job retain_forever true via SQL, ingest, backdate, purge keeps job-retain row
+
+crates/server/Cargo.toml dev-dependencies: chrono for test timestamps
+
+crates/server/tests/migrations_integration.rs: assert 4 new columns on logs
+
+--- CLI (crates/cli/src/main.rs) ---
+Command::Logs { LogsCommand::List|Delete|Send }
+- logs list <session_id> [--limit] [--cursor] [--job-id] [--level] [--last]
+- logs delete <session_id> [--job-id]
+- logs send <task_id> --json '<array>'
+run_logs() implementation with reqwest blocking.
+
+--- WEB (web/src/App.tsx) ---
+New "Logs" section: optional job_id filter, last N field, GET list, DELETE, POST worker batch with task id + JSON textarea. Reuses sessionIdField and apiKey.
+
+--- DOCS UPDATED ---
+- docs/GETTING_STARTED.md: removed stale 501 /sessions note; logs CLI/UI text; env table LOG_RETENTION_DAYS_DEFAULT=7, LOG_PURGE_INTERVAL_SECS=3600
+- docs/ARCHITECTURE.md §6: implementation note — Postgres central store done; on-server file mirror not implemented; SSE is task 15
+- plan/README.md: task 14 row points to -complete.md
+- plan/14-server-logs-retention-complete.md: status complete + Completed / Notes
+
+--- COMMANDS RUN (representative output) ---
+cargo test -p server logs_ingest → 1 passed
+cargo test --workspace → all passed (29+ tests across crates)
+cargo clippy --workspace --all-targets -- -D warnings → pass after fix redundant_closure in logs.rs (job_id .map(Uuid::parse_str))
+web: npm run typecheck && npm run lint → pass
+
+--- FILES TOUCHED (git-style list) ---
+A  crates/server/migrations/20250320160000_logs_api_fields.sql
+A  crates/api-types/src/logs.rs
+M  crates/api-types/src/lib.rs
+A  crates/server/src/logs.rs
+M  crates/server/src/lib.rs
+M  crates/server/src/main.rs
+M  crates/server/src/config.rs
+M  crates/server/openapi.yaml
+M  crates/server/tests/openapi_contract.rs
+M  crates/server/tests/sessions_integration.rs
+M  crates/server/tests/migrations_integration.rs
+M  crates/server/Cargo.toml
+M  crates/cli/src/main.rs
+M  web/src/App.tsx
+M  docs/GETTING_STARTED.md
+M  docs/ARCHITECTURE.md
+M  plan/README.md
+A  plan/14-server-logs-retention-complete.md
+D  plan/14-server-logs-retention-pending.md (replaced by complete; processing file removed after work)
+A  logs/14-server-logs-retention.log (this file)
+
+--- KEY IMPLEMENTATION DETAIL: PURGE SQL (reference) ---
+DELETE FROM logs l
+USING sessions s
+LEFT JOIN jobs j ON j.id = l.job_id
+WHERE l.session_id = s.id
+  AND l.occurred_at < (now() - ($1::bigint * interval '1 day'))
+  AND s.retain_forever = false
+  AND (l.job_id IS NULL OR j.retain_forever = false)
+
+--- END DUMP ===

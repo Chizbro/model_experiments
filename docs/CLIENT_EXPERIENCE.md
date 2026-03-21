@@ -67,6 +67,7 @@ Contract: [API_OVERVIEW §6–7](API_OVERVIEW.md).
 | **Initial load** | Fetch **full** log history for the context first, then open SSE (see API client contract). |
 | **Disconnect** | Show **“Reconnecting…”** (or non-alarming equivalent); exponential backoff; cap max interval (e.g. 30s). |
 | **Reconnect** | On reconnect, optionally **delta** from last seen timestamp if the API supports it later; v1 may re-open SSE only for new events if history was already loaded (document in UI impl). |
+| **Reconnect (Web UI v1)** | After each successful reconnect following a drop, **re-fetch full log history** (paginate `GET /sessions/:id/logs` to completion), **merge by `id`**, sort by `timestamp` then `id`, then resume `logs/stream`. That fills gaps written while the stream was down **without** duplicating lines already shown. |
 | **Session ended** | Close stream when session/job is **completed** or **failed** per API state, not merely when SSE drops. |
 
 ---
@@ -76,8 +77,9 @@ Contract: [API_OVERVIEW §6–7](API_OVERVIEW.md).
 | Situation | UX |
 |-----------|-----|
 | **Session create rejected** (missing git or agent token) | Direct user to **Settings → Credentials** (or CLI `credentials set`) with one sentence: both Git and agent tokens are required for this workflow. |
+| **Cursor “invalid API key” / token** (job logs or agent stderr) | Clarify: **agent** BYOL key is the **Cursor User API key** from [Cloud Agents](https://cursor.com/dashboard/cloud-agents), not the Remote Harness API key or Git PAT. Suggest re-paste (no extra spaces), then [TROUBLESHOOTING §2e](TROUBLESHOOTING.md#2e-cursor-invalid-api-key--invalid-token-in-job-logs) for network/plan issues. |
 | **Token health** | Use `GET /identities/:id/auth-status` for Git expiry messaging; show “Re-auth” or “Refresh” when `expired_needs_reauth` or `expiring_soon`. |
-| **Git OAuth succeeded** | Redirect to Settings with clear success (`credentials=github_ok` etc.); refresh credential status. |
+| **Git OAuth succeeded** | Redirect to Settings (`REDIRECT_AFTER_AUTH`) with `oauth_success=github` or `oauth_success=gitlab` in the query string; show a clear success message and refresh credential status as needed. |
 | **Provider API errors** (repo list) | Show `502` / provider message as “GitHub/GitLab temporarily unavailable or token invalid” — not a generic crash. |
 
 Agent (Cursor / Claude Code) tokens in v1 are set via UI/CLI/PATCH, not via a separate OAuth spec in the API—see [PRODUCT.md — BYOL](PRODUCT.md#bring-your-own-licence-byol).
@@ -94,6 +96,7 @@ Surface server and worker semantics from [Architecture §3b](ARCHITECTURE.md#3b-
 | **`[MAX_WORKER_LOSS_RETRIES]`** | “This job failed after several worker interruptions. Start a new session or retry from the dashboard.” |
 | **`[JOB_LEASE_EXPIRED]`** | “The job ran too long and was stopped by policy.” |
 | **`[AUTH_EXPIRED]`** (or clone auth) | “Git authentication failed—refresh Git credentials.” |
+| **Agent CLI spawn** (`No such file or directory`, `failed to spawn agent CLI`, or `error_message` naming `agent` / `claude`) | Not a Settings token issue: the **worker** cannot run the CLI. Operator: ensure `agent` / `claude` exists on the worker (`PATH` or `CURSOR_AGENT_PATH` / `CLAUDE_CLI_PATH`). Default **Dockerfile.worker** bundles **Cursor** only; **Claude** needs a custom image or mount. Rebuild the worker if the bundled Cursor package version was retired. See [GETTING_STARTED — Agent CLI in the worker](GETTING_STARTED.md#14-agent-cli-in-the-worker-container). |
 
 Always show **what happened** and **what to do next** in one short paragraph.
 
@@ -108,6 +111,8 @@ Always show **what happened** and **what to do next** in one short paragraph.
 | **Credentials** | After API key works, prompt for BYOL/Git setup if user opens “New session” without tokens. |
 
 See [HOSTING.md — Production checklist](HOSTING.md#13-production-and-first-run-checklist) and [HOSTING.md — Web UI threat model](HOSTING.md#14-web-ui-threat-model-api-key-in-browser).
+
+**Implementation (v1 Web):** The SPA **Settings** page validates **`GET /health`**, persists the control plane URL + API key + optional wake URL in **localStorage**, exposes **BYOL credentials** (**`PATCH /identities/:id`** for **agent** token and optional Git PAT, credential flags via **`GET /identities/:id`**), **GitHub/GitLab OAuth** links (identity id persisted as `rh_git_identity_id`) and **`oauth_success` / `oauth_error`** query feedback after redirect, uses a shared fetch helper for **CORS vs network** messaging ([§3](CLIENT_EXPERIENCE.md#3-browser-network-tls-and-cors)), and shows **first-key bootstrap** only while no key is stored and the server has not returned bootstrap **403** (or after **GET /api-keys** succeeds). **Settings** also surfaces **default log retention** and **chat history cap** from **`GET /health`** (`log_retention_days_default`, `chat_history_max_turns`) and points users to **retain forever** on session detail ([§9](CLIENT_EXPERIENCE.md#9-log-retention-and-purge); [`plan/25-web-ux-spec-checkpoints-complete.md`](../plan/25-web-ux-spec-checkpoints-complete.md)). **Sessions** (`/sessions`, `/sessions/new`, `/sessions/:id`) and **Workers** (`/workers`) implement paginated lists, session create (workflow, repo, identity, `agent_cli`, branch options), session detail with jobs, **prominent `error_message`**, **Git/PR outcome notes** (including missing MR and missing `commit_ref` per [§8](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes)), **`chat_history_truncated` / `chat_history_max_turns` from `GET /sessions/:id`** for long-chat copy ([§12](CLIENT_EXPERIENCE.md#12-long-chat-sessions)), **log history + `logs/stream` SSE** (with reconnect + refetch merge per [§4](CLIENT_EXPERIENCE.md#4-sse-logs-and-session-events)), **`events` SSE attach**, **chat `POST /sessions/:id/input`**, **delete logs** with confirm, and **`PATCH` retain_forever** for session and jobs ([`plan/24-web-logs-sse-attach-complete.md`](../plan/24-web-logs-sse-attach-complete.md)), plus the **heterogeneous worker pool** banner per [§10](CLIENT_EXPERIENCE.md#10-worker-pool-heterogeneity-warnings) ([`plan/23-web-sessions-workers-complete.md`](../plan/23-web-sessions-workers-complete.md)). The **API playground** duplicates the OAuth links for debugging.
 
 ### 7.1 Git “planning” failures (branch/MR text)
 

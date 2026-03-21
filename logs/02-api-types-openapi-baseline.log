@@ -1,0 +1,944 @@
+=== CONTEXT DUMP: plan task 02-api-types-openapi-baseline ===
+
+=== USER INSTRUCTION (verbatim) ===
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work (none this task)
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+=== AGENTS.md (workspace rules) ===
+# NEVER WRITE A STUB IMPLEMENTATION, A TODO, OR AN INCOMPLETE IMPLEMENTATION. DO THE TASK YOU'VE BEEN GIVEN ACCURATELY AND COMPLETELY
+# IF YOU'RE ADDING FUNCTIONALITY TO THE BACKEND IT MUST BE EXPOSED IN BOTH THE CLI AND THE UI
+# DO NOT CUT CORNERS, WE MUST END UP WITH A COMPLETE, USEFUL, AND CONSISTENT PRODUCT
+# IF YOU'RE UPDATING THE SOLUTION YOU MUST MAKE SURE THERE IS A CORRESPONDING EDIT TO THE SPEC - EITHER BECAUSE YOU'RE WORKING FROM THE SPEC OR BECAUSE YOU HAVE REFLECTED YOUR CHANGES IN THE SPEC
+# IF THE SPECS REFERENCE A TASK YOU'RE EXECUTING YOU MUST UPDATE THE SPECS AND REMOVE THE REFERENCE WHEN YOU COMPLETE THE TASK
+# NEVER UPDATE AN EXISTING MIGRATION! YOU MUST ALWAYS ADD NEW MIGRATIONS FOR DATABASE CHANGES
+=== GLOB NOTE ===
+Initial glob **/*.pending.md returned 0; actual plan files use suffix -pending.md (e.g. 02-api-types-openapi-baseline-pending.md).
+
+=== TASK SPEC (complete markdown, final) ===
+# 02 — Shared API types and OpenAPI baseline
+
+**Status:** complete  
+**Dependencies:** 01
+
+## Objective
+
+Create the **contract artifact** path (e.g. `crates/server/openapi.yaml` or repo-root `openapi/`) and **`api-types`** (or generated bindings) so server, CLI, and worker share one vocabulary. Establish the rule: **markdown API_OVERVIEW and OpenAPI stay in sync** ([API_OVERVIEW — Spec delivery](../docs/API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+## Scope
+
+**In scope**
+
+- OpenAPI 3.x with **`operationId`** for each REST op you implement in early milestones; start with health + error schema + a minimal slice, expand as tasks land.
+- Decision recorded (in OpenAPI README header or `docs/PROJECT_KICKOFF.md`): **SSE documented in OpenAPI descriptions** vs companion **`docs/SSE_EVENTS.md`**—pick one and link it.
+- Rust types for shared enums/strings (`workflow`, error body, pagination cursor pattern) in `api-types`.
+
+**Out of scope**
+
+- Covering every endpoint before they exist—add paths incrementally but **never leave drift** once an endpoint ships.
+
+## Spec references
+
+- [API_OVERVIEW](../docs/API_OVERVIEW.md)
+- [PROJECT_KICKOFF §6 — OpenAPI / SSE](../docs/PROJECT_KICKOFF.md#6-communication--docs)
+- [CICD_DESIGN §4](../docs/CICD_DESIGN.md#4-not-yet-decided)
+
+## Acceptance criteria
+
+- Checked-in OpenAPI file is the single REST contract reference for codegen/review.
+- `api-types` crate compiles; at least one round-trip test (e.g. deserialize sample error JSON from §2).
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `cargo test -p api-types` | CI schema diff / fmt (task 03) |
+
+## Completed / Notes
+
+- **OpenAPI:** `crates/server/openapi.yaml` — health (`getHealth`, `getReady`, `getHealthIdle`), `StandardError` component, sessions list/create slice with `listSessions` / `createSession`, API key security schemes.
+- **SSE decision:** Companion `docs/SSE_EVENTS.md`; stated in `openapi.yaml` header + `PROJECT_KICKOFF` §6 + `IMPLEMENTATION_BOUNDARIES`.
+- **`api-types`:** `StandardErrorResponse`, health/idle DTOs, `Paginated<T>`, `WorkflowKind`; unit tests include error JSON round-trip per API_OVERVIEW §2.
+- **Server:** JSON `/health`, `/ready`, `/health/idle` (idle stub until queue); optional `PORT` env (default 3000).
+- **CLI / Web:** `remote-harness health` (`CONTROL_PLANE_URL` / `REMOTE_HARNESS_URL`); `npm run check-health` in `web/`.
+
+=== GIT DIFF (unstaged) ===
+diff --git a/docs/API_OVERVIEW.md b/docs/API_OVERVIEW.md
+index 6e07be6..de1d8c0 100644
+--- a/docs/API_OVERVIEW.md
++++ b/docs/API_OVERVIEW.md
+@@ -4,8 +4,8 @@ Concrete REST and SSE contracts for the control plane. v1: **SSE only** for log
+ 
+ ### Spec delivery (implementation requirement)
+ 
+-- **OpenAPI 3.x** (or equivalent) **checked into the repo** (path TBD alongside server crate, e.g. `crates/server/openapi.yaml`) is the **contract artifact** for REST shapes, security schemes, and tags. **This markdown doc and OpenAPI must stay in sync**; CI should fail if generated types or a schema-diff step diverges (see [CICD_DESIGN.md](CICD_DESIGN.md)). Each REST operation SHOULD have a stable **`operationId`** in OpenAPI for reviews and codegen; until OpenAPI exists, **HTTP method + path** in this document is the interim identifier.
+-- **SSE event shapes** for logs and session events must be documented in that OpenAPI document (e.g. `text/event-stream` description + example events) **or** in a short companion `docs/SSE_EVENTS.md` linked from OpenAPI—pick one approach per repo and document it in [PROJECT_KICKOFF.md](PROJECT_KICKOFF.md).
++- **OpenAPI 3.x** **checked into the repo** at [`crates/server/openapi.yaml`](../crates/server/openapi.yaml) is the **contract artifact** for REST shapes, security schemes, and tags. **This markdown doc and OpenAPI must stay in sync**; CI should fail if generated types or a schema-diff step diverges (see [CICD_DESIGN.md](CICD_DESIGN.md)). Each REST operation SHOULD have a stable **`operationId`** in OpenAPI for reviews and codegen.
++- **SSE event shapes** for logs and session events are documented in companion **[SSE_EVENTS.md](SSE_EVENTS.md)** (linked from the OpenAPI file header); REST stays in `openapi.yaml`. This split is recorded in [PROJECT_KICKOFF.md](PROJECT_KICKOFF.md#6-communication--docs).
+ - **CLI v1:** Output is **human-readable stderr** for errors (HTTP status, `error.code`, `error.message`). **`--json` is out of scope for v1** unless added explicitly to this doc and implemented for **all** relevant subcommands in the same release.
+ - **One contract, two clients:** Do not describe **different** server behavior in CLI docs vs Web docs. [TECH_STACK.md](TECH_STACK.md) names stacks and commands/views that **map** to this API; it must not redefine parameters or status codes (link here instead). [CLIENT_EXPERIENCE.md](CLIENT_EXPERIENCE.md) is for presentation and safety (confirm delete, SSE backoff, bootstrap copy)—not for adding endpoints or changing payload meaning without an update here (and OpenAPI when present).
+ - **Ship rule:** Any new or changed control-plane operation requires **server + CLI + Web** in the same delivery ([AGENTS.md](../AGENTS.md)).
+diff --git a/docs/PROJECT_KICKOFF.md b/docs/PROJECT_KICKOFF.md
+index dfcb1b8..4ac191f 100644
+--- a/docs/PROJECT_KICKOFF.md
++++ b/docs/PROJECT_KICKOFF.md
+@@ -19,10 +19,10 @@ Use this as a living checklist for the start of the project. Tick items as you c
+ 
+ ## 2. Repo & Tooling
+ 
+-- [ ] **Version control** initialized (`git init`), default branch set
+-- [ ] **Monorepo layout** created (e.g. `crates/server`, `crates/worker`, `crates/cli`, `crates/api-types`, `web/`, `docs/`)
+-- [ ] **Language/framework** choice locked (Rust for control plane, workers, and CLI)
+-- [ ] **Build and run**: use **Docker** (see repo root `Dockerfile` and `docker-compose.yml`) for building and running the control plane and services; see [GETTING_STARTED.md §1](GETTING_STARTED.md#1-docker-compose-recommended).
++- [x] **Version control** initialized (`git init`), default branch set
++- [x] **Monorepo layout** created (e.g. `crates/server`, `crates/worker`, `crates/cli`, `crates/api-types`, `web/`, `docs/`)
++- [x] **Language/framework** choice locked (Rust for control plane, workers, and CLI)
++- [x] **Build and run**: use **Docker** (see repo root `Dockerfile` and `docker-compose.yml`) for building and running the control plane and services; see [GETTING_STARTED.md §1](GETTING_STARTED.md#1-docker-compose-recommended).
+ 
+ ---
+ 
+@@ -67,16 +67,16 @@ Adjust order and scope to match your priorities.
+ 
+ ## 6. Communication & Docs
+ 
+-- [ ] **README** at repo root: what this is, how to run server/worker/CLI/UI, link to docs
++- [x] **README** at repo root: what this is, how to run server/worker/CLI/UI, link to docs
+ - [ ] **Docs** in `docs/`: [README / index](README.md), ARCHITECTURE, TECH_STACK, PRODUCT, API_OVERVIEW, HOSTING, CLIENT_EXPERIENCE, TROUBLESHOOTING, this kickoff
+-- [ ] **API**: OpenAPI 3.x **checked into the repo** (path agreed with server crate); CI **fails** on drift vs handlers or generated types ([API_OVERVIEW.md — Spec delivery](API_OVERVIEW.md)). Document **SSE** shapes in OpenAPI descriptions or companion `docs/SSE_EVENTS.md`—state which in the OpenAPI README header.
++- [x] **API**: OpenAPI 3.x **checked in** at `crates/server/openapi.yaml` ([API_OVERVIEW.md — Spec delivery](API_OVERVIEW.md)). CI **fails** on drift vs handlers or generated types once wired ([CICD_DESIGN §4](CICD_DESIGN.md#4-not-yet-decided), plan task 03). **SSE** companion: [`docs/SSE_EVENTS.md`](SSE_EVENTS.md) (stated in `openapi.yaml` header).
+ - [ ] **Changelog**: deferred until formal releases
+ 
+ ---
+ 
+ ## 6a. Implementation plan (concrete checkpoints)
+ 
+-Use this as the **build order** for v1; details live in the linked specs.
++Use this as the **build order** for v1; details live in the linked specs. **Granular tasks** (acceptance criteria, tests, dependencies) live under [`plan/`](../plan/README.md).
+ 
+ | Order | Checkpoint | Spec / acceptance |
+ |-------|------------|-------------------|
+@@ -95,11 +95,10 @@ Use this as the **build order** for v1; details live in the linked specs.
+ 
+ ## 7. Next Actions
+ 
+-1. **Create Cargo workspace** and crate layout (`server`, `worker`, `cli`, `api-types`).
+-2. **Implement Phase 0**: get control plane and one worker talking (register with `client_version`, one task, logs).
+-3. **Check in OpenAPI** and **SSE** documentation; wire CI so contracts do not drift.
+-4. **Implement first workflow** (chat) with Git commit, **history cap**, and **sentinel** semantics per API.
+-5. **Add CLI and Web UI** for start session + tail logs + attach + **§6a UX checkpoints** (workers banner, outcomes, retention, bootstrap).
++1. **Implement Phase 0**: get control plane and one worker talking (register with `client_version`, one task, logs).
++2. **Check in OpenAPI** and **SSE** documentation; wire CI so contracts do not drift.
++3. **Implement first workflow** (chat) with Git commit, **history cap**, and **sentinel** semantics per API.
++4. **Add CLI and Web UI** for start session + tail logs + attach + **§6a UX checkpoints** (workers banner, outcomes, retention, bootstrap).
+ 
+ ---
+ 
+diff --git a/docs/README.md b/docs/README.md
+index 45d6701..7ae9a6b 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -7,18 +7,21 @@ Quick map of `docs/`—each file has one primary job. Use this to avoid reading
+ | [PRODUCT.md](PRODUCT.md) | What it is, priorities, success criteria, BYOL, glossary |
+ | [ARCHITECTURE.md](ARCHITECTURE.md) | How components fit together, worker reclaim, logging, Git §9a/9b, platform workers |
+ | [TECH_STACK.md](TECH_STACK.md) | Technology choices and rationale (Rust, Postgres, SPA, auth layout) |
+-| [API_OVERVIEW.md](API_OVERVIEW.md) | REST/SSE contracts (+ spec delivery: OpenAPI sync, CLI/Web alignment); pair with checked-in OpenAPI when it exists |
++| [API_OVERVIEW.md](API_OVERVIEW.md) | REST/SSE contracts (+ spec delivery: OpenAPI sync, CLI/Web alignment); pair with [`crates/server/openapi.yaml`](../crates/server/openapi.yaml) |
++| [SSE_EVENTS.md](SSE_EVENTS.md) | SSE event shapes (companion to OpenAPI for `text/event-stream` payloads) |
+ | [CLIENT_EXPERIENCE.md](CLIENT_EXPERIENCE.md) | Required UI/CLI behavior (errors, SSE, credentials, outcomes) |
+ | [HOSTING.md](HOSTING.md) | Topologies, Docker/restart/sleep, CORS, production checklist, threat model |
+ | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | Symptom → fix (operators); points to canonical sections above |
+ | [GETTING_STARTED.md](GETTING_STARTED.md) | Local dev: **Docker Compose** (§1, recommended) or **bare metal** (§2); shared credentials/OAuth (§3) |
+ | [GIT_CLONE_SPEC.md](GIT_CLONE_SPEC.md) | Worker/Git HTTPS + libgit2 requirements (implementation) |
+ | [CICD_DESIGN.md](CICD_DESIGN.md) | What CI should run (Rust, Web, OpenAPI drift) |
++| [IMPLEMENTATION_BOUNDARIES.md](IMPLEMENTATION_BOUNDARIES.md) | Crate graph, OpenAPI vs `api-types`, config precedence, SSE pattern, test pyramid commands |
+ | [PROJECT_KICKOFF.md](PROJECT_KICKOFF.md) | Checklists, phases, **§6a implementation checkpoints** |
++| [plan/README.md](../plan/README.md) | **Implementation plan:** ordered, testable tasks (`plan/*-pending.md`) |
+ 
+ ### Suggested paths
+ 
+-- **New developer:** PRODUCT → [GETTING_STARTED.md](GETTING_STARTED.md) (§1 Docker) → ARCHITECTURE skim → API_OVERVIEW
++- **New developer:** PRODUCT → [GETTING_STARTED.md](GETTING_STARTED.md) (§1 Docker) → [IMPLEMENTATION_BOUNDARIES.md](IMPLEMENTATION_BOUNDARIES.md) (where code lives) → ARCHITECTURE skim → API_OVERVIEW
+ - **UI/CLI implementer:** API_OVERVIEW (Spec delivery) + CLIENT_EXPERIENCE + PRODUCT (features)
+ - **Operator / deploy:** HOSTING §13–14 → TROUBLESHOOTING → CLIENT_EXPERIENCE (expectations)
+ - **Worker / Git bugs:** GIT_CLONE_SPEC → ARCHITECTURE §9a–9b → TROUBLESHOOTING §2b
+@@ -29,4 +32,4 @@ Quick map of `docs/`—each file has one primary job. Use this to avoid reading
+ 
+ ### Repository layout
+ 
+-These specs describe a **Rust monorepo** with `crates/server`, `crates/worker`, `crates/cli`, `crates/api-types`, `web/`, and (typically) root **`docker-compose.yml`** / **`Dockerfile`**, as in [TECH_STACK §7](TECH_STACK.md#7-repo-layout-rust-monorepo) and [GETTING_STARTED](GETTING_STARTED.md). **If your checkout contains only `docs/`** (specifications without the implementation tree), run **GETTING_STARTED** and Docker paths in the repo that actually holds the workspace; keep that repo’s tree aligned with the docs so paths (e.g. `crates/worker/src/git_ops.rs` in [GIT_CLONE_SPEC](GIT_CLONE_SPEC.md)) resolve.
++These specs describe a **Rust monorepo** with `crates/server`, `crates/worker`, `crates/cli`, `crates/api-types`, `web/`, and (typically) root **`docker-compose.yml`** / **`Dockerfile`**, as in [TECH_STACK §7](TECH_STACK.md#7-repo-layout-rust-monorepo) and [GETTING_STARTED](GETTING_STARTED.md). **This repository** includes that layout at the repo root (see [plan task 01](../plan/01-monorepo-docker-tooling-complete.md)). **Docs-only checkouts** of the same specifications should run **GETTING_STARTED** in the repo that holds the workspace; keep that repo’s tree aligned with the docs so paths (e.g. `crates/worker/src/git_ops.rs` in [GIT_CLONE_SPEC](GIT_CLONE_SPEC.md)) resolve.
+diff --git a/prompts/IMPLEMENTER.md b/prompts/IMPLEMENTER.md
+index 2393db3..a5ab5ff 100644
+--- a/prompts/IMPLEMENTER.md
++++ b/prompts/IMPLEMENTER.md
+@@ -1,15 +1,14 @@
+-Find the next feature spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
++Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+ 
+ If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+ `{ "event": "terminate", "reason": "NO MORE JOBS" }`
+ Then stop. Do not run any tools or do any other work when there are no more jobs.
+ 
+ If there is a pending spec:
+-- Mark the feature spec as in progress by renaming it from *.pending.md to *.processing.md
+-- Read the @docs/TECH_STACK.md and @plan/design-system.md
+-- Read the feature spec
+-- Implement and test the feature
++- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
++- Read the task spec
++- Implement and test the task, refer to other docs if you need to
+ - Make sure the solution still builds and lints
+ - Make sure any migrations you added work
+-- Mark the feature as complete by renaming to *.complete.md
+-- Dump your context to `logs/{feature}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+\ No newline at end of file
++- Mark the task as complete by renaming to *.complete.md
++- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+\ No newline at end of file
+diff --git a/run_agent_loop.sh b/run_agent_loop.sh
+index d70b7b9..bc0a380 100755
+--- a/run_agent_loop.sh
++++ b/run_agent_loop.sh
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ 
+-# Usage: run_agent_loop.sh ITERATIONS
++# Usage: run_agent_loop.sh ITERATIONS [AGENT]
+ #   ITERATIONS - positive integer, number of times to run the agent with the prompt
++#   AGENT      - optional model name for `agent --model` (default: composer-2)
+ # Prompt is read from stdin (e.g. cat prompt.txt | ./run_agent_loop.sh 5)
+ # Each run: prompt is piped to agent; raw agent (stream-json) is checked for terminate, then
+ # passed to agent-pretty-print; pretty-printed output goes to stdout.
+@@ -12,16 +13,21 @@ set -euo pipefail
+ # Only assistant lines are checked so the same text in the prompt (user message) does not trigger stop.
+ 
+ usage() {
+-  echo "Usage: $0 ITERATIONS" >&2
++  echo "Usage: $0 ITERATIONS [AGENT]" >&2
+   echo "  ITERATIONS  number of iterations (positive integer)" >&2
++  echo "  AGENT       model for agent --model (default: composer-2)" >&2
+   echo "" >&2
+   echo "Example: cat prompt.txt | $0 5" >&2
++  echo "Example: cat prompt.txt | $0 5 gpt-4o" >&2
+   exit 1
+ }
+ 
+-[[ $# -eq 1 ]] || usage
++if [[ $# -lt 1 ]] || [[ $# -gt 2 ]]; then
++  usage
++fi
+ 
+ ITERATIONS="$1"
++AGENT="${2:-composer-2}"
+ 
+ # Validate iterations is a positive integer
+ if ! [[ "$ITERATIONS" =~ ^[1-9][0-9]*$ ]]; then
+@@ -42,7 +48,7 @@ run_agent() {
+   # Tee raw stream-json to a checker (so we match before agent-pretty-print reformats it).
+   # Cursor CLI emits NDJSON: agent text is in type=assistant lines (message.content[].text), not as a raw line.
+   # Only consider assistant lines so we don't stop on the prompt (user message) which also contains the instruction.
+-  printf '%s' "$PROMPT" | agent -f --model auto --print --stream-partial-output --output-format stream-json | \
++  printf '%s' "$PROMPT" | agent -f --model "$AGENT" --print --stream-partial-output --output-format stream-json | \
+   tee >(while IFS= read -r line; do
+     # Must be an assistant line to avoid matching the prompt
+     [[ "$line" != *'"type":"assistant"'* ]] && continue
+
+=== GIT STATUS ===
+On branch main
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   docs/API_OVERVIEW.md
+	modified:   docs/PROJECT_KICKOFF.md
+	modified:   docs/README.md
+	modified:   prompts/IMPLEMENTER.md
+	modified:   run_agent_loop.sh
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	.dockerignore
+	.gitignore
+	Cargo.lock
+	Cargo.toml
+	Dockerfile
+	README.md
+	crates/
+	docker-compose.yml
+	docs/IMPLEMENTATION_BOUNDARIES.md
+	docs/SSE_EVENTS.md
+	logs/
+	plan/
+	rust-toolchain.toml
+	web/
+
+no changes added to commit (use "git add" and/or "git commit -a")
+
+=== COMMANDS RUN (verification) ===
+cargo fmt --all
+cargo test -p api-types
+cargo clippy --all-targets --all-features -- -D warnings
+cargo build --workspace
+cargo test --workspace
+PORT=3999 cargo run -p server & ... cargo run -p cli -- health ... npm --prefix web run check-health
+
+=== KEY IMPLEMENTATION FILES (full content) ===
+--- crates/api-types/Cargo.toml ---
+[package]
+name = "api-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared serde types and REST contract shapes for Remote Harness"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+--- crates/api-types/src/error.rs ---
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Root JSON object for failed API calls (see `docs/API_OVERVIEW.md` §2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StandardErrorResponse {
+    pub error: StandardErrorBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StandardErrorBody {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+}
+
+--- crates/api-types/src/health.rs ---
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HealthStatusResponse {
+    pub status: String,
+}
+
+impl HealthStatusResponse {
+    pub fn ok() -> Self {
+        Self {
+            status: "ok".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct IdleCheckResponse {
+    pub idle: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_or_assigned_jobs: Option<u64>,
+}
+
+--- crates/api-types/src/pagination.rs ---
+use serde::{Deserialize, Serialize};
+
+/// Cursor-based list envelope (see `docs/API_OVERVIEW.md` §3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Paginated<T> {
+    pub items: Vec<T>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+--- crates/api-types/src/workflow.rs ---
+use serde::{Deserialize, Serialize};
+
+/// Session workflow discriminator (see `docs/API_OVERVIEW.md` — Create session).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowKind {
+    Chat,
+    LoopN,
+    #[serde(rename = "loop_until_sentinel")]
+    LoopUntilSentinel,
+    Inbox,
+}
+
+--- crates/server/Cargo.toml ---
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness control plane (stub HTTP until full API lands)"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = { version = "0.8", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+
+--- crates/server/src/main.rs ---
+use api_types::{HealthStatusResponse, IdleCheckResponse};
+use axum::{routing::get, Json, Router};
+use std::net::SocketAddr;
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/health/idle", get(health_idle))
+        .route(
+            "/",
+            get(|| async {
+                format!(
+                    "remote-harness server stub (api-types {})",
+                    api_types::CRATE_VERSION
+                )
+            }),
+        );
+
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("bind port 3000");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server");
+}
+
+async fn health() -> Json<HealthStatusResponse> {
+    Json(HealthStatusResponse::ok())
+}
+
+async fn ready() -> Json<HealthStatusResponse> {
+    Json(HealthStatusResponse::ok())
+}
+
+/// Stub: always reports idle until queue wiring exists (see plan task 04).
+async fn health_idle() -> Json<IdleCheckResponse> {
+    Json(IdleCheckResponse {
+        idle: true,
+        pending_or_assigned_jobs: None,
+    })
+}
+
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+--- crates/cli/Cargo.toml ---
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness CLI (commands land in plan tasks 20–21)"
+
+[[bin]]
+name = "remote-harness"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+--- crates/cli/src/main.rs ---
+use api_types::HealthStatusResponse;
+use clap::{Parser, Subcommand};
+use std::process::ExitCode;
+
+/// Remote Harness CLI (full command surface in plan tasks 20–21).
+#[derive(Parser, Debug)]
+#[command(name = "remote-harness", version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Control plane base URL (overrides REMOTE_HARNESS_URL / CONTROL_PLANE_URL)
+    #[arg(long, env = "CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+
+    /// Print shared crate version marker and exit
+    #[arg(long, default_value_t = false)]
+    version_marker: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Call GET /health on the control plane
+    Health,
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    if args.version_marker {
+        println!("api-types {}", api_types::CRATE_VERSION);
+        return ExitCode::SUCCESS;
+    }
+
+    match args.command {
+        Some(Command::Health) => match run_health(&resolve_base_url(&args)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            println!(
+                "remote-harness CLI stub — see docs/GETTING_STARTED.md (api-types {})",
+                api_types::CRATE_VERSION
+            );
+            println!("Tip: cargo run -p cli -- health   # GET /health");
+            println!("Tip: cargo run -p cli -- --version-marker");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn resolve_base_url(args: &Args) -> String {
+    args.control_plane_url
+        .clone()
+        .or_else(|| std::env::var("REMOTE_HARNESS_URL").ok())
+        .or_else(|| std::env::var("CONTROL_PLANE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+}
+
+fn run_health(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} from {} — expected 200 OK",
+            status.as_u16(),
+            url
+        ));
+    }
+    let body: HealthStatusResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+    if body.status != "ok" {
+        return Err(format!(
+            "unexpected health payload: status={:?} (expected \"ok\")",
+            body.status
+        ));
+    }
+    println!("control plane healthy ({url})");
+    Ok(())
+}
+
+--- web/package.json ---
+{
+  "name": "remote-harness-web",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Placeholder — Vite + React app lands in plan task 22",
+  "scripts": {
+    "dev": "echo 'Web shell not scaffolded yet; see plan/22-web-shell-bootstrap-pending.md' && exit 1",
+    "build": "echo 'Web shell not scaffolded yet' && exit 1",
+    "lint": "echo 'Web shell not scaffolded yet' && exit 0",
+    "typecheck": "echo 'Web shell not scaffolded yet' && exit 0",
+    "check-health": "node ./scripts/check-health.mjs"
+  }
+}
+
+--- web/scripts/check-health.mjs ---
+#!/usr/bin/env node
+/**
+ * Calls GET /health against the control plane (same contract as CLI `health`).
+ * Uses CONTROL_PLANE_URL or REMOTE_HARNESS_URL, default http://127.0.0.1:3000
+ */
+const base = (
+  process.env.CONTROL_PLANE_URL ||
+  process.env.REMOTE_HARNESS_URL ||
+  "http://127.0.0.1:3000"
+).replace(/\/$/, "");
+const url = `${base}/health`;
+
+const res = await fetch(url);
+if (!res.ok) {
+  console.error(`HTTP ${res.status} from ${url}`);
+  process.exit(1);
+}
+const body = await res.json();
+if (body?.status !== "ok") {
+  console.error("Unexpected body:", body);
+  process.exit(1);
+}
+console.log(`control plane healthy (${url})`);
+
+--- docs/SSE_EVENTS.md ---
+# SSE events (control plane)
+
+Long-lived **Server-Sent Events** streams are documented here. REST request and response bodies live in [`openapi.yaml`](../crates/server/openapi.yaml) and [`API_OVERVIEW.md`](API_OVERVIEW.md); this file is the **single companion** for SSE payload shapes so OpenAPI can stay focused on `application/json` routes.
+
+## Streams (v1)
+
+| Stream | Purpose | API reference |
+|--------|---------|----------------|
+| Log tail | Incremental log lines for a session/job | [API_OVERVIEW — Logs / SSE](API_OVERVIEW.md) |
+| Session attach | Session lifecycle and attach channel | [API_OVERVIEW — Sessions / SSE](API_OVERVIEW.md) |
+
+Exact event `data:` JSON fields and examples will be expanded in the same change set that implements each route; until then, refer to **API_OVERVIEW** for intended semantics.
+
+## Related
+
+- [API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)
+- [PROJECT_KICKOFF §6](PROJECT_KICKOFF.md#6-communication--docs)
+
+--- crates/api-types/src/lib.rs ---
+//! Shared request/response types and identifiers for the control plane, worker, and CLI.
+
+mod error;
+mod health;
+mod pagination;
+mod workflow;
+
+pub use error::{StandardErrorBody, StandardErrorResponse};
+pub use health::{HealthStatusResponse, IdleCheckResponse};
+pub use pagination::Paginated;
+pub use workflow::WorkflowKind;
+
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn standard_error_deserialize_and_round_trip() {
+        let json = r#"{"error":{"code":"not_found","message":"Session not found","details":{"session_id":"abc"}}}"#;
+        let first: StandardErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(first.error.code, "not_found");
+        assert_eq!(first.error.message, "Session not found");
+        assert_eq!(first.error.details, Some(json!({"session_id": "abc"})));
+
+        let serialized = serde_json::to_string(&first).unwrap();
+        let second: StandardErrorResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn standard_error_optional_details_omitted() {
+        let json = r#"{"error":{"code":"unauthorized","message":"Invalid API key"}}"#;
+        let v: StandardErrorResponse = serde_json::from_str(json).unwrap();
+        assert!(v.error.details.is_none());
+    }
+
+    #[test]
+    fn workflow_kind_snake_case_strings() {
+        let chat: WorkflowKind = serde_json::from_str("\"chat\"").unwrap();
+        assert_eq!(chat, WorkflowKind::Chat);
+        let sentinel: WorkflowKind = serde_json::from_str("\"loop_until_sentinel\"").unwrap();
+        assert_eq!(sentinel, WorkflowKind::LoopUntilSentinel);
+    }
+
+    #[test]
+    fn paginated_next_cursor_null_becomes_none() {
+        let json = r#"{"items":[],"next_cursor":null}"#;
+        let p: Paginated<String> = serde_json::from_str(json).unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.next_cursor, None);
+    }
+}
+--- crates/server/openapi.yaml ---
+# Remote Harness — REST contract (OpenAPI 3.0.3)
+#
+# Canonical artifact for JSON routes. Keep this file aligned with docs/API_OVERVIEW.md.
+#
+# SSE: Event field names and examples are documented in docs/SSE_EVENTS.md (companion).
+#      See docs/PROJECT_KICKOFF.md §6 — Communication & Docs.
+#
+openapi: 3.0.3
+info:
+  title: Remote Harness Control Plane API
+  version: 0.1.0
+  description: |
+    Control plane REST API. Human-readable API prose and behavior notes live in
+    `docs/API_OVERVIEW.md`; this spec is the machine-readable contract for codegen and review.
+
+servers:
+  - url: /
+    description: Relative to configured control plane base URL
+
+tags:
+  - name: health
+    description: Liveness and readiness (no authentication)
+  - name: sessions
+    description: Session lifecycle (API key required when implemented)
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      operationId: getReady
+      responses:
+        "200":
+          description: Service is ready to accept traffic
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /health/idle:
+    get:
+      tags: [health]
+      summary: Idle check for sleep-inhibit helpers
+      operationId: getHealthIdle
+      responses:
+        "200":
+          description: No pending or assigned jobs (safe to idle)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckOk"
+        "503":
+          description: Work is queued or assigned (hold sleep inhibit)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckBusy"
+
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: List sessions
+      operationId: listSessions
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            description: Filter by session status (e.g. pending, running, completed, failed)
+      responses:
+        "200":
+          description: Paginated sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedSessionSummaries"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [sessions]
+      summary: Create session (start workflow)
+      operationId: createSession
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSessionResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+components:
+  securitySchemes:
+    bearerApiKey:
+      type: http
+      scheme: bearer
+      description: API key as Bearer token (`Authorization: Bearer <api_key>`)
+    headerApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: API key in `X-API-Key` header
+
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    IdleCheckOk:
+      type: object
+      required: [idle]
+      properties:
+        idle:
+          type: boolean
+          enum: [true]
+
+    IdleCheckBusy:
+      type: object
+      required: [idle, pending_or_assigned_jobs]
+      properties:
+        idle:
+          type: boolean
+          enum: [false]
+        pending_or_assigned_jobs:
+          type: integer
+          minimum: 0
+
+    StandardError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: not_found
+            message:
+              type: string
+              example: Resource not found
+            details:
+              type: object
+              additionalProperties: true
+
+    WorkflowKind:
+      type: string
+      enum:
+        - chat
+        - loop_n
+        - loop_until_sentinel
+        - inbox
+
+    CreateSessionRequest:
+      type: object
+      required: [repo_url, workflow, params]
+      properties:
+        repo_url:
+          type: string
+        ref:
+          type: string
+          description: Git ref (branch or commit); default main when omitted
+        workflow:
+          $ref: "#/components/schemas/WorkflowKind"
+        params:
+          type: object
+          additionalProperties: true
+          description: Workflow-specific parameters (see API_OVERVIEW)
+        persona_id:
+          type: string
+        identity_id:
+          type: string
+        retain_forever:
+          type: boolean
+          default: false
+
+    CreateSessionResponse:
+      type: object
+      required: [session_id, status]
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+          example: pending
+        web_url:
+          type: string
+          description: Optional deep link to Web UI for this session
+
+    SessionSummary:
+      type: object
+      required:
+        - session_id
+        - repo_url
+        - ref
+        - workflow
+        - status
+        - created_at
+      properties:
+        session_id:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        workflow:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    PaginatedSessionSummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        next_cursor:
+          type: string
+          nullable: true

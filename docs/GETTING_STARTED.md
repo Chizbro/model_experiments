@@ -53,7 +53,7 @@ One shared **API key** for server, worker, and CLI/UI. Default: `dev-key-change-
 export API_KEY="your-secret-key"
 ```
 
-Run `docker compose` in the same shell, or put `API_KEY=...` in a **`.env`** file in the repo root.
+Run `docker compose` in the same shell, or put `API_KEY=...` in a **`.env`** file in the repo root (see [`.env.example`](../.env.example)).
 
 ### 1.2 Start everything
 
@@ -78,6 +78,8 @@ docker compose up -d --build
 
 See [TROUBLESHOOTING.md §1b](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migration-checksum-errors).
 
+**SQLx offline / `cargo sqlx prepare`:** Migrations use `sqlx::migrate!`, which **embeds** the files under `crates/server/migrations` at **compile time**—no live database is required to build. The `cargo sqlx prepare` flow and `.sqlx/` metadata are for **compile-time checked queries** (`query!`, etc.), not for the migration macro; see [TROUBLESHOOTING.md §1b](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migration-checksum-errors) if you add those macros later.
+
 **Sleep-inhibit:** From the **host**, poll `GET http://localhost:3000/health/idle` (or your published port). **200** = OK to sleep; **503** = busy. See [HOSTING.md §4a](HOSTING.md#4a-idle-sleep--sleep-inhibit).
 
 #### Worker and backend lifecycle
@@ -94,12 +96,12 @@ See [TROUBLESHOOTING.md §1b](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migrat
 
 ### 1.4 Agent CLI in the worker container
 
-The worker image includes the **Cursor Agent CLI**. Sessions with `agent_cli: "cursor"` work without extra setup (`/root/.local/bin/agent`).
+The **default** `Dockerfile.worker` image installs **Cursor’s `agent`** on `PATH` (`/usr/local/bin/agent` → `/opt/cursor-agent/cursor-agent`) by downloading the official Linux package at image build time. **`CURSOR_AGENT_VERSION`** (build arg / env for Compose) pins the package version; if the download 404s, bump it to match the URL in `curl -fsSL https://cursor.com/install | grep DOWNLOAD_URL`.
 
-- **Override (Linux host):** Mount the binary and set e.g. `CURSOR_AGENT_PATH`.
-- **macOS host:** Do not mount the Mac `agent` binary into the Linux worker — use the image CLI or run the worker **bare metal** on the Mac.
-
-For **Claude Code**, set `CLAUDE_CLI_PATH` inside the image or mount a Linux `claude` binary.
+- **Claude Code** is **not** bundled: install `claude` in a derived image, mount a **Linux** binary, or set `CLAUDE_CLI_PATH` / `REMOTE_HARNESS_CLAUDE_BIN`.
+- **Override Cursor:** set `CURSOR_AGENT_PATH` or `REMOTE_HARNESS_CURSOR_AGENT_BIN`, or mount a different Linux `agent`.
+- **macOS host:** Do not bind-mount the Mac `agent` into a Linux worker — the image already ships a Linux build, or run the worker **natively** on the Mac.
+- **Smoke / CI:** use `docker-compose.smoke.yml` (or `REMOTE_HARNESS_STUB_AGENT=1`) to skip the real CLI; see [§1.9](#19-automated-compose-smoke-tier-1--tier-2).
 
 ### 1.5 CLI from your laptop (Docker)
 
@@ -107,24 +109,36 @@ For **Claude Code**, set `CLAUDE_CLI_PATH` inside the image or mount a Linux `cl
 export REMOTE_HARNESS_URL="http://localhost:3000"
 export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
 cargo run -p cli -- health
-cargo run -p cli -- session list
-cargo run -p cli -- logs tail --session-id <id>
-cargo run -p cli -- attach <session-id>
+cargo run -p cli -- ready
+# API keys (see API_OVERVIEW §4c): create/list/revoke need a key; bootstrap is unauthenticated only when no keys exist and the server has no API_KEY/API_KEYS env keys.
+cargo run -p cli -- api-key list
+cargo run -p cli -- api-key create --label ci
+# cargo run -p cli -- api-key bootstrap   # first-run only; prints operator warning
+# BYOL identities (API_OVERVIEW §4a): credentials status, auth health, repo picker, token PATCH
+cargo run -p cli -- identity get default
+cargo run -p cli -- identity auth-status default
+cargo run -p cli -- identity repos default --provider github
+# RH_AGENT_TOKEN=… RH_GIT_TOKEN=… cargo run -p cli -- identity patch default
 ```
 
-Or `~/.config/remote-harness/config.yaml` with `control_plane_url` and `api_key`.
+Or `~/.config/remote-harness/config.yaml` with `control_plane_url` and `api_key`. Run `cargo run -p cli -- config show` to see resolved values and which source won (CLI → env → file).
+
+The Web UI **Identities (BYOL)** section calls the same endpoints once you paste an API key.
+
+Sessions and logs use the same API from CLI and Web (`session …`, **Logs** section in the dev UI). The server exposes SSE log tail and session events (`docs/SSE_EVENTS.md`); CLI/Web streaming UX is covered in later plan tasks.
 
 ### 1.6 Logs (Docker)
 
-**UI:** Session → log panel (history then stream). **CLI:** `logs tail` / `attach`. Logs live in Postgres on the server; browser and CLI call the same API URL.
+**UI:** Session → log panel (history then stream). **CLI:** `logs list`, `logs delete`, `logs send` (worker batch). Logs are stored in Postgres on the server; scheduled purge honors `retain_forever` on sessions and jobs (`LOG_RETENTION_DAYS_DEFAULT`, default **7** days; `LOG_PURGE_INTERVAL_SECS`).
 
 ### 1.7 What this setup uses
 
 | Piece | Purpose |
 |-------|--------|
-| **docker-compose.yml** | `postgres`, `server`, `worker`, `web`; server/worker share one image; Postgres healthcheck before server. |
-| **Dockerfile** (repo root) | Builds server + worker; worker image includes Cursor CLI. |
-| **web/Dockerfile** | Vite build + nginx; SPA `try_files` → `index.html`. |
+| **docker-compose.yml** | `postgres`, `server`, `worker`, `web`; Postgres healthcheck before server; see [§1.9](#19-automated-compose-smoke-tier-1--tier-2) for smoke overlay. |
+| **Dockerfile** (repo root) | Builds **server** binary into the control-plane image. |
+| **Dockerfile.worker** | Builds **worker**, **`git`**, and **Cursor `agent`** (pinned `CURSOR_AGENT_VERSION`); **no** Claude Code — see [§1.4](#14-agent-cli-in-the-worker-container). |
+| **web/Dockerfile** | Vite production build + nginx; SPA `try_files` → `index.html`. |
 | **CORS** | UI origin `http://localhost:5173` (and often `127.0.0.1:5173`) must be allowed; see `CORS_ALLOWED_ORIGINS` and [TROUBLESHOOTING.md §1a](TROUBLESHOOTING.md#1a-cors-errors-in-the-browser). |
 
 ### 1.8 Optional: API key without exporting env
@@ -134,6 +148,24 @@ API_KEY=my-secret docker compose up --build
 ```
 
 Use `my-secret` in UI Settings and `REMOTE_HARNESS_API_KEY`.
+
+### 1.9 Automated Compose smoke (tier 1 / tier 2)
+
+**Tier 1 (default, reproducible, CI-style):** From the repo root, run:
+
+```bash
+./scripts/compose-smoke.sh
+```
+
+This brings up **Postgres, server, worker, and the static web image** (see root `docker-compose.yml` + `docker-compose.smoke.yml`), enables the worker’s **`REMOTE_HARNESS_STUB_AGENT`** stub, bind-mounts a throwaway **bare Git repo** at `file:///e2e/repo.git`, patches the **default identity** with fixture tokens, creates one **chat** session, waits until the **sole job is `completed`** (the session may stay **`running`**—that is normal for chat so follow-up input is allowed), and checks that **at least one log line** is returned from `GET /sessions/:id/logs`. The stack is torn down afterward unless you set **`RH_SMOKE_KEEP_STACK=1`**.
+
+**Bootstrap path (first-run simulation):** `RH_SMOKE_BOOTSTRAP=1 ./scripts/compose-smoke.sh` — server starts with **no** `API_KEY` env so `POST /api-keys/bootstrap` succeeds, then the worker starts with the issued key.
+
+**Tier 2 (real agent):** Run Compose **without** `docker-compose.smoke.yml`, set real **BYOL** credentials ([§3](#3-credentials-and-oauth-byol)), and use an **`https://` or `http://` remote** the worker can clone. Do **not** set `REMOTE_HARNESS_STUB_AGENT` on the worker.
+
+**Assumptions (green path time):** Roughly **10–25 minutes** first time (Rust + web image builds), **2–5 minutes** when images are warm; requires **Docker**, **git**, **curl**, and **python3** on the host.
+
+**Rust image cache:** The smoke script sets **`RH_DOCKER_SRC_TS`** (timestamp) so Compose rebuilds the `server`/`worker` binaries instead of reusing a stale cached `RUN cargo build` layer. For manual Compose runs, export a new value when you change Rust code, or use `RH_DOCKER_SRC_TS=0` only when you intentionally want layer reuse.
 
 ---
 
@@ -180,11 +212,19 @@ Optional server/worker tuning:
 
 | Variable | Component | Default |
 |----------|-----------|--------|
-| `HOST` | server | `0.0.0.0` |
+| `BIND_HOST` or `HOST` | server | `0.0.0.0` |
 | `PORT` | server | `3000` |
-| `WORKER_STALE_SECONDS` | server | `90` |
-| `MAX_JOB_RECLAIMS` | server | `3` |
+| `DATABASE_URL` | server | unset (no DB / readiness skips ping); use `?sslmode=disable` with local Postgres when using TLS-disabled listeners |
+| `CORS_ALLOWED_ORIGINS` | server | comma-separated UI origins; defaults always merge **localhost / 127.0.0.1 / `[::1]`** for Vite **5173** and preview **4173**. **`vite --host` (LAN IP)** on ports **5173 / 4173 / 5174** is allowed without listing each IP. Production hostnames still belong here. |
+| `CORS_ORIGINS` | server | optional legacy alias; merged with `CORS_ALLOWED_ORIGINS` if both set |
+| `LOG_RETENTION_DAYS_DEFAULT` | server | `7` |
+| `LOG_PURGE_INTERVAL_SECS` | server | `3600` |
+| `LOG_RETENTION_MAX_BYTES_PER_SESSION_DEFAULT` | server | `52428800` |
+| `WORKER_STALE_THRESHOLD_SECS` or `WORKER_STALE_SECONDS` | server | `120` |
+| `MAX_JOB_RECLAIMS` | server | `3` — after this many reclaims (stale worker, `DELETE /workers/:id`, or `POST /workers/tasks/pull`), assigned jobs are **failed** with `[MAX_WORKER_LOSS_RETRIES]` |
 | `JOB_LEASE_SECONDS` | server | `0` (disabled); e.g. `21600` = 6h lease / `[JOB_LEASE_EXPIRED]` |
+| `CHAT_HISTORY_MAX_TURNS` | server | `50` — max prior user turns in `task_input.history` and max prior assistant turns in `task_input.history_assistant` on **chat follow-up** pull payloads; `0` disables capping (not recommended for production). When older turns are dropped, pull sets `history_truncated`: `true` ([API_OVERVIEW — Pull task](API_OVERVIEW.md#pull-task)). |
+| `LOOP_UNTIL_SENTINEL_MAX_ITERATIONS` | server | `500` (minimum effective `1`) — max jobs enqueued for **`loop_until_sentinel`** when the worker never sets `sentinel_reached` on complete ([README § Git OAuth env table](../README.md) / [API_OVERVIEW — Create session](API_OVERVIEW.md#4-rest--sessions)). |
 | `HEARTBEAT_INTERVAL_SECS` | worker | `30` |
 
 Worker config file: `~/.config/remote-harness-worker/config.yaml` or `REMOTE_HARNESS_CONFIG` (YAML; env overrides file). See [Worker README](../crates/worker/README.md).
@@ -201,6 +241,8 @@ cargo run -p server
 ```
 
 Wait for `listening` on `0.0.0.0:3000`. Migrations run on startup.
+
+**`.env` at the repo root:** The server binary loads that file automatically (and a `.env` in the current directory) so GitLab/GitHub OAuth variables do not need manual `export` when they live in **`remote_harness_3/.env`**. Restart the server after changes. If you still see **`oauth_not_configured`**, see [TROUBLESHOOTING.md §1d](TROUBLESHOOTING.md#1d-oauth-redirect-loop-oauth_not_configured-or-sign-in-does-nothing).
 
 **Terminal 2 — Worker**
 
@@ -219,7 +261,7 @@ npm install
 npm run dev
 ```
 
-Open the URL Vite prints. **Settings:** Control plane **http://127.0.0.1:3000**, API key **dev-key-change-in-production**.
+Open the URL Vite prints. The home page polls **`/health`**, **`/ready`**, and **`/health/idle`** against the base URL (default `http://127.0.0.1:3000`, or **`VITE_CONTROL_PLANE_URL`**). **Settings (later):** control plane URL, API key **dev-key-change-in-production**.
 
 **Terminal 4 — CLI (optional)**
 
@@ -228,6 +270,8 @@ cd /path/to/remote_harness_3
 export REMOTE_HARNESS_URL="http://127.0.0.1:3000"
 export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
 cargo run -p cli -- health
+cargo run -p cli -- ready
+cargo run -p cli -- idle
 ```
 
 Or `~/.config/remote-harness/config.yaml`.
@@ -254,7 +298,7 @@ Use the **control plane URL** from [URLs and consistency](#urls-and-consistency)
 
 ### 3.1 UI Settings (recommended)
 
-**Settings → Credentials (BYOL):** Git token and Agent token → **Save**. Optional **Sign in with GitHub** or **Sign in with GitLab** if the server is configured ([§3.5](#35-gitlab-oauth-sign-in-with-gitlab), [§3.6](#36-github-oauth-sign-in-with-github)).
+**Settings → Identity & credentials (BYOL)** (`/settings#byol-credentials`): save **Agent CLI token** (Cursor / Claude Code), then **Sign in with GitHub/GitLab** or paste a **Git PAT**. Use **Refresh** to confirm both flags show Git **yes** and Agent **yes** before starting a session ([§3.5](#35-gitlab-oauth-sign-in-with-gitlab), [§3.6](#36-github-oauth-sign-in-with-github)).
 
 ### 3.2 PATCH default identity (curl)
 
@@ -273,15 +317,15 @@ Use a Git PAT with **`repo`** (or equivalent). With GitHub/GitLab OAuth, the UI 
 ### 3.3 CLI — `credentials set`
 
 ```bash
-cargo run -p cli -- credentials set
+cargo run -p cli -- credentials set default
 ```
 
-Masked prompts, or:
+Use identity id `default` (or your BYOL id). Flags or env `RH_AGENT_TOKEN` / `RH_GIT_TOKEN`, or:
 
 ```bash
-cargo run -p cli -- credentials set --git-token "ghp_xxx" --agent-token "cursor_xxx"
-export GIT_TOKEN="ghp_xxx" AGENT_TOKEN="cursor_xxx"
-cargo run -p cli -- credentials set
+cargo run -p cli -- credentials set default --git-token "ghp_xxx" --agent-token "sk-ant-…"
+export RH_GIT_TOKEN="ghp_xxx" RH_AGENT_TOKEN="…"
+cargo run -p cli -- credentials set default
 ```
 
 Set `REMOTE_HARNESS_URL` and `REMOTE_HARNESS_API_KEY` to your control plane first.
@@ -297,7 +341,7 @@ Configure the **server** (e.g. repo root **`.env`** for Compose, or env for bare
 - **GITLAB_CLIENT_ID** — [GitLab Application](https://gitlab.com/-/user_settings/applications) (or self‑hosted GitLab).
 - **GITLAB_CLIENT_SECRET**
 - **GITLAB_REDIRECT_URI** — callback on the **API** host, e.g. `http://localhost:3000/auth/gitlab/callback` (not the UI port).
-- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings`.
+- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings#byol-credentials`.
 - **GITLAB_BASE_URL** (optional) — self‑hosted GitLab base URL; omit for gitlab.com. Do not set to your harness app URL.
 
 Register the same callback under the GitLab app’s **Redirect URI**. Scopes include `read_repository`, `write_repository`, `api`. Flow uses CSRF + PKCE; refresh tokens refreshed when supported.
@@ -309,9 +353,9 @@ Configure the server:
 - **GITHUB_CLIENT_ID** — [GitHub OAuth App](https://github.com/settings/developers)
 - **GITHUB_CLIENT_SECRET**
 - **GITHUB_REDIRECT_URI** — e.g. `http://localhost:3000/auth/github/callback` (must match the OAuth app **Authorization callback URL** exactly).
-- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings`.
+- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings#byol-credentials`.
 
-After authorization, the server stores the token on the identity and redirects to Settings (e.g. `?credentials=github_ok`).
+After authorization, the server stores the token on the identity and redirects to Settings (e.g. `?oauth_success=github` or `oauth_success=gitlab`).
 
 ---
 

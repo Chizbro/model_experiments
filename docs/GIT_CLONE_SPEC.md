@@ -2,6 +2,8 @@
 
 When clone or push fails in production, surface a **clear** message to the user (job/session error + link to Settings for Git credentials). See [CLIENT_EXPERIENCE.md §6](CLIENT_EXPERIENCE.md#6-jobs-failures-outside-the-users-control).
 
+**`file://` remotes (non-production):** The worker also supports **`file://`** URLs for **local development and automated tests** (clone/push against a local bare repository). Production deployments should use **HTTPS** remotes with a PAT per the checklist below; `file://` is intentionally excluded from the production-focused problem statement in §1.
+
 **Implementation checklist (end of this doc):** This is a **release / code-review gate** for the worker: every box should be verifiable before declaring Git HTTPS support done. It is **not** a public operator checklist; unchecked items here do **not** mean the spec is optional—only that the implementer has not yet confirmed the code path. The canonical file path is **`crates/worker/src/git_ops.rs`** in the **implementation** monorepo ([docs/README — Repository layout](README.md#repository-layout)).
 
 ## Problem
@@ -48,11 +50,12 @@ The worker **must** implement all of the following. In the standard monorepo, im
 
 ## Implementation checklist
 
-- [ ] **Embed token in URL** (`embed_token_into_url`): For `http://` and `https://` URLs, produce `scheme://git:{percent_encoded_token}@{host}{path}`; strip any existing `user@` from the authority before adding `git:token@`.
-- [ ] **Token encoding**: Use URL percent-encoding for the token only (e.g. `urlencoding::encode(git_token)` in Rust).
-- [ ] **FetchOptions**: Every clone path uses `fetch_opts.follow_redirects(RemoteRedirect::All)` and sets `remote_callbacks.credentials` to return the same token (so redirects that lose URL credentials still get auth).
-- [ ] **PushOptions**: Every push path uses `push_opts.follow_redirects(RemoteRedirect::All)` and sets credentials callback (push uses the same token).
-- [ ] **Credentials callback**: Always set for fetch and push when a git token is used (required for "remote authentication required" when URL creds are not sent on redirect).
+- [x] **Embed token in URL** (`embed_token_into_url`): For `http://` and `https://` URLs, produce `scheme://git:{percent_encoded_token}@{host}{path}`; strip any existing `user@` from the authority before adding `git:token@`.
+- [x] **Token encoding**: Use URL percent-encoding for the token only (e.g. `urlencoding::encode(git_token)` in Rust).
+- [x] **FetchOptions**: Every clone path uses `fetch_opts.follow_redirects(RemoteRedirect::All)` and sets `remote_callbacks.credentials` to return the same token (so redirects that lose URL credentials still get auth).
+- [x] **PushOptions**: Every push path uses `push_opts.follow_redirects(RemoteRedirect::All)` and sets credentials callback (push uses the same token).
+- [x] **Credentials callback**: Always set for fetch and push when a git token is used (required for "remote authentication required" when URL creds are not sent on redirect).
+- [x] **`file://` (dev/tests only):** `clone_repository` / `fetch_origin` / `push_refspec` branch for `file:` URLs without embedding tokens (see module docs on `crates/worker/src/git_ops.rs`).
 
 ## References
 

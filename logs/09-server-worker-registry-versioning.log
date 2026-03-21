@@ -1,0 +1,99 @@
+=== AGENT CONTEXT DUMP — task 09-server-worker-registry-versioning ===
+Generated as part of completing plan task 09. This log is a verbatim-style dump of assistant context for this session (instructions, reasoning, edits, verification).
+
+--- USER REQUEST (verbatim) ---
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+--- DISCOVERY / INTERPRETATION ---
+Glob `*.pending.md` returned 0 files because plan tasks use the suffix `-pending.md` (hyphen), not `.pending.md`. Sorted `plan/*-pending.md` by numeric prefix; lowest after completed 01–08 was **09-server-worker-registry-versioning-pending.md**.
+
+Actions taken on the plan file:
+1. `mv plan/09-server-worker-registry-versioning-pending.md` → `plan/09-server-worker-registry-versioning-processing.md`
+2. After implementation: deleted `processing.md` and created `plan/09-server-worker-registry-versioning-complete.md` (user asked `*.complete.md`; repo README also mentions `-done` but user instruction took precedence).
+
+--- TASK SPEC CONTENT (as processed; original was plan/09 processing copy) ---
+Title: 09 — Server: worker registry, heartbeat, version gate
+Objective: Workers register with client_version; incompatible → 400 + error.code worker_version_incompatible.
+Scope: POST /workers/register, POST /workers/:id/heartbeat, GET /workers, GET /workers/:id, DELETE /workers/:id; stale from last_seen_at + worker_stale_seconds; semver policy; DELETE reclaims jobs per ARCHITECTURE §3b.
+Out of scope: Pull task (task 10).
+Acceptance: integration tests for compatible/incompatible register, heartbeat updates last_seen_at, list active vs stale. Original spec said CLI/Web strings deferred to 21/25; AGENTS.md requires backend exposed in CLI + UI — implemented worker subcommands and Web Workers section anyway.
+
+--- DESIGN DECISIONS ---
+- **Server version source:** `api_types::CRATE_VERSION` (workspace package version, currently 0.1.0).
+- **Compatibility rule:** `semver` crate; **major** and **minor** must match between worker `client_version` and server version; patch may differ.
+- **Missing client_version:** API allows transitional accept with warning — implemented `eprintln!` to stderr on server when omitted/blank, still inserts row with NULL client_version.
+- **Stale:** `status` in list/get = `active` if `last_seen_at` is within `ServerConfig.worker_stale_threshold` (from `WORKER_STALE_THRESHOLD_SECS` / `WORKER_STALE_SECONDS`), else `stale`; NULL last_seen treated as stale.
+- **DELETE /workers/:id:** Transaction: reclaim assigned jobs with `reclaim_count < max_job_reclaims` → `pending`, increment reclaim_count; assigned jobs with `reclaim_count >= max` → `failed` append `[MAX_WORKER_LOSS_RETRIES]` to error_message; then DELETE worker. `max_job_reclaims` from env `MAX_JOB_RECLAIMS` default 3 (added to ServerConfig).
+- **Pagination:** Same pattern as API keys — cursor base64 of `rfc3339|worker_id`, order `created_at DESC, id DESC`.
+- **sqlx:** Added feature `json` for JSONB; used `sqlx::types::Json as PgJson` to avoid clash with `axum::Json`.
+
+--- FILES CREATED ---
+- `crates/server/migrations/20250320120000_workers_version_capabilities.sql` — ALTER workers ADD client_version TEXT; ADD capabilities JSONB NOT NULL DEFAULT '[]'::jsonb
+- `crates/api-types/src/workers.rs` — RegisterWorkerRequest/Response, WorkerHeartbeatRequest/Response, WorkerSummary, PaginatedWorkerSummaries
+- `crates/server/src/workers.rs` — handlers: register_worker, heartbeat_worker, list_workers, get_worker, delete_worker (+ helpers)
+- `crates/server/tests/workers_integration.rs` — auth required test; full DB test: register ok, incompatible code, duplicate 409, heartbeat advances last_seen, list stale/active, get detail capabilities, delete reclaim, delete fail at cap
+- `plan/09-server-worker-registry-versioning-complete.md` — final task file with Completed / Notes
+- `logs/09-server-worker-registry-versioning.log` — this file
+
+--- FILES MODIFIED ---
+- `crates/api-types/src/lib.rs` — mod workers; pub use worker types; RegisterWorkerRequest derives Serialize for tests/CLI JSON body
+- `crates/server/Cargo.toml` — deps: semver, sqlx json feature; dev-dep uuid
+- `crates/server/src/lib.rs` — mod workers; routes under API-key layer for /workers/*
+- `crates/server/src/config.rs` — field max_job_reclaims + from_env MAX_JOB_RECLAIMS + test_without_db default
+- `crates/server/openapi.yaml` — tag workers; paths /workers/register, /workers/{id}/heartbeat, /workers, /workers/{id}; schemas
+- `crates/server/tests/openapi_contract.rs` — operationIds: deleteWorker, getWorker, heartbeatWorker, listWorkers, registerWorker
+- `crates/server/tests/migrations_integration.rs` — assert workers has client_version + capabilities columns
+- `crates/cli/src/main.rs` — Command::Worker + WorkerCommand (list, get, delete, register, heartbeat) + run_worker
+- `web/src/App.tsx` — Workers section: GET /workers, POST /workers/register; CONTROL_PLANE_RELEASE constant 0.1.0
+- `docs/API_OVERVIEW.md` — version policy bullet under Register
+- `docs/GETTING_STARTED.md` — MAX_JOB_RECLAIMS row clarified for delete reclaim + future task 10
+- `docs/PROJECT_KICKOFF.md` — §6a checkpoint A marked done with link to plan 09
+- `plan/README.md` — task 09 link → complete file
+
+--- ROUTES (axum 0.8 path syntax) ---
+Mounted inside the same `require_api_key` router as identities/sessions:
+- POST `/workers/register`
+- POST `/workers/{id}/heartbeat`
+- GET `/workers`
+- GET `/workers/{id}`
+- DELETE `/workers/{id}`
+
+--- COMMANDS RUN (representative) ---
+- `cargo build` (after Json alias fix)
+- `cargo test -p server` — all pass including workers_integration when DATABASE_URL set
+- `cargo clippy --workspace --all-targets -- -D warnings` — fixed type_complexity with type aliases WorkerListRow, WorkerDetailRow
+- `cargo build --workspace`
+- `cd web && npm run lint && npm run typecheck`
+- `cargo test --workspace` — all green
+
+--- FIXES DURING IMPLEMENTATION ---
+- `Json` name clash axum vs sqlx → `PgJson` alias
+- RegisterWorkerRequest needed `Serialize` for serde_json::to_string in integration tests
+- query_scalar inference for DateTime → turbofish `query_scalar::<_, DateTime<Utc>>`
+- clippy type_complexity on tuple rows → type aliases
+
+--- AGENTS.md / RULES APPLIED ---
+- No stub implementations for the requested endpoints
+- Backend worker registry exposed in CLI (`remote-harness worker …`) and Web UI
+- Spec updates: API_OVERVIEW, GETTING_STARTED, PROJECT_KICKOFF, plan README, plan task file
+- New migration file only (no edit to existing migrations)
+
+--- OPEN POINTS / FOLLOW-UPS (not implemented here) ---
+- Task 10: POST /workers/tasks/pull reclaim transaction (this task only implements DELETE reclaim + registry)
+- health_idle still stub (unchanged)
+- Worker binary (crates/worker) not updated to call new endpoints in this task (task 16 likely)
+
+=== END CONTEXT DUMP ===

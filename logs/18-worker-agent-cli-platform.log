@@ -1,0 +1,1815 @@
+=== CONTEXT DUMP: task 18 worker agent_cli (full file contents per user request) ===
+
+--- USER INSTRUCTION (verbatim) ---
+Find the next task spec ... logs/{task}.log ... ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+--- FILES ---
+
+======== FILE: crates/worker/Cargo.toml ========
+[package]
+name = "worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness worker (control plane client; task execution in later plan tasks)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "worker"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+git2 = { version = "0.20", features = ["vendored-libgit2"] }
+hostname = "0.4"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = [
+    "io-util",
+    "macros",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+urlencoding = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+wiremock = "0.5"
+
+======== FILE: crates/worker/src/lib.rs ========
+//! Remote Harness worker: control-plane HTTP client (register, heartbeat, pull loop).
+//!
+//! Env configuration: see [`WorkerConfig::from_env`] and `crates/worker/README.md`.
+
+pub mod agent_cli;
+mod config;
+mod control_plane;
+pub mod git_ops;
+
+pub use config::WorkerConfig;
+pub use control_plane::{ControlPlaneClient, ControlPlaneError, PullOutcome};
+
+use std::time::Duration;
+
+/// Run until SIGINT: register, background heartbeats, pull loop with backoff when idle.
+pub async fn run(config: WorkerConfig) -> Result<(), RunError> {
+    let client = ControlPlaneClient::new(&config)?;
+    client.register_idempotent(&config).await?;
+    client.heartbeat_idle(&config.worker_id).await?;
+
+    let hb_client = client.clone();
+    let hb_wid = config.worker_id.clone();
+    let hb_every = config.heartbeat_interval;
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(hb_every);
+        loop {
+            tick.tick().await;
+            if let Err(e) = hb_client.heartbeat_idle(&hb_wid).await {
+                tracing::warn!(error = %e, "heartbeat failed");
+            }
+        }
+    });
+
+    let pull_result = pull_loop(&client, &config.worker_id).await;
+    heartbeat.abort();
+    pull_result
+}
+
+async fn pull_loop(client: &ControlPlaneClient, worker_id: &str) -> Result<(), RunError> {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown signal received, exiting");
+                return Ok(());
+            }
+            r = client.pull_task(worker_id) => {
+                match r {
+                    Ok(PullOutcome::NoWork) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    Ok(PullOutcome::Task(t)) => {
+                        backoff = Duration::from_secs(1);
+                        tracing::warn!(
+                            job_id = %t.job_id,
+                            session_id = %t.session_id,
+                            "task received; failing job until execution is implemented (plan task 19)"
+                        );
+                        client
+                            .complete_task_failed(
+                                &t.task_id,
+                                worker_id,
+                                "Task execution not yet implemented (worker plan task 19).",
+                            )
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "pull failed, retrying");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Top-level run failures (config or repeated control-plane errors surfaced from pull/complete).
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("configuration: {0}")]
+    Config(#[from] config::ConfigError),
+    #[error("control plane: {0}")]
+    ControlPlane(#[from] ControlPlaneError),
+}
+
+======== FILE: crates/worker/src/control_plane.rs ========
+use crate::config::WorkerConfig;
+use api_types::{
+    PullTaskRequest, PullTaskResponse, RegisterWorkerRequest, TaskCompleteRequest,
+    WorkerHeartbeatRequest,
+};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::{Client, StatusCode, Url};
+use serde_json::Value;
+
+/// HTTP client for worker ↔ control plane ([`docs/API_OVERVIEW.md`](../../../docs/API_OVERVIEW.md) §9).
+#[derive(Debug, Clone)]
+pub struct ControlPlaneClient {
+    http: Client,
+    base: Url,
+    api_key: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ControlPlaneError {
+    #[error("invalid control plane URL: {0}")]
+    BadBaseUrl(String),
+    #[error("HTTP client build failed: {0}")]
+    HttpBuild(#[from] reqwest::Error),
+    #[error("unexpected response status {status}: {body}")]
+    UnexpectedStatus { status: u16, body: String },
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Debug)]
+pub enum PullOutcome {
+    NoWork,
+    Task(PullTaskResponse),
+}
+
+impl ControlPlaneClient {
+    pub fn new(config: &WorkerConfig) -> Result<Self, ControlPlaneError> {
+        let base: Url = config
+            .control_plane_url
+            .parse()
+            .map_err(|_| ControlPlaneError::BadBaseUrl(config.control_plane_url.clone()))?;
+        let http = Client::builder().build()?;
+        Ok(Self {
+            http,
+            base,
+            api_key: config.api_key.clone(),
+        })
+    }
+
+    fn auth_headers(&self) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let bearer = format!("Bearer {}", self.api_key);
+        if let Ok(v) = HeaderValue::from_str(&bearer) {
+            h.insert(AUTHORIZATION, v);
+        }
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        h
+    }
+
+    fn url(&self, path: &str) -> Url {
+        self.base.join(path).expect("join path under base")
+    }
+
+    /// Register worker; **409 Conflict** is treated as idempotent success (same worker id already registered).
+    pub async fn register_idempotent(
+        &self,
+        config: &WorkerConfig,
+    ) -> Result<(), ControlPlaneError> {
+        let platform = crate::agent_cli::register_platform_label();
+        let labels = serde_json::json!({ "platform": platform });
+        let body = RegisterWorkerRequest {
+            id: config.worker_id.clone(),
+            host: config.host.clone(),
+            labels,
+            capabilities: vec![],
+            client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        let resp = self
+            .http
+            .post(self.url("/workers/register"))
+            .headers(self.auth_headers())
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == StatusCode::CREATED || status == StatusCode::CONFLICT {
+            return Ok(());
+        }
+        Err(Self::status_err(resp).await)
+    }
+
+    /// Heartbeat while idle (no current job).
+    pub async fn heartbeat_idle(&self, worker_id: &str) -> Result<(), ControlPlaneError> {
+        let path = format!("/workers/{}/heartbeat", encode_path_segment(worker_id));
+        let body = WorkerHeartbeatRequest {
+            status: "idle".to_string(),
+            current_job_id: None,
+        };
+        let resp = self
+            .http
+            .post(self.url(&path))
+            .headers(self.auth_headers())
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status() == StatusCode::OK {
+            return Ok(());
+        }
+        Err(Self::status_err(resp).await)
+    }
+
+    /// Poll for work. **204** or empty assignment → [`PullOutcome::NoWork`].
+    pub async fn pull_task(&self, worker_id: &str) -> Result<PullOutcome, ControlPlaneError> {
+        let body = PullTaskRequest {
+            worker_id: Some(worker_id.to_string()),
+        };
+        let resp = self
+            .http
+            .post(self.url("/workers/tasks/pull"))
+            .headers(self.auth_headers())
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(PullOutcome::NoWork);
+        }
+        let body_text = resp.text().await?;
+        if status == StatusCode::OK {
+            let v: Value = serde_json::from_str(&body_text)?;
+            if v.get("task_id").is_none_or(|t| t.is_null()) {
+                return Ok(PullOutcome::NoWork);
+            }
+            let task: PullTaskResponse = serde_json::from_value(v)?;
+            return Ok(PullOutcome::Task(task));
+        }
+        Err(ControlPlaneError::UnexpectedStatus {
+            status: status.as_u16(),
+            body: truncate_body(body_text),
+        })
+    }
+
+    /// Mark task failed so the queue/session can progress until real execution exists (plan task 19).
+    pub async fn complete_task_failed(
+        &self,
+        task_id: &str,
+        worker_id: &str,
+        message: &str,
+    ) -> Result<(), ControlPlaneError> {
+        let path = format!("/workers/tasks/{}/complete", encode_path_segment(task_id));
+        let body = TaskCompleteRequest {
+            status: "failed".to_string(),
+            worker_id: Some(worker_id.to_string()),
+            branch: None,
+            commit_ref: None,
+            mr_title: None,
+            mr_description: None,
+            error_message: Some(message.to_string()),
+            output: None,
+            sentinel_reached: None,
+            assistant_reply: None,
+        };
+        let resp = self
+            .http
+            .post(self.url(&path))
+            .headers(self.auth_headers())
+            .json(&body)
+            .send()
+            .await?;
+        if resp.status() == StatusCode::OK {
+            return Ok(());
+        }
+        Err(Self::status_err(resp).await)
+    }
+
+    async fn status_err(resp: reqwest::Response) -> ControlPlaneError {
+        let status = resp.status();
+        let body = truncate_body(resp.text().await.unwrap_or_default());
+        ControlPlaneError::UnexpectedStatus {
+            status: status.as_u16(),
+            body,
+        }
+    }
+}
+
+fn encode_path_segment(s: &str) -> String {
+    urlencoding::encode(s).into_owned()
+}
+
+fn truncate_body(s: String) -> String {
+    const MAX: usize = 512;
+    if s.len() <= MAX {
+        return s;
+    }
+    format!("{}…(truncated)", &s[..MAX])
+}
+
+======== FILE: crates/worker/src/agent_cli/mod.rs ========
+//! Claude Code / Cursor subprocess handling per OS ([`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §4c).
+//!
+//! - [`AgentCliRunner`] applies platform spawn flags (e.g. Windows `CREATE_NO_WINDOW`).
+//! - [`invoke::build_invocation`] maps `agent_cli` + prompt to argv/env; tokens go in **env only**, never argv.
+//! - [`run_invocation`] streams stdout/stderr through a redacting [`AgentLogSink`]; raw text is accumulated for `task_complete`.
+
+mod invoke;
+mod kind;
+mod platform;
+mod redact;
+mod runner;
+
+pub use invoke::{
+    build_invocation, choose_prompt_delivery, debug_invocation, extract_prompt, AgentTaskInput,
+    InvokeError, PromptDelivery,
+};
+pub use kind::AgentCliKind;
+pub use platform::{detect_worker_platform, register_platform_label, WorkerPlatform};
+pub use redact::{redact_secrets, LogRedactor};
+pub use runner::{
+    default_agent_cli_runner, run_invocation, AgentCliRunError, AgentCliRunner, AgentInvocation,
+    AgentLogLine, AgentLogSink, AgentStream, CapturedAgentOutput, TracingAgentLogSink,
+    UnixAgentCliRunner, WindowsAgentCliRunner,
+};
+
+======== FILE: crates/worker/src/agent_cli/kind.rs ========
+//! `agent_cli` values from session/task params (`claude_code` | `cursor`).
+
+use serde_json::Value;
+use std::fmt;
+
+/// Which vendor CLI to run for this task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCliKind {
+    ClaudeCode,
+    Cursor,
+}
+
+impl AgentCliKind {
+    pub fn parse_str(s: &str) -> Option<Self> {
+        match s {
+            "claude_code" => Some(Self::ClaudeCode),
+            "cursor" => Some(Self::Cursor),
+            _ => None,
+        }
+    }
+
+    /// Read `params.agent_cli` or top-level string (tests).
+    pub fn from_params(params: &Value) -> Option<Self> {
+        let s = params.get("agent_cli").and_then(|v| v.as_str())?;
+        Self::parse_str(s)
+    }
+}
+
+impl fmt::Display for AgentCliKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ClaudeCode => write!(f, "claude_code"),
+            Self::Cursor => write!(f, "cursor"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_params() {
+        let v = serde_json::json!({ "agent_cli": "cursor" });
+        assert_eq!(AgentCliKind::from_params(&v), Some(AgentCliKind::Cursor));
+    }
+}
+
+======== FILE: crates/worker/src/agent_cli/platform.rs ========
+//! Runtime platform detection (macOS, Linux, WSL, Windows) for spawn policy and worker labels.
+
+/// Fine-grained platform for CLI invocation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerPlatform {
+    Macos,
+    Linux,
+    /// Linux kernel under WSL1/WSL2 — same process model as Linux; labeled separately for ops.
+    Wsl,
+    Windows,
+}
+
+/// Detect the current worker platform. WSL is reported as [`WorkerPlatform::Wsl`] when detected.
+pub fn detect_worker_platform() -> WorkerPlatform {
+    #[cfg(target_os = "windows")]
+    {
+        WorkerPlatform::Windows
+    }
+    #[cfg(all(not(target_os = "windows"), target_os = "macos"))]
+    {
+        WorkerPlatform::Macos
+    }
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        target_os = "linux"
+    ))]
+    {
+        if is_wsl() {
+            WorkerPlatform::Wsl
+        } else {
+            WorkerPlatform::Linux
+        }
+    }
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(target_os = "macos"),
+        not(target_os = "linux")
+    ))]
+    {
+        WorkerPlatform::Linux
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_wsl() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| {
+            let l = s.to_lowercase();
+            l.contains("microsoft") || l.contains("wsl")
+        })
+        .unwrap_or(false)
+}
+
+/// Value for `labels.platform` on worker register ([`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §4c).
+pub fn register_platform_label() -> &'static str {
+    match detect_worker_platform() {
+        WorkerPlatform::Macos => "macos",
+        WorkerPlatform::Linux => "linux",
+        WorkerPlatform::Wsl => "wsl",
+        WorkerPlatform::Windows => "windows",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_matches_detection() {
+        let p = detect_worker_platform();
+        let label = register_platform_label();
+        match p {
+            WorkerPlatform::Macos => assert_eq!(label, "macos"),
+            WorkerPlatform::Linux => assert_eq!(label, "linux"),
+            WorkerPlatform::Wsl => assert_eq!(label, "wsl"),
+            WorkerPlatform::Windows => assert_eq!(label, "windows"),
+        }
+    }
+}
+
+======== FILE: crates/worker/src/agent_cli/redact.rs ========
+//! Remove known secrets before logging or forwarding log lines.
+
+/// Replace every occurrence of each secret substring with a fixed placeholder.
+pub fn redact_secrets<'a>(line: &'a str, secrets: &[String]) -> std::borrow::Cow<'a, str> {
+    if secrets.is_empty() || line.is_empty() {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = line.to_string();
+    let mut any = false;
+    for s in secrets {
+        if s.is_empty() {
+            continue;
+        }
+        if out.contains(s.as_str()) {
+            any = true;
+            out = out.replace(s.as_str(), "[REDACTED]");
+        }
+    }
+    if any {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    }
+}
+
+/// Holds secret material for repeated redaction (e.g. agent token).
+#[derive(Debug, Clone, Default)]
+pub struct LogRedactor {
+    secrets: Vec<String>,
+}
+
+impl LogRedactor {
+    pub fn new(secrets: Vec<String>) -> Self {
+        Self { secrets }
+    }
+
+    pub fn redact<'a>(&self, line: &'a str) -> std::borrow::Cow<'a, str> {
+        redact_secrets(line, &self.secrets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_token() {
+        let t = "super-secret-token".to_string();
+        let line = format!("error: auth failed token={t} end");
+        let r = redact_secrets(&line, &[t.clone()]);
+        assert!(!r.contains("super-secret"));
+        assert!(r.contains("[REDACTED]"));
+    }
+}
+
+======== FILE: crates/worker/src/agent_cli/invoke.rs ========
+//! Build [`super::runner::AgentInvocation`] from task fields (binary, argv, env, stdin).
+
+use super::kind::AgentCliKind;
+use super::platform::WorkerPlatform;
+use super::runner::AgentInvocation;
+use serde_json::Value;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+/// How the user prompt is delivered to the child (Windows cmdline limits vs Unix argv).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptDelivery {
+    /// Prompt is written to child stdin after spawn.
+    Stdin(Vec<u8>),
+    /// Prompt is the last argv entry (lossy on Windows for non-UTF16 if we used wide-only APIs; we use Rust `OsString` from `str`).
+    ArgvLast(OsString),
+}
+
+/// Inputs needed to construct an invocation (no Git / clone paths).
+#[derive(Debug, Clone)]
+pub struct AgentTaskInput<'a> {
+    pub kind: AgentCliKind,
+    pub agent_token: &'a str,
+    pub model: Option<&'a str>,
+    pub prompt: &'a str,
+    pub platform: WorkerPlatform,
+}
+
+/// Resolve prompt text from `task_input` JSON (chat / loop jobs).
+pub fn extract_prompt(task_input: &Value) -> Option<String> {
+    if let Some(p) = task_input.get("prompt").and_then(|v| v.as_str()) {
+        return Some(p.to_string());
+    }
+    if let Some(m) = task_input.get("message").and_then(|v| v.as_str()) {
+        return Some(m.to_string());
+    }
+    None
+}
+
+/// Pick stdin vs argv for the prompt from platform heuristics ([`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §4c).
+pub fn choose_prompt_delivery(platform: WorkerPlatform, prompt: &str) -> PromptDelivery {
+    let force_stdin = match platform {
+        WorkerPlatform::Windows => {
+            // CreateProcess command-line limit ~8191 chars including executable and all args.
+            prompt.len() > 4000
+                || prompt.contains('\n')
+                || prompt.contains('\r')
+                || prompt.contains('"')
+        }
+        WorkerPlatform::Wsl | WorkerPlatform::Linux | WorkerPlatform::Macos => {
+            prompt.len() > 200_000
+        }
+    };
+    if force_stdin {
+        PromptDelivery::Stdin(prompt.as_bytes().to_vec())
+    } else {
+        PromptDelivery::ArgvLast(OsString::from(prompt))
+    }
+}
+
+fn cursor_program() -> PathBuf {
+    if let Ok(p) = std::env::var("CURSOR_AGENT_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(p) = std::env::var("REMOTE_HARNESS_CURSOR_AGENT_BIN") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("agent.exe")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("agent")
+    }
+}
+
+fn claude_program() -> PathBuf {
+    if let Ok(p) = std::env::var("CLAUDE_CLI_PATH") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if let Ok(p) = std::env::var("REMOTE_HARNESS_CLAUDE_BIN") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from("claude.exe")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        PathBuf::from("claude")
+    }
+}
+
+fn parse_extra_args(env_key: &str) -> Vec<OsString> {
+    std::env::var(env_key)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split_whitespace().map(OsString::from).collect::<Vec<_>>())
+        .unwrap_or_default()
+}
+
+/// Build argv + env + stdin for the vendor CLI. **Never** place `agent_token` in argv; use env only.
+pub fn build_invocation(input: AgentTaskInput<'_>) -> Result<AgentInvocation, InvokeError> {
+    if input.agent_token.is_empty() {
+        return Err(InvokeError::MissingAgentToken);
+    }
+    if input.prompt.is_empty() {
+        return Err(InvokeError::MissingPrompt);
+    }
+
+    let delivery = choose_prompt_delivery(input.platform, input.prompt);
+    let secrets = vec![input.agent_token.to_string()];
+
+    match input.kind {
+        AgentCliKind::Cursor => {
+            let program = cursor_program();
+            let mut args: Vec<OsString> = parse_extra_args("REMOTE_HARNESS_CURSOR_AGENT_ARGS");
+            if args.is_empty() {
+                args.extend(["run", "--print"].into_iter().map(OsString::from));
+            }
+            let stdin_body = match delivery {
+                PromptDelivery::Stdin(b) => Some(b),
+                PromptDelivery::ArgvLast(p) => {
+                    args.push(p);
+                    None
+                }
+            };
+            let mut env = vec![(
+                OsString::from("CURSOR_API_KEY"),
+                OsString::from(input.agent_token),
+            )];
+            if let Some(m) = input.model.filter(|s| !s.is_empty()) {
+                env.push((OsString::from("CURSOR_MODEL"), OsString::from(m)));
+            }
+            Ok(AgentInvocation {
+                program,
+                args,
+                env,
+                cwd: None,
+                stdin_body,
+                secrets_for_redaction: secrets,
+            })
+        }
+        AgentCliKind::ClaudeCode => {
+            let program = claude_program();
+            let mut args: Vec<OsString> = parse_extra_args("REMOTE_HARNESS_CLAUDE_AGENT_ARGS");
+            if args.is_empty() {
+                args.push(OsString::from("-p"));
+            }
+            let stdin_body = match delivery {
+                PromptDelivery::Stdin(b) => {
+                    args.push(OsString::from("-"));
+                    Some(b)
+                }
+                PromptDelivery::ArgvLast(p) => {
+                    args.push(p);
+                    None
+                }
+            };
+            let mut env = vec![(
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from(input.agent_token),
+            )];
+            if let Some(m) = input.model.filter(|s| !s.is_empty()) {
+                env.push((OsString::from("ANTHROPIC_MODEL"), OsString::from(m)));
+            }
+            Ok(AgentInvocation {
+                program,
+                args,
+                env,
+                cwd: None,
+                stdin_body,
+                secrets_for_redaction: secrets,
+            })
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InvokeError {
+    #[error("agent_token is empty")]
+    MissingAgentToken,
+    #[error("prompt is empty")]
+    MissingPrompt,
+}
+
+/// Display invocation for debugging — **omits env values and stdin** (only keys and arg count).
+pub fn debug_invocation(inv: &AgentInvocation) -> String {
+    use std::fmt::Write;
+    let mut s = String::new();
+    let _ = write!(
+        &mut s,
+        "program={} argc={} env_keys={}",
+        inv.program.display(),
+        inv.args.len(),
+        inv.env.len()
+    );
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_puts_token_in_env_not_argv() {
+        let inv = build_invocation(AgentTaskInput {
+            kind: AgentCliKind::Cursor,
+            agent_token: "tok_x",
+            model: Some("auto"),
+            prompt: "hi",
+            platform: WorkerPlatform::Linux,
+        })
+        .unwrap();
+        let joined: String = inv
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!joined.contains("tok_x"));
+        assert!(inv
+            .env
+            .iter()
+            .any(|(k, v)| { k == "CURSOR_API_KEY" && v.to_string_lossy() == "tok_x" }));
+    }
+
+    #[test]
+    fn windows_newline_forces_stdin() {
+        let inv = build_invocation(AgentTaskInput {
+            kind: AgentCliKind::Cursor,
+            agent_token: "t",
+            model: None,
+            prompt: "line1\nline2",
+            platform: WorkerPlatform::Windows,
+        })
+        .unwrap();
+        assert!(inv.stdin_body.is_some());
+        assert!(!inv
+            .args
+            .iter()
+            .any(|a| a.to_string_lossy().contains("line1")));
+    }
+
+    #[test]
+    fn claude_uses_anthropic_env() {
+        let inv = build_invocation(AgentTaskInput {
+            kind: AgentCliKind::ClaudeCode,
+            agent_token: "sk-ant",
+            model: None,
+            prompt: "go",
+            platform: WorkerPlatform::Macos,
+        })
+        .unwrap();
+        assert!(inv
+            .env
+            .iter()
+            .any(|(k, v)| { k == "ANTHROPIC_API_KEY" && v.to_string_lossy().contains("sk-ant") }));
+    }
+}
+
+======== FILE: crates/worker/src/agent_cli/runner.rs ========
+//! Spawn agent CLI, stream stdout/stderr (redacted), capture output for `task_complete`.
+
+use super::redact::LogRedactor;
+use std::ffi::OsString;
+use std::fmt;
+use std::path::PathBuf;
+use std::process::ExitStatus;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+/// One child invocation (constructed by [`super::invoke::build_invocation`]).
+#[derive(Clone)]
+pub struct AgentInvocation {
+    pub program: PathBuf,
+    pub args: Vec<OsString>,
+    /// Extra environment pairs (merged on top of inherited env).
+    pub env: Vec<(OsString, OsString)>,
+    pub cwd: Option<PathBuf>,
+    pub stdin_body: Option<Vec<u8>>,
+    /// Substrings that must never appear in logs.
+    pub secrets_for_redaction: Vec<String>,
+}
+
+impl fmt::Debug for AgentInvocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentInvocation")
+            .field("program", &self.program)
+            .field("argc", &self.args.len())
+            .field("env_pairs", &self.env.len())
+            .field("cwd", &self.cwd)
+            .field("has_stdin", &self.stdin_body.is_some())
+            .finish()
+    }
+}
+
+/// Which stream a log line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentStream {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentLogLine {
+    pub stream: AgentStream,
+    pub text: String,
+}
+
+/// Receives redacted agent lines (e.g. tracing or future `POST /workers/tasks/:id/logs`).
+pub trait AgentLogSink: Send {
+    fn emit(&mut self, line: AgentLogLine);
+}
+
+/// Emit to `tracing` with target `remote_harness::agent` (redacted).
+pub struct TracingAgentLogSink {
+    redactor: LogRedactor,
+}
+
+impl TracingAgentLogSink {
+    pub fn new(redactor: LogRedactor) -> Self {
+        Self { redactor }
+    }
+}
+
+impl AgentLogSink for TracingAgentLogSink {
+    fn emit(&mut self, line: AgentLogLine) {
+        let redacted = self.redactor.redact(&line.text);
+        match line.stream {
+            AgentStream::Stdout => {
+                tracing::info!(target: "remote_harness::agent", stream = "stdout", "{}", redacted)
+            }
+            AgentStream::Stderr => {
+                tracing::warn!(target: "remote_harness::agent", stream = "stderr", "{}", redacted)
+            }
+        }
+    }
+}
+
+/// Collect stdout/stderr separately for `assistant_reply` vs `output` / sentinel ([`docs/API_OVERVIEW.md`](../../../docs/API_OVERVIEW.md) §9).
+#[derive(Debug, Clone, Default)]
+pub struct CapturedAgentOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl CapturedAgentOutput {
+    pub fn append_line(&mut self, stream: AgentStream, line: &str) {
+        match stream {
+            AgentStream::Stdout => {
+                self.stdout.push_str(line);
+                self.stdout.push('\n');
+            }
+            AgentStream::Stderr => {
+                self.stderr.push_str(line);
+                self.stderr.push('\n');
+            }
+        }
+    }
+
+    /// Last `max` UTF-8 chars of combined streams (for `output` / sentinel checks).
+    pub fn combined_snippet(&self, max: usize) -> String {
+        let mut c = self.stdout.clone();
+        c.push_str(&self.stderr);
+        truncate_chars(&c, max)
+    }
+
+    /// Last `max` chars of stdout (v1 heuristic for chat `assistant_reply`).
+    pub fn assistant_reply_snippet(&self, max: usize) -> String {
+        truncate_chars(&self.stdout, max)
+    }
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let skip = s.len().saturating_sub(max);
+    s[skip..].to_string()
+}
+
+/// Platform hooks before spawn ([`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md) §4c).
+pub trait AgentCliRunner: Send + Sync {
+    fn apply_spawn_options(&self, cmd: &mut Command);
+}
+
+/// Unix / macOS / WSL: no extra flags.
+pub struct UnixAgentCliRunner;
+
+impl AgentCliRunner for UnixAgentCliRunner {
+    fn apply_spawn_options(&self, _cmd: &mut Command) {}
+}
+
+/// Windows: hide console window for worker service / headless hosts.
+pub struct WindowsAgentCliRunner;
+
+impl AgentCliRunner for WindowsAgentCliRunner {
+    fn apply_spawn_options(&self, cmd: &mut Command) {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = cmd;
+        }
+    }
+}
+
+use super::platform::{detect_worker_platform, WorkerPlatform};
+
+pub fn default_agent_cli_runner() -> &'static dyn AgentCliRunner {
+    match detect_worker_platform() {
+        WorkerPlatform::Windows => &WindowsAgentCliRunner,
+        WorkerPlatform::Macos | WorkerPlatform::Linux | WorkerPlatform::Wsl => &UnixAgentCliRunner,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentCliRunError {
+    #[error("failed to spawn agent CLI: {0}")]
+    Spawn(std::io::Error),
+    #[error("I/O while streaming agent output: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Run `inv`, stream redacted lines to `sink`, fill `capture`. Uses `runner` for platform spawn flags.
+pub async fn run_invocation(
+    runner: &dyn AgentCliRunner,
+    inv: &AgentInvocation,
+    sink: &mut dyn AgentLogSink,
+    capture: &mut CapturedAgentOutput,
+) -> Result<ExitStatus, AgentCliRunError> {
+    let mut cmd = Command::new(&inv.program);
+    cmd.args(&inv.args);
+    for (k, v) in &inv.env {
+        cmd.env(k, v);
+    }
+    if let Some(dir) = &inv.cwd {
+        cmd.current_dir(dir);
+    }
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    runner.apply_spawn_options(&mut cmd);
+
+    let mut child = cmd.spawn().map_err(AgentCliRunError::Spawn)?;
+
+    if let Some(body) = &inv.stdin_body {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(body).await.map_err(AgentCliRunError::Io)?;
+            stdin.flush().await.map_err(AgentCliRunError::Io)?;
+        }
+    }
+    drop(child.stdin.take());
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "missing stderr"))?;
+
+    let redactor = LogRedactor::new(inv.secrets_for_redaction.clone());
+
+    let out_task = tokio::spawn(stream_lines(stdout, AgentStream::Stdout));
+    let err_task = tokio::spawn(stream_lines(stderr, AgentStream::Stderr));
+
+    let (out_res, err_res, status) = tokio::join!(out_task, err_task, child.wait());
+
+    let out_lines = out_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+    let err_lines = err_res.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+
+    for (stream, line) in out_lines {
+        capture.append_line(stream, &line);
+        let redacted = redactor.redact(&line);
+        sink.emit(AgentLogLine {
+            stream,
+            text: redacted.into_owned(),
+        });
+    }
+    for (stream, line) in err_lines {
+        capture.append_line(stream, &line);
+        let redacted = redactor.redact(&line);
+        sink.emit(AgentLogLine {
+            stream,
+            text: redacted.into_owned(),
+        });
+    }
+
+    let status = status.map_err(AgentCliRunError::Io)?;
+    Ok(status)
+}
+
+async fn stream_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    stream: AgentStream,
+) -> Result<Vec<(AgentStream, String)>, std::io::Error> {
+    let mut lines = Vec::new();
+    let mut buf = BufReader::new(reader);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = buf.read_line(&mut line).await?;
+        if n == 0 {
+            break;
+        }
+        let t = line.trim_end_matches(['\n', '\r']).to_string();
+        lines.push((stream, t));
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct VecSink(Arc<Mutex<Vec<String>>>);
+
+    impl AgentLogSink for VecSink {
+        fn emit(&mut self, line: AgentLogLine) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{:?}: {}", line.stream, line.text));
+        }
+    }
+
+    #[tokio::test]
+    async fn fake_echo_subprocess_no_token_in_logs() {
+        let secret = "ULTRA_SECRET_AGENT".to_string();
+        let inv = AgentInvocation {
+            program: PathBuf::from(if cfg!(windows) {
+                "cmd.exe"
+            } else {
+                "/bin/echo"
+            }),
+            args: if cfg!(windows) {
+                vec![
+                    OsString::from("/C"),
+                    OsString::from(format!("echo token={secret} ok")),
+                ]
+            } else {
+                vec![OsString::from(format!("token={secret} ok"))]
+            },
+            env: vec![],
+            cwd: None,
+            stdin_body: None,
+            secrets_for_redaction: vec![secret.clone()],
+        };
+        let runner = default_agent_cli_runner();
+        let mut sink = VecSink::default();
+        let buf = sink.0.clone();
+        let mut cap = CapturedAgentOutput::default();
+        let st = run_invocation(runner, &inv, &mut sink, &mut cap)
+            .await
+            .expect("echo");
+        assert!(st.success());
+        let lines = buf.lock().unwrap();
+        let joined = lines.join(" ");
+        assert!(!joined.contains("ULTRA_SECRET"));
+        assert!(joined.contains("[REDACTED]") || joined.contains("token="));
+    }
+}
+
+======== FILE: crates/worker/README.md ========
+# `worker` crate
+
+Long-lived **worker** binary: registers with the control plane, sends periodic **heartbeats**, and **polls** `POST /workers/tasks/pull` with exponential backoff when idle.
+
+HTTP calls are centralized in [`ControlPlaneClient`](src/control_plane.rs) (`reqwest` + shared types from `api-types`).
+
+HTTPS Git (clone, fetch, checkout, commit, push) for the task runner lives in [`git_ops`](src/git_ops.rs) (`git2`): token embedded in the URL (percent-encoded), `RemoteRedirect::All` on fetch/push, and a credential callback—see [GIT_CLONE_SPEC.md](../../docs/GIT_CLONE_SPEC.md). v1 supports only `http://` / `https://` remotes (no SSH).
+
+**Agent CLI (Claude Code / Cursor)** — [`agent_cli`](src/agent_cli/mod.rs): builds argv + env from `agent_cli` + prompt (`build_invocation`), applies Windows vs Unix spawn options (`AgentCliRunner`), and streams child stdout/stderr through a redacting sink while capturing raw text for `task_complete` fields (`run_invocation`). Tokens are passed in **environment variables only** (`CURSOR_API_KEY`, `ANTHROPIC_API_KEY`), never as argv. See [ARCHITECTURE.md §4c](../../docs/ARCHITECTURE.md#4c-platform-specific-workers-cli-invocation).
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CURSOR_AGENT_PATH` | no | Cursor `agent` binary path; default `agent` (Unix) / `agent.exe` (Windows). |
+| `REMOTE_HARNESS_CURSOR_AGENT_BIN` | no | Alternate override for Cursor binary path. |
+| `REMOTE_HARNESS_CURSOR_AGENT_ARGS` | no | Space-separated extra argv **before** prompt (default: `run --print`). |
+| `CLAUDE_CLI_PATH` | no | Claude Code CLI path; default `claude` / `claude.exe`. |
+| `REMOTE_HARNESS_CLAUDE_BIN` | no | Alternate override for Claude binary path. |
+| `REMOTE_HARNESS_CLAUDE_AGENT_ARGS` | no | Space-separated argv override; when empty, worker uses `-p` plus prompt or `-p -` + stdin. |
+
+### Manual smoke checklist (macOS, one OS)
+
+Prerequisites: real **Cursor** or **Claude Code** CLI on `PATH` (or set `CURSOR_AGENT_PATH` / `CLAUDE_CLI_PATH`), valid `agent_token` in session/identity, control plane running.
+
+1. `cargo test -p worker` — passes (includes subprocess `echo` redaction test; no vendor CLI required).
+2. In `cargo test -p worker agent_cli::runner::tests::fake_echo_subprocess_no_token_in_logs -- --nocapture` optional: confirms log sink never prints the injected secret substring.
+3. **Operator check (real CLI):** from a throwaway repo clone directory, set `CURSOR_API_KEY` or `ANTHROPIC_API_KEY` in the environment only; run the same argv your worker would use (`agent run --print` + prompt, or `claude -p "…"`) and confirm the process exits 0 and prints expected assistant text. The worker will use the same shape when task execution is fully wired (plan task 19).
+
+## Environment
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CONTROL_PLANE_URL` or `REMOTE_HARNESS_URL` | yes | Base URL of the control plane (no trailing slash). |
+| `API_KEY` or `REMOTE_HARNESS_API_KEY` | yes | Same API key the server accepts (`Authorization: Bearer …`). |
+| `WORKER_ID` | no | Stable worker id; default: hostname + `-worker`, or a random UUID suffix if hostname is missing. |
+| `WORKER_HOST` | no | Optional `host` field on register (observability). |
+| `WORKER_HEARTBEAT_INTERVAL_SECS` | no | Default **30**; must be ≥ 1 if set. |
+| `REMOTE_HARNESS_GIT_HTTPS_USER` | no | HTTPS Git username for non-GitHub / non-GitLab.com hosts (overrides `git` / `oauth2` defaults). |
+
+`client_version` on register is **`CARGO_PKG_VERSION`** of this crate (workspace semver). **`409 Conflict`** on register (same id already registered) is treated as **success** so restarts are idempotent.
+
+## Run (bare metal)
+
+```bash
+export CONTROL_PLANE_URL=http://127.0.0.1:3000
+export API_KEY=your-key
+cargo run -p worker
+```
+
+## Docker Compose
+
+The root `docker-compose.yml` builds and runs the worker with `CONTROL_PLANE_URL=http://server:3000` and the same `API_KEY` as the server.
+
+## Tests
+
+```bash
+cargo test -p worker
+```
+
+Integration tests use **wiremock** to assert paths, JSON bodies, and `Authorization` headers (plan task 16). Git URL embedding is covered by `cargo test -p worker git_ops` (no network).
+
+======== FILE: docs/ARCHITECTURE.md ========
+# Architecture & Communications
+
+## 1. High-Level System Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              CONTROL PLANE (Server)                               │
+│  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  ┌─────────────┐            │
+│  │ API Gateway │  │ Task/Workflow│  │  Session    │  │   Log       │            │
+│  │ (REST+SSE)  │  │   Engine     │  │   Store     │  │   Aggregator│            │
+│  └──────┬──────┘  └──────┬───────┘  └──────┬──────┘  └──────┬──────┘            │
+│         │                 │                 │                 │                   │
+│         └─────────────────┴────────┬───────┴─────────────────┘                   │
+│                                    │                                              │
+│  ┌─────────────────────────────────▼─────────────────────────────────────────┐   │
+│  │                    Registry & State (Workers, Repos, Jobs, Inboxes)        │   │
+│  │                    (DB: registry, sessions, task queue, inboxes)            │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+         │                           │                            │
+         │  REST + SSE               │  Task dispatch / heartbeats │  Log / SSE stream
+         ▼                           ▼                            ▼
+┌─────────────────┐    ┌─────────────────────────────────────────────────────────┐
+│  CLI Client     │    │                    WORKER POOL                             │
+│  (any machine)  │    │  ┌──────────┐  ┌──────────┐  ┌──────────┐  (auto-discover)│
+└─────────────────┘    │  │ Worker A │  │ Worker B │  │ Worker N │                 │
+         │             │  │ (device 1)│  │ (device 2)│  │ (device N)│                 │
+         │             │  └────┬─────┘  └────┬─────┘  └────┬─────┘                 │
+         │             │       │ clone/run   │              │                       │
+         │             │       ▼             ▼              ▼                       │
+         │             │  ┌─────────────────────────────────────┐                  │
+         │             │  │  Git repos (local clones), Claude Code / Cursor CLI │   │
+         │             │  └─────────────────────────────────────┘                  │
+         │             └─────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Web UI         │
+│  (browser)      │
+└─────────────────┘
+```
+
+## 2. Component Diagram (Mermaid)
+
+```mermaid
+flowchart TB
+    subgraph Clients
+        CLI[CLI Client]
+        Web[Web UI]
+    end
+
+    subgraph ControlPlane["Control Plane (Server)"]
+        API[API Gateway]
+        Engine[Task/Workflow Engine]
+        Sessions[Session Store]
+        LogAgg[Log Aggregator]
+        Registry[(Registry & State)]
+    end
+
+    subgraph Workers["Worker Pool"]
+        W1[Worker 1]
+        W2[Worker 2]
+        WN[Worker N]
+    end
+
+    subgraph External
+        Git[Git Remotes]
+    end
+
+    CLI <-->|REST + SSE| API
+    Web <-->|REST + SSE| API
+    API <--> Engine
+    API <--> Sessions
+    API <--> LogAgg
+    Engine <--> Registry
+    Sessions <--> Registry
+    LogAgg --> Registry
+
+    Engine -->|Dispatch tasks / poll| W1
+    Engine -->|Dispatch tasks / poll| W2
+    Engine -->|Dispatch tasks / poll| WN
+    W1 -->|Heartbeat / Register| Registry
+    W2 -->|Heartbeat / Register| Registry
+    WN -->|Heartbeat / Register| Registry
+    W1 -->|Clone / Push| Git
+    W2 -->|Clone / Push| Git
+    WN -->|Clone / Push| Git
+```
+
+### 2a. Schema migrations
+
+**Where migrations run:** On **control plane startup**, not as a separate Docker Compose step. After connecting to Postgres, the server binary runs embedded SQLx migrations (`crates/server/migrations`) via `sqlx::migrate!(...).run(...)` in `crates/server/src/main.rs`, then binds the HTTP listener. Compose only ensures **`postgres` is healthy** before starting **`server`**; the first server process applies any pending migrations.
+
+**Why not a dedicated `migrate` service in compose?** A single entrypoint keeps dev and prod behavior aligned: one image, one startup sequence. SQLx coordinates concurrent migrators with a database lock, so multiple server replicas (if you scale later) are safe for migrations.
+
+**Operational note:** Changing migration files after they have been applied to a database causes checksum errors (`VersionMismatch`); use forward-only migrations in shared environments. Local Docker: reset the volume if needed (`docker compose down -v`). See [TROUBLESHOOTING.md](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migration-checksum-errors).
+
+## 3. Worker Discovery & Registration
+
+Workers **auto-discover** the control plane and register themselves so you can add new workers without reconfiguring the server.
+
+```mermaid
+sequenceDiagram
+    participant W as New Worker
+    participant R as Registry
+    participant E as Task Engine
+
+    W->>R: Register (id, capabilities, host, labels)
+    R->>R: Add to worker pool
+    loop Periodically
+        W->>R: Heartbeat (status, current job id)
+        R->>R: Update last_seen, mark stale if missing
+    end
+    Note over E,R: v1: no label/capability dispatch—see Product O4
+    W->>E: Poll pull task (POST /workers/tasks/pull)
+    E->>R: Claim pending job; bind to this worker if available
+    R->>E: Job payload (or empty)
+    E->>W: Task in pull response (same logical assign)
+```
+
+**Dispatch model:** v1 workers **poll** for work (`pull_task`); the engine does not push assignments over a standing connection. The diagram above is **logical**: assignment happens when a worker pulls and the server selects a job. **Capability/label matching** for dispatch is **not** in v1 ([PRODUCT.md — F2](PRODUCT.md#core-platform), [API_OVERVIEW — Register](API_OVERVIEW.md#register)); labels are for observability and future dispatch ([PRODUCT.md — O4](PRODUCT.md#optional--later)).
+
+**Discovery:** Workers use an **explicit server URL** in env or config (`CONTROL_PLANE_URL`, plus auth). On startup they register with the control plane and then send **periodic heartbeats** via `POST /workers/:id/heartbeat`. The **heartbeat interval** is worker-configurable (e.g. 30s in env or config). The control plane updates last-seen on each heartbeat and marks a worker **stale** if no heartbeat is received for a **server-configured** threshold (e.g. 90s or 3× heartbeat interval). Stale workers are not assigned new tasks. There is no mDNS or broker-based discovery; workers always configure the URL explicitly.
+
+### 3b. Worker death, job reclaim, and bounded retries
+
+Workers can exit unexpectedly (panic, OOM, SIGKILL, host sleep/reboot). This section describes how the system **detects** dead workers, **reclaims** their jobs, and **bounds** retries so pathological jobs don't loop forever.
+
+#### Identifying dead workers
+
+The **primary signal** is heartbeat staleness:
+
+- Each worker sends heartbeats on a configurable interval (e.g. 30s). The control plane stores `last_seen_at`.
+- If `now - last_seen_at > worker_stale_seconds` (e.g. 90s), the worker is **stale**.
+- Stale does not prove the OS is off -- it proves we have not heard from the process. Causes: crash, sleep, network loss, user killed the worker.
+
+**No separate "dead" flag is required.** Stale is sufficient to treat the worker as unavailable for assignment and to reclaim its jobs.
+
+We do **not** rely on:
+
+- Worker-reported "I'm shutting down" (best-effort only; not required for correctness).
+- TCP connection liveness to the worker (workers poll outbound; there is no persistent server-to-worker connection).
+
+**Lease timeout (phase 2, implemented):** If a job stays `assigned` longer than `job_lease_seconds` (config, e.g. 21600 = 6h) even while the worker heartbeats, the server fails it with `[JOB_LEASE_EXPIRED]` as a "stuck job" escape hatch for hung agent CLIs or infinite loops. Default 0 = disabled. The server stores `jobs.assigned_at` when assigning; in `pull_task` (before stale reclaim) it runs lease reclaim when `job_lease_seconds > 0`.
+
+#### Reclaiming tasks and reallocating
+
+**When to reclaim (recommended: in `pull_task`):** Before selecting work, run a single transactional step:
+
+```sql
+UPDATE jobs
+SET worker_id = NULL, status = 'pending', reclaim_count = reclaim_count + 1
+WHERE status = 'assigned'
+  AND worker_id IN (SELECT id FROM workers WHERE last_seen_at < $stale_cutoff)
+  AND reclaim_count < $max_job_reclaims;
+```
+
+Jobs over the reclaim cap are failed instead (see below). Then proceed as normal: select from `status = 'pending'`.
+
+**Reallocation:** After reclaim, jobs are `pending` with `worker_id = NULL`. The next `pull_task` from any non-stale worker may receive the job (existing selection rules apply).
+
+**Idempotency:** Agent workflows should be designed so a second run after reclaim is acceptable (fresh clone, new branch, or explicit "continue" semantics in params). Document for users.
+
+**Interaction with worker delete:** On `DELETE /workers/:id`, jobs assigned to that worker must also return to `pending` (and increment `reclaim_count`).
+
+#### Bounded retries: stop reclaiming eventually
+
+The retry loop to bound is: job assigned -> worker dies/sleeps before complete -> reclaimed -> another worker -> dies again. (This is distinct from agent failures, which go through `task_complete` with a failed status.)
+
+- **`reclaim_count`** (integer, default 0) on the `jobs` table tracks how many times a job has been reclaimed from a stale worker.
+- **`max_job_reclaims`** (config, e.g. **3**): when `reclaim_count >= max_job_reclaims`, the job is marked **`failed`** (not reclaimed); `error_message` is appended with `[MAX_WORKER_LOSS_RETRIES]` so UI/CLI can show a user-friendly explanation.
+- **New job = fresh counter.** Operator "retry" creates a new job row; `reclaim_count` starts at 0.
+- **Distinct from agent failure:** Agent returned non-zero / `task_complete` failed is existing behavior and does not increment `reclaim_count`. Two different failure modes, two different caps.
+
+#### Visibility
+
+- Log or metrics: `job_reclaimed{reason="stale_worker"}`.
+- API/UI: `reclaim_count` or "reassigned after worker loss" on job/session detail.
+- Failed reason `max_worker_loss_retries` visible in session/job views.
+
+#### Configuration summary
+
+| Key | Example | Purpose |
+|-----|---------|---------|
+| `worker_stale_seconds` | 90 | Worker considered dead for assignment + reclaim |
+| `max_job_reclaims` | 3 | After N stale reclaims, fail job instead of retrying |
+| `job_lease_seconds` (phase 2) | 0 (disabled) or e.g. 21600 | Max wall time in `assigned` before job is failed with `[JOB_LEASE_EXPIRED]`; 0 = no lease reclaim |
+
+### 3c. Worker restart policy and host sleep
+
+Workers run on **general workstations** that may sleep. The system handles two distinct failure modes differently:
+
+- **Process crash while host is awake:** Handled by **OS-level restart policy** (Docker `restart: unless-stopped`, systemd `Restart=on-failure`, launchd `KeepAlive`). The restarted worker re-registers and picks up reclaimed jobs.
+- **Host sleeps or powers off:** Restart policy does not help (the entire OS is suspended). Handled by **stale detection + job reclaim** (above). When the host wakes, the worker process resumes (Docker containers resume with the VM/host) and heartbeats again.
+
+**Docker Compose is the recommended runtime** for consumer devices (developer laptops, desktops). See [Hosting](HOSTING.md#6-recommended-runtime-docker-compose) for the full rationale and detailed sleep/wake behavior per platform.
+
+| Deployment target | Recommended runtime |
+|-------------------|---------------------|
+| Developer laptop / desktop (sleeps) | **Docker Compose** -- lightweight, crash restart, sleep-compatible |
+| Dedicated server / VPS (always-on) | Docker Compose or K8s |
+| Cloud / EKS / GKE | K8s |
+| Dev "just run it" | `cargo run` in terminal |
+
+**Panic reduction:** Run workers under a supervisor with restart backoff (Docker `restart`, systemd, launchd); keep worker logs on disk for post-mortems. Prefer fixing panics in the worker binary over relying on restart alone ([HOSTING.md §11 Anti-patterns](HOSTING.md#11-anti-patterns)).
+
+## 4. Task & Workflow Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant U as User (CLI or Web)
+    participant API as API Gateway
+    participant E as Task Engine
+    participant R as Registry
+    participant W as Worker
+
+    U->>API: Create session / Start workflow (repo, type, params)
+    API->>E: Enqueue or assign
+    E->>R: Select worker (available, capable)
+    E->>W: Dispatch (clone url, workflow def, env)
+    W->>W: Clone repo, run Claude Code / Cursor CLI (user’s token)
+    W->>API: POST log batches; control plane aggregates (see §6)
+    API->>U: Stream logs to CLI or Web
+    W->>E: Task complete (result, branch, commit ref)
+    E->>R: Update job state
+    E->>API: Notify session complete
+```
+
+**v1:** Workers get tasks by **polling** (e.g. `POST /workers/tasks/pull` or long-poll); the engine does not push. When a worker polls, the engine selects an available worker and returns the task (logically "dispatch" as above).
+
+**Workflow types and how they map:**
+
+- **Chat** → Multi-turn in one session: the first job uses the create-session prompt; each follow-up via `POST /sessions/:id/input` is a new job whose **`task_input`** includes the original prompt (`session_prompt`), prior user follow-ups (`history`), prior assistant replies (`history_assistant`; user/assistant text only, no thinking or tool calls), and the new message—so the agent sees the full conversation and session goal (e.g. “Retry”). **Bounded payload:** The control plane **must not** grow `history` / `history_assistant` without limit—defaults and `history_truncated` are specified in [API_OVERVIEW — Pull task](API_OVERVIEW.md#pull-task). UI copy: [CLIENT_EXPERIENCE §12](CLIENT_EXPERIENCE.md#12-long-chat-sessions).
+- **Loop N times** → **One job per iteration:** the engine creates N jobs; each job is one task (one clone, one agent run). Worker pulls one task per iteration.
+- **Loop until sentinel** → **One job per iteration:** worker runs until agent output contains the configured **literal substring** sentinel (**v1**; no regex); each iteration is one job. Variable number of jobs per session.
+- **Continuous inbox** → Long-lived session per agent; tasks are messages in an inbox; worker **polls** the control plane (v1: no broker push).
+- **Spawn to other inbox** → One workflow sends a message/task to another agent’s inbox (stored in Registry); that agent’s worker picks it up.
+
+(One job per iteration is the rule for loop workflows.)
+
+### 4b. Personas (separate agent identities)
+
+When you have agent loops, inboxes, and chat, agents need **separate personas**—distinct “who is this agent” context for each run. Personas are **user-provided, pre-configured prompts** stored in the control plane (e.g. “Refactorer”, “Reviewer”, “Code reviewer that focuses on security”).
+
+**At every invocation** (chat, loop iteration, inbox task, or any other path), the system:
+
+1. Resolves the **persona** for that run (from session params, inbox config, or task payload).
+2. Takes that persona’s prompt and **combines it with the task-specific information** (repo, ref, user message, loop prompt, inbox payload, etc.).
+3. Passes that combined context to the worker; the worker invokes the Claude Code or Cursor CLI with it so the agent runs with the right identity and task.
+
+So: the same worker and CLI can run many “agents”; what distinguishes them is the persona prompt plus the task. Personas are optional: if no persona is specified, the task runs with only the workflow params (e.g. a single user prompt). See [Product W6](PRODUCT.md) and [API_OVERVIEW](API_OVERVIEW.md) (Personas, persona_id in session/inbox).
+
+**Agent execution (BYOL):** The worker does not call model HTTP APIs for the main agent turn. It runs the **Claude Code** or **Cursor** CLI in the cloned repo, authenticated with the user’s **agent** token stored on the control plane (Web UI / CLI / API). Git identity OAuth applies to **GitHub/GitLab** only. See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol).
+
+### 4c. Platform-specific workers (CLI invocation)
+
+Workers run on **Windows** (native or WSL), **macOS**, and **Linux**. The agent CLIs (Claude Code, Cursor) **operate differently on each platform**—different invocation, argument passing, process model, and output streaming. A single “generic” worker that assumes Unix behaviour is not sufficient; in particular **Windows** diverges heavily (process creation, quoting, console/PTY, stdout/stderr handling).
+
+We must have **platform-specific workers** (or platform-specific handling inside the worker) that implement, per platform:
+
+1. **Discovering and invoking the CLI** — where the CLI is installed, how it is named, how to spawn it (e.g. `CreateProcess` vs `fork`/`exec`, WSL vs native Windows).
+2. **Passing arguments in** — how to pass prompts, options, and task context into the CLI (argument quoting, command-line vs stdin, environment; Windows command-line parsing is different from Unix).
+3. **Streaming results out** — how to capture and stream stdout/stderr (or equivalent) back to the control plane; PTY vs non-PTY, Windows console vs Unix streams.
+
+So: **one worker binary (or build) per platform** (Windows native, WSL, macOS, Linux), each with **specific handling** for interacting with the CLIs on that platform. Workers **advertise their platform** (e.g. via labels such as `platform=windows`, `platform=wsl`, `platform=macos`, `platform=linux`) for observability (filtering, display).
+
+**Operational requirement (slick multi-platform pools):** Run a **homogeneous worker pool** per deployment—same **OS family** (or WSL vs native Windows) and the same **`agent_cli` installed and on PATH**. The v1 engine does **not** enforce platform or CLI affinity; a mixed pool (e.g. Linux + macOS workers) can assign a task to a machine that **cannot** run the requested CLI. Prefer **separate control plane deployments** or a **single OS** in the pool until **label/capability dispatch** is available ([Product O4](PRODUCT.md)). See [Tech Stack §2](TECH_STACK.md#2-workers-rust) and [Product F2](PRODUCT.md).
+
+**Implementation (CLI/Web):** The **Workers** view **must** implement the warning banner and messaging in [CLIENT_EXPERIENCE §10](CLIENT_EXPERIENCE.md#10-worker-pool-heterogeneity-warnings) when the registry shows **incompatible or mixed** `platform` labels so users are not surprised by spawn/CLI errors.
+
+**Implementation (Rust worker):** `crates/worker/src/agent_cli/` provides `AgentCliRunner` (Unix vs Windows spawn options), `build_invocation` (`claude_code` \| `cursor` → argv + env + optional stdin; tokens only in env), `run_invocation` (stdout/stderr line streaming with redaction to log sinks + raw capture for `task_complete`), and WSL-aware `register_platform_label` (`wsl` \| `linux` \| `macos` \| `windows`). End-to-end pull → clone → run → complete is wired in plan task 19.
+
+## 5. Session Attachment (CLI ↔ UI)
+
+Sessions are stored in the **Session Store** and identified by a stable **session ID**. Both CLI and Web use the same API and session ID.
+
+```mermaid
+flowchart LR
+    subgraph "Start session"
+        A[User starts in Web UI]
+        B[User starts in CLI]
+    end
+    A --> SessionStore[(Session Store)]
+    B --> SessionStore
+    SessionStore --> SessionID[session_id]
+
+    subgraph "Attach to session"
+        C[CLI: attach session_id]
+        D[Web: open session_id URL]
+    end
+    SessionID --> C
+    SessionID --> D
+    C --> LogStream[Log stream / Live view]
+    D --> LogStream
+```
+
+**Implementation notes:**
+
+- Creating a session returns `session_id` (and optionally a deep link for the Web UI).
+- **CLI**: `remote-harness attach <session_id>` opens a live view (logs, status) and optionally sends input (e.g. chat).
+- **Web**: URL like `/sessions/:session_id` shows the same session; same log tail and controls.
+- Both clients subscribe to the same **log stream** and **session events** via **SSE** keyed by `session_id`.
+
+## 6. Logging Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        W1[Worker 1]
+        W2[Worker 2]
+        API[API Gateway]
+        E[Engine]
+    end
+
+    subgraph "Log pipeline"
+        Collect[Log Collector / Agent]
+        Buffer[Buffer / Queue]
+        Store[(Log Store)]
+        Index[(Index by session_id, job_id, level, time)]
+    end
+
+    subgraph Consumers
+        CLI_Tail[CLI: tail]
+        Web_Tail[Web: tail / viewer]
+    end
+
+    W1 --> Collect
+    W2 --> Collect
+    API --> Collect
+    E --> Collect
+    Collect --> Buffer
+    Buffer --> Store
+    Buffer --> Index
+    Store --> CLI_Tail
+    Store --> Web_Tail
+    Index --> CLI_Tail
+    Index --> Web_Tail
+```
+
+**Requirements:**
+
+- **Structured logs** (e.g. JSON) with fields: `session_id`, `job_id`, `worker_id`, `level`, `message`, `timestamp`, `source`.
+- **Logs interface: consistent and complete.** Wherever a user views logs (session, job, or any context), the **full history** for that context must be **loaded and rendered first** (all logs, no cap—paginate until complete), then the live stream is attached. So: (1) client fetches all existing logs for the context, (2) client renders them, (3) client subscribes to the stream so new logs append. The user always sees the complete backlog before any streamed entries; same behavior in CLI and Web UI.
+- **Tail from CLI**: e.g. `remote-harness logs tail --session-id <id>` — load history first, then stream. v1: SSE for the stream.
+- **Tail from Web**: Session (and job) detail views have a log panel that loads full history for that context first, then streams. **CLI and Web UI** both show **all logs from all places** (agent, system, backend, worker).
+- **Persistence**: See “Observability and dual-write” below.
+
+**Observability at all times — dual-write (files + central store):**
+
+Logs must be findable even when something is broken (e.g. streaming to the CLI or Web UI fails). So every component **writes logs to local files** on the machine where it runs, and the same logs are also available from a **central store** so the CLI and Web UI can both show everything.
+
+| Where | What happens |
+|-------|----------------|
+| **Worker** | Writes **all** logs (agent output, system, worker code) to **local files** on the worker machine (e.g. under a configured log dir). **Also** sends the same log entries to the control plane (HTTPS POST). So if the control plane or network is down, logs are still on disk on that worker. |
+| **Control plane** | Writes its own logs to **local files** on the backend (e.g. under a configured log dir). Receives worker logs and stores them in the **central store** (DB). Writes its own logs into the same central store so the CLI and Web UI have one place for “all logs.” So if the stream or either client is broken, you can still read files on the backend (control plane’s own logs) and on each worker (that worker’s logs). |
+| **Central store (DB)** | Holds all logs that reached the control plane (worker logs via POST, control plane’s own logs). Used for CLI and Web UI tail, search, and “whole system” view. Default retention: 7 days (configurable); “retain forever” / manual delete apply here. |
+| **CLI and Web UI** | Both get all logs from the central store (tail API, search). So from either client you see agent, system, backend, worker — the whole state. If streaming or the client is broken, you fall back to reading **files on the backend** or **files on the worker**. |
+
+So: **all logs go to disk** — every log line is written to local files on the component that produced it (control plane to files on the backend, each worker to files on that worker). The same logs (that reach the control plane) are also in the central store so the **CLI and Web UI** can show everything. Observability at all times from either client; if the stream or a client breaks, you always have logs on disk.
+
+**Implementation note (v1 control plane):** The **Postgres central store** is implemented: worker batch ingest (`POST /workers/tasks/:id/logs`), paginated history, delete, and scheduled retention purge (honoring `retain_forever`). **SSE** live tail (`GET /sessions/:id/logs/stream`) and session lifecycle events (`GET /sessions/:id/events`) use in-memory broadcast channels (see [`SSE_EVENTS.md`](SSE_EVENTS.md)). **Optional on-server file mirroring** of ingested lines is not implemented—the operator path for “files when the UI breaks” remains **worker-local files** and **host logs** for the server process.
+
+## 7. Agent Inboxes & Cross-Agent Tasks
+
+For “agents monitoring an inbox” and “spawn tasks to another agent’s inbox”:
+
+```mermaid
+flowchart TB
+    subgraph "Control Plane"
+        Engine[Task Engine]
+        Inboxes[(Inboxes: agent_id -> queue of tasks)]
+        Registry[(Registry)]
+    end
+
+    subgraph "Agent A (continuous)"
+        WorkerA[Worker A]
+        InboxA[Inbox A]
+    end
+
+    subgraph "Agent B (continuous)"
+        WorkerB[Worker B]
+        InboxB[Inbox B]
+    end
+
+    Engine --> Inboxes
+    InboxA --> WorkerA
+    InboxB --> WorkerB
+    WorkerA -->|"spawn_task(agent_id=B, task)"| Engine
+    Engine --> Inboxes
+    InboxB --> WorkerB
+```
+
+- Each **agent** (or agent “role”) has an **inbox** in the Registry (DB); tasks are rows in a table.
+- A **continuous** workflow is a long-running worker that: (1) claims “inbox listener” for that agent, (2) **polls** the inbox via the API, (3) processes tasks and can call the API to **spawn_task(agent_id, payload)**.
+- Spawn inserts a task into the target agent’s inbox; that agent’s worker picks it up when it polls or receives an event.
+
+## 8. Three auth concerns
+
+The system has **three separate auth concerns**. Do not mix them up:
+
+| Concern | Who | Purpose | Who chooses the mechanism |
+|--------|-----|---------|----------------------------|
+| **1. Auth to the control plane** | User (CLI/Web UI) and worker process | Who is allowed to use this Remote Harness instance; which machines may register as workers. | **We** choose (e.g. API key, OIDC, mTLS). This is our API's auth. |
+| **2. Auth to the Git provider** | User (via our app); worker uses the token we give it | Clone/push to GitHub/GitLab. Must work with that provider. | **The provider** (GitHub/GitLab). We store and refresh the user's token; we pass it to the worker per job. |
+| **3. Auth to the agent CLI (BYOL)** | User (their subscription); worker runs CLI with that token | Claude Code / Cursor must be authenticated. | **The provider** (Claude Code, Cursor). We store and refresh the user's token; we pass it to the worker so it can run the CLI. |
+
+- **Control plane auth (1)** is the only one we design ourselves. v1 uses **API key only** for CLI, Web UI, and workers; see [Tech Stack §6](TECH_STACK.md#6-security--auth-control-plane-only) for configuration. OIDC and mTLS are out of scope for v1.
+- **Git (2)** and **agent CLI (3)** are always on behalf of the user and use **that provider's** mechanism; we do not replace it, we store and pass tokens.
+
+## 9. Git Integration (Workers)
+
+| Mode | Behavior |
+|------|----------|
+| **Main** | Worker clones, makes commits, pushes to `main` (or configured default branch). |
+| **Task order (worker)** | Clone and checkout the session **ref** first (fail fast if URL/token/ref is wrong). **Branch / MR metadata (before agent):** In **PR/MR** (and similar) modes the worker may generate a branch name and MR/commit messages via a **short model call** (implementation-specific: may use the same Cursor/Claude CLI or a small auxiliary call—must use credentials already on the task / host). Failures here are user-visible job failures with a clear message (see [§9a](ARCHITECTURE.md#9a-when-the-worker-attempts-commit-and-push)). Then create the feature branch at that HEAD if applicable, **run the agent CLI** (main work), then commit/push. |
+| **PR/MR** | Worker creates a branch (e.g. from prompt or naming rule), commits, pushes branch, optionally creates PR/MR via API (GitHub/GitLab). |
+
+**Branch naming:** Default is derived from **session_id** (e.g. `harness/<short_session_id>`). Session create accepts optional **branch_name_prefix** in params; if set, branch = prefix + short session/task id. See [API_OVERVIEW](API_OVERVIEW.md).
+
+### 9a. When the worker attempts commit and push
+
+The worker **attempts** commit and push only after the **main agent run** completes in a way the worker treats as successful for Git follow-up (e.g. the agent process ran and the worker did not abort before the commit step—exact condition is implementation-defined but **must** be documented in worker release notes). If that precondition is not met, **no commit** is produced.
+
+**Typical reasons there is no commit or push:**
+
+| Cause | Result | What to check |
+|---------|--------|----------------|
+| **Agent run failed early** (e.g. CLI missing, spawn error, timeout) | Job **failed**; often no `branch` / `commit_ref`. | `error_message`, worker logs: agent run / spawn errors. |
+| **Missing task credentials** | No clone; job **failed**. | Identity or params must supply `repo_url`, `git_token`, `agent_cli`, `agent_token`. |
+| **Clone or checkout failed** | Job **failed**; auth or ref issues. | `error_message`, [GIT_CLONE_SPEC.md](GIT_CLONE_SPEC.md). |
+| **Branch / MR “planning” step failed** (metadata generation) | Job **failed** before or without useful Git output. | `error_message` should name this phase; [CLIENT_EXPERIENCE §7.1](CLIENT_EXPERIENCE.md#71-git-planning-failures-branchmr-text). |
+| **Create branch failed** | Job **failed**. | Worker logs, `error_message`. |
+| **Commit or push failed** after agent ran | May have **no** `commit_ref` even if the agent produced output; job status depends on agent exit code and worker policy. | Logs for push/auth errors. |
+
+**Edge case:** Some implementations still **attempt** commit/push after the agent exits **non-zero** (agent “failed” but worker proceeded). Then you can have **commits on the remote** while the job **`status`** is **failed**—the control plane will not open a PR/MR unless it only does so on **success** ([§9b](ARCHITECTURE.md#9b-when-the-control-plane-creates-a-prmr)). UI must explain that distinction ([CLIENT_EXPERIENCE §8](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes)).
+
+### 9b. When the control plane creates a PR/MR
+
+The server creates a **Pull Request (GitHub)** or **Merge Request (GitLab)** only when **all** of the following hold (exact handler is implementation-specific; these are the intended product rules):
+
+- Task complete reports **success** (not **failed**).
+- Job reaches a **completed** (or equivalent) terminal state aligned with that success.
+- **`branch`** and **`mr_title`** (or API equivalent) from the worker are **non-empty** where required by the API contract.
+- Session **`params.branch_mode`** is **`"pr"`** (exact string).
+- **`repo_url`** is recognized as **GitHub or GitLab**, and the identity has a **git token** usable for the provider API.
+
+**Typical reasons there is no PR/MR despite a push:**
+
+| Cause | What to check |
+|-------|----------------|
+| **Job not successful** | Worker sent `failed` (e.g. agent non-zero). MR logic usually requires success. |
+| **Not in PR mode** | `branch_mode` must be `"pr"`. |
+| **Missing branch or title** | Task complete payload incomplete. |
+| **Provider not GitHub/GitLab** | URL not recognized; MR skipped. |
+| **Provider API error** | Token scopes, rate limits, or API failure—job may still **complete** while MR creation fails; surface for operators ([CLIENT_EXPERIENCE §8](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes)). |
+
+Operator checklist: [TROUBLESHOOTING §2b](TROUBLESHOOTING.md#2b-no-commit-push-or-merge-request).
+
+### Git auth (GitHub / GitLab) — auth concern 2
+
+Git operations must work with **GitHub** and **GitLab**. This is **auth concern 2** (see §8): the provider’s mechanism; we store and pass the user’s token. Workers never perform login themselves.
+
+- **User sign-in:** Users sign in to GitHub and/or GitLab via the platform (e.g. OAuth in the Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT) as appropriate.
+- **Credentials per job:** For each task, the control plane either includes a job-scoped token in the task payload or exposes an endpoint so the worker can request credentials for a given repo. Workers use that token only for the duration of the job.
+- **Worker Git usage:** The worker receives a token (or SSH key) and uses it for clone/push. Both GitHub and GitLab support HTTPS with a token as the password; the worker’s Git library (e.g. `git2`) is configured with credentials we supply—no reliance on the host’s global Git config for user credentials. To avoid libgit2 "too many redirects or authentication replays" (e.g. on HTTP→HTTPS or CDN redirects), the worker must embed the token in the URL (URL-encoded) and set follow_redirects to All; see [GIT_CLONE_SPEC.md](GIT_CLONE_SPEC.md).
+
+## 10. Deployment Topology (Logical)
+
+- **Single server**: Control plane (API + Engine + Session Store + Log Aggregator + Registry) on one host; workers on one or many devices.
+- **Scaled**: API and Engine can be replicated behind a load balancer; Registry and Log Store must be shared (DB, queue, or distributed store).
+- **Control plane & workers**: Implemented in Rust (see [Tech Stack](TECH_STACK.md)). Workers run on dev machines, CI nodes, or dedicated boxes; only need network access to control plane and Git remotes.
+
+**Hosting flexibility:** The control plane (and its DB) can run on an always-on server or on a sleepable machine (e.g. desktop or laptop). Workers can run on Windows (native or WSL), macOS, or Linux. For **power-saving setups** where the backend and workers may be off or asleep, an optional **wake integration** (configurable URL or script invoked by the UI/CLI) lets you trigger your own wake path (e.g. WOL from an always-on host). The product does not mandate or implement WOL or any specific hosting layout. See [Hosting](HOSTING.md) for deployment topologies and the sleepable / wake-integration design.
+
+---
+
+*Next: [Tech Stack](TECH_STACK.md) | [Product & Features](PRODUCT.md) | [Hosting](HOSTING.md) | [Client experience](CLIENT_EXPERIENCE.md)*
+
+======== FILE: docs/IMPLEMENTATION_BOUNDARIES.md ========
+# Implementation boundaries & test strategy
+
+Companion to [TECH_STACK §7](TECH_STACK.md#7-repo-layout-rust-monorepo) and [ARCHITECTURE](ARCHITECTURE.md). **Goal:** keep dependencies and contracts one-directional so the workspace can grow without ad-hoc coupling.
+
+---
+
+## 1. Crate graph
+
+**Workspace binaries and library:**
+
+| Crate | Role | May depend on |
+|-------|------|----------------|
+| **`api-types`** | Shared serde types, IDs, request/response shapes for REST JSON | `serde`, small std-only helpers only—**no** `axum`, `sqlx`, `reqwest` |
+| **`server`** | Control plane: HTTP (REST + SSE), DB, workflows, log aggregation | `api-types`, DB stack (`sqlx`, etc.), `axum`, engine/store modules **inside** this crate |
+| **`worker`** | Poll tasks, Git, agent CLI subprocess (`src/agent_cli/` — platform spawn + argv/env + streaming) | `api-types`, HTTP client (`reqwest`), `git2`—**no** server-only crates |
+| **`cli`** | User commands, API client, SSE consumers | `api-types`, HTTP + SSE client stack—**no** direct `sqlx` / server internals |
+
+**Dependency rule:** `api-types` is a **DAG leaf** (nothing in `crates/` should depend on `server`). `worker` and `cli` talk to the control plane **only over HTTP** (and shared types from `api-types`), not by linking server code.
+
+**Optional internal layout inside `crates/server`** (single package, modules—not separate crates unless a future task splits them):
+
+- **`engine`** — task/workflow state machine, queue claims, leases
+- **`api`** — Axum routers, extractors, error mapping to [standard error JSON](API_OVERVIEW.md#2-standard-error-response)
+- **`db`** — queries, migrations path (`crates/server/migrations` per [ARCHITECTURE §2a](ARCHITECTURE.md#2a-schema-migrations))
+
+Keep boundaries as **modules** with `pub(crate)` where possible so handlers do not reach into raw SQL from every file.
+
+---
+
+## 2. Single source of truth for HTTP contracts
+
+- **Canonical artifact:** **OpenAPI 3.x** at [`crates/server/openapi.yaml`](../crates/server/openapi.yaml) ([API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)). **This file + [API_OVERVIEW.md](API_OVERVIEW.md) must agree**; CI fails on `operationId` drift via `cargo test -p server --test openapi_contract` ([CICD_DESIGN §4](CICD_DESIGN.md#4-platform-placeholder--remaining-decisions)).
+- **Rust types:** Prefer **`api-types`** as the shared serde mirror for payloads used by server, worker, and CLI. If a type is server-only (internal admin), it may live in `server` only—do not duplicate “public” REST shapes in three places.
+- **Alternatives (avoid unless justified):** Hand-written duplicates in each crate **require** a pairing test or codegen step so JSON round-trips match OpenAPI examples.
+
+**SSE:** Documented in **[SSE_EVENTS.md](SSE_EVENTS.md)** (companion to OpenAPI); stated in the `openapi.yaml` header and [PROJECT_KICKOFF §6](PROJECT_KICKOFF.md#6-communication--docs).
+
+---
+
+## 3. Configuration (env + file precedence)
+
+Align with [TECH_STACK §3](TECH_STACK.md#3-cli--rust), **Control plane auth** table in [TECH_STACK §6](TECH_STACK.md#6-security--auth-control-plane-only), and implementation notes there.
+
+| Component | Control plane URL | API key / auth | Notes |
+|-----------|-------------------|----------------|--------|
+| **Server** | `PORT`, `DATABASE_URL`, bind address | `API_KEY` / `API_KEYS`, issued keys in DB, optional config file | See server task specs for full env surface |
+| **CLI** | `REMOTE_HARNESS_URL` or `CONTROL_PLANE_URL`; config `control_plane_url` | `REMOTE_HARNESS_API_KEY` / `API_KEY`; config `api_key` | **Precedence:** CLI flag > env > `~/.config/remote-harness/config.yaml` |
+| **Worker** | `CONTROL_PLANE_URL` or `REMOTE_HARNESS_URL` | `API_KEY` or `REMOTE_HARNESS_API_KEY` | **v1:** env only (`crates/worker/README.md`). Optional YAML file may be added later; no CLI flags for worker v1 |
+
+**Rule:** Document new env vars in **one** place operators read ([GETTING_STARTED](GETTING_STARTED.md), [HOSTING](HOSTING.md), or TECH_STACK)—and add them to the server/worker/CLI config parsers in the same change.
+
+---
+
+## 4. SSE vs REST (avoid ad-hoc channels)
+
+- **REST:** CRUD, commands, polling endpoints (`POST /workers/tasks/pull`, session create, etc.).
+- **SSE:** Long-lived **streams** only—e.g. log tail, session attach/events ([API_OVERVIEW](API_OVERVIEW.md)).
+
+**Implementation pattern (server):** Use a **single broadcast / subscriber abstraction** per stream family (e.g. “log events keyed by session/job”, “session lifecycle events keyed by session id”). Handlers subscribe clients to those buses; **do not** spawn unbounded per-handler `tokio::sync::broadcast` channels without a shared registry, or duplicate fan-out logic in each route.
+
+**Clients (CLI + Web):** Same URLs and query params as documented; reconnect with backoff ([CLIENT_EXPERIENCE](CLIENT_EXPERIENCE.md)).
+
+---
+
+## 5. Test pyramid & named commands
+
+Use the same commands in local dev and CI ([CICD_DESIGN §2](CICD_DESIGN.md#2-jobs-design)).
+
+| Layer | Scope | Command(s) | Notes |
+|-------|--------|------------|--------|
+| **Unit** | Pure logic (parsers, state transitions, cap math) | `cargo test -p <crate> --lib` | No network; fast |
+| **Integration (Rust)** | DB + HTTP with real Postgres | `cargo test --all-targets` with `DATABASE_URL` pointing at a disposable DB | Prefer a dedicated test database; optional **testcontainers** (or Compose service) if the repo adopts it—keep one documented pattern |
+| **Web** | Components, hooks, API client | `npm ci` then `npm run lint`, `npm run typecheck` / `tsc --noEmit`, `npm run build`, `npm run test` (Vitest) | Exact scripts follow `web/package.json` when present |
+| **E2E (optional)** | Full stack smoke | Documented in plan task **26** (e.g. Compose smoke); **Playwright** only if added by spec—not required for v1 core loop |
+
+**Formatting / lint (Rust):** `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+
+**Contract drift:** Implemented per [CICD_DESIGN §4](CICD_DESIGN.md#4-platform-placeholder--remaining-decisions) (`openapi_contract` test + GitHub Actions workflow).
+
+---
+
+## Related docs
+
+- [ARCHITECTURE §2a — Migrations](ARCHITECTURE.md#2a-schema-migrations)
+- [TECH_STACK §7 — Repo layout](TECH_STACK.md#7-repo-layout-rust-monorepo)
+- [API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)
+
+*Previous: [Docs index](README.md) | Next: follow [plan/README.md](../plan/README.md) build order*
+
+======== FILE: plan/18-worker-agent-cli-platform-complete.md ========
+# 18 — Worker: Claude Code / Cursor invocation (platform-specific)
+
+**Status:** complete  
+**Dependencies:** 16
+
+## Objective
+
+**Isolate OS-specific** process spawning: Windows native vs WSL vs macOS vs Linux for **argument quoting**, stdin vs argv, stdout/stderr streaming, optional PTY needs ([ARCHITECTURE §4c](../docs/ARCHITECTURE.md#4c-platform-specific-workers-cli-invocation), [TECH_STACK §2](../docs/TECH_STACK.md#2-workers-rust)).
+
+## Scope
+
+**In scope**
+
+- Module per platform or `cfg(target_os)` matrix with shared trait `AgentCliRunner`.
+- Map `agent_cli` enum from task payload to binary + args; inject `agent_token` per vendor docs **without** logging it.
+- Stream child output to **worker logs** + accumulate **assistant_reply** / **output** snippet for `task_complete` ([API_OVERVIEW — Task complete](../docs/API_OVERVIEW.md#task-complete)).
+
+**Out of scope**
+
+- Installing CLIs—document prerequisites.
+
+## Spec references
+
+- [PRODUCT — BYOL](../docs/PRODUCT.md#bring-your-own-licence-byol)
+- [ARCHITECTURE §9a](../docs/ARCHITECTURE.md#9a-when-the-worker-attempts-commit-and-push)
+
+## Acceptance criteria
+
+- **Unit tests** with **fake child** or recorded subprocess interface (no real vendor in CI).
+- Manual smoke checklist documented for one OS (developer runbook).
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `cargo test -p worker` platform-agnostic paths | CI + manual per platform |
+
+## Completed / Notes
+
+- Added `crates/worker/src/agent_cli/`: `AgentCliKind`, `WorkerPlatform` + WSL detection, `register_platform_label` for worker register, `build_invocation` / `run_invocation`, `TracingAgentLogSink`, `CapturedAgentOutput`, `UnixAgentCliRunner` / `WindowsAgentCliRunner` (`CREATE_NO_WINDOW`).
+- Docs: [ARCHITECTURE.md §4c](../docs/ARCHITECTURE.md#4c-platform-specific-workers-cli-invocation) implementation pointer; [worker README](../crates/worker/README.md) env table + macOS manual smoke; [IMPLEMENTATION_BOUNDARIES.md](../docs/IMPLEMENTATION_BOUNDARIES.md) worker row.
+- Pull loop still fails jobs until plan task 19 wires clone + `run_invocation` + complete/logs.
+
+======== FILE: docs/TECH_STACK.md (excerpt row only; full file was not re-logged) ========
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). **Code:** `crates/worker/src/agent_cli/` (`AgentCliRunner`, `build_invocation`, `run_invocation`). | — |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user’s token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).

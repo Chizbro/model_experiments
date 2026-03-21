@@ -66,6 +66,8 @@ A **remote harness** for agentic tasks: a single control plane that manages work
 
 ### Optional / Later
 
+**Phase 2 design (personas, inboxes, PR/MR API details, log search):** see [PHASE2_DESIGN.md](PHASE2_DESIGN.md) — implementation tasks follow that document.
+
 | ID | Feature | Description | Priority |
 |----|---------|-------------|----------|
 | O2 | **PR/MR creation** | In PR/MR mode, after push, call GitHub/GitLab API to open a Pull/Merge Request. | P1 |
@@ -76,6 +78,8 @@ A **remote harness** for agentic tasks: a single control plane that manages work
 ---
 
 ## Success Criteria (Early Phase)
+
+**Automated check:** [`scripts/compose-smoke.sh`](../scripts/compose-smoke.sh) (Tier 1: stub agent + `file://` repo in Docker Compose) verifies control plane + Postgres + worker + static web, a **chat** session whose **first job completes** (session may remain **`running`** for follow-up turns), and **logs via the API**. Tier 2 is a real remote + BYOL tokens without the stub (see [GETTING_STARTED §1.9](GETTING_STARTED.md#19-automated-compose-smoke-tier-1--tier-2)).
 
 - [ ] One control plane + one worker: run a “chat” workflow on a repo and see one commit (or branch) created.
 - [ ] Second worker joins without changing server config; tasks can be handled by either worker.

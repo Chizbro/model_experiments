@@ -1,0 +1,315 @@
+================================================================================
+AGENT CONTEXT DUMP — plan task 16 (worker HTTP lifecycle)
+================================================================================
+This file is a verbatim-style dump of the assistant’s working context for this
+session: user instructions, interpretation, discovery, implementation choices,
+file edits, commands run, failures, and fixes. (Requested: full context, not a
+short summary.)
+
+--------------------------------------------------------------------------------
+1) USER REQUEST (verbatim substance)
+--------------------------------------------------------------------------------
+- Find the next numbered task in plan/ still marked *-pending.md (ascending).
+- If none: output exactly `{ "event": "terminate", "reason": "NO MORE JOBS" }`
+  and stop (no tools).
+- If pending:
+  - Rename *.pending.md → *.processing.md
+  - Read spec, implement + test, consult docs
+  - Build + lint; migrations if any must work
+  - Rename → *.complete.md
+  - Dump full assistant context to logs/{task}.log (entire contents window)
+
+Note: Actual plan files use the pattern `NN-slug-pending.md`, not `*.pending.md`.
+Glob `*.pending.md` returned 0; listing plan/ showed files like
+`16-worker-http-lifecycle-pending.md`.
+
+--------------------------------------------------------------------------------
+2) TASK SELECTED
+--------------------------------------------------------------------------------
+Lowest pending: **16-worker-http-lifecycle-pending.md**
+Renamed: `16-worker-http-lifecycle-pending.md` → `16-worker-http-lifecycle-processing.md`
+(later finalized as `16-worker-http-lifecycle-complete.md` after work.)
+
+Spec title: **16 — Worker: HTTP client, register, heartbeat, pull loop**
+
+Key requirements extracted:
+- ControlPlaneClient module; centralize reqwest (no scattered calls).
+- Config: CONTROL_PLANE_URL, API key, heartbeat interval.
+- Idempotent register on restart: HTTP 409 treated as success.
+- client_version from build metadata `env!("CARGO_PKG_VERSION")`.
+- Structured logging; never log secrets (API key).
+- Integration tests: wiremock or mock HTTP verifying shapes + auth headers.
+- Out of scope: Git + agent execution (tasks 17–19).
+- Acceptance: worker idles against real server in Compose (full smoke cited as task 26).
+
+--------------------------------------------------------------------------------
+3) CODEBASE DISCOVERY (before implementation)
+--------------------------------------------------------------------------------
+- Existing `crates/worker/src/main.rs` was a println stub referencing api_types version.
+- Server routes (crates/server/src/lib.rs): POST /workers/register, POST /workers/{id}/heartbeat,
+  POST /workers/tasks/pull (worker_tasks::pull_task).
+- Auth: Bearer or X-API-Key (crates/server/src/auth.rs). Integration tests predominantly use
+  `Authorization: Bearer <key>`.
+- pull_task returns 204 No Content when no job; 200 JSON PullTaskResponse when assigned.
+- Pull requires worker_id in JSON body (validated server-side).
+- Register conflict: unique violation → 409 with Standard error body.
+- docker-compose.yml had worker service commented; only postgres + server active.
+- Root Dockerfile built only `server` binary.
+
+--------------------------------------------------------------------------------
+4) DESIGN DECISIONS
+--------------------------------------------------------------------------------
+- Library + binary split: `crates/worker/src/lib.rs` (run loop + exports) and `main.rs` (tracing init, runtime).
+- **ControlPlaneClient** in `control_plane.rs` with methods:
+  - `register_idempotent(&WorkerConfig)` → 201 or 409 OK
+  - `heartbeat_idle(worker_id)` status "idle"
+  - `pull_task(worker_id)` → PullOutcome::NoWork | Task(PullTaskResponse)
+  - `complete_task_failed(...)` for assigned tasks until task 19 implements execution
+    (avoids leaving jobs stuck in `assigned`; error_message explains plan task 19).
+- **WorkerConfig::from_env** supports aliases from TECH_STACK / Compose docs:
+  - URL: CONTROL_PLANE_URL or REMOTE_HARNESS_URL
+  - Key: API_KEY or REMOTE_HARNESS_API_KEY
+  - WORKER_ID optional; default hostname::get() + "-worker" else UUID suffix
+  - WORKER_HOST optional register host field
+  - WORKER_HEARTBEAT_INTERVAL_SECS optional (default 30, must be >=1 if set)
+- Register labels: `{ "platform": "macos"|"linux"|"windows" }` from `std::env::consts::OS`.
+- Heartbeat: background tokio task on interval; initial heartbeat before pull loop (server stale gate).
+- Pull loop: tokio::select! biased: ctrl_c, pull_task; exponential backoff 1s..30s on NoWork;
+  2s sleep on transport/API pull errors.
+- Path encoding: urlencoding for worker_id and task id in path segments.
+- Error bodies truncated to 512 chars for logs/errors (no key material).
+
+--------------------------------------------------------------------------------
+5) DEPENDENCIES ADDED (crates/worker/Cargo.toml)
+--------------------------------------------------------------------------------
+- api-types (path)
+- reqwest 0.12 rustls-tls json
+- serde_json, thiserror, tokio (macros rt-multi-thread signal time)
+- tracing, tracing-subscriber env-filter
+- hostname, uuid v4, urlencoding
+- dev: wiremock 0.5, serde_json, tokio
+
+--------------------------------------------------------------------------------
+6) FILES CREATED / MODIFIED (inventory)
+--------------------------------------------------------------------------------
+CREATED:
+- crates/worker/src/lib.rs
+- crates/worker/src/config.rs
+- crates/worker/src/control_plane.rs
+- crates/worker/tests/control_plane_client.rs
+- crates/worker/README.md
+- Dockerfile.worker
+- plan/16-worker-http-lifecycle-complete.md
+
+MODIFIED:
+- crates/worker/Cargo.toml (lib target, deps)
+- crates/worker/src/main.rs (tokio main, tracing, WorkerConfig::from_env, worker::run)
+- docker-compose.yml (enabled worker service)
+- Dockerfile (comment: worker uses Dockerfile.worker)
+- README.md (root quick start mentions cargo run -p worker)
+- docs/TECH_STACK.md (worker env-first v1; YAML deferred)
+- docs/IMPLEMENTATION_BOUNDARIES.md (worker config table)
+- plan/README.md (task 16 link → complete)
+
+DELETED (after superseded):
+- plan/16-worker-http-lifecycle-processing.md (replaced by -complete.md)
+
+--------------------------------------------------------------------------------
+7) TESTS IMPLEMENTED (wiremock)
+--------------------------------------------------------------------------------
+File: crates/worker/tests/control_plane_client.rs
+Cases:
+- register_sends_bearer_auth_and_json_body (expects Authorization + JSON, 201)
+- register_conflict_409_is_idempotent
+- heartbeat_hits_worker_scoped_path_with_auth (path_regex)
+- pull_no_work_204
+- pull_includes_worker_id_in_json_body (closure matcher on JSON body)
+- pull_task_200_parsed (full minimal PullTaskResponse JSON)
+
+--------------------------------------------------------------------------------
+8) COMMANDS EXECUTED AND RESULTS
+--------------------------------------------------------------------------------
+- `cargo test -p worker`
+  - First failure: thiserror format string in ConfigError::MissingControlPlaneUrl used `{0}` without argument.
+  - Fix: static message without positional arg.
+  - After fix: all 6 integration tests passed.
+
+- `cargo clippy -p worker --all-targets -- -D warnings`
+  - Failure: clippy unnecessary_map_or on task_id null check.
+  - Fix: `v.get("task_id").is_none_or(|t| t.is_null())`
+
+- `cargo fmt --all`
+- `cargo clippy --all-targets --all-features -- -D warnings` → OK
+- `cargo test --all-targets` → entire workspace tests OK (integration tests use DATABASE_URL where needed)
+
+- `docker compose build worker` → succeeded (Rust 1.85 in container, release build worker binary)
+
+--------------------------------------------------------------------------------
+9) POST-IMPLEMENTATION DOC FIX
+--------------------------------------------------------------------------------
+- rustdoc link in control_plane.rs: corrected relative path to API_OVERVIEW from
+  `../../docs/...` (wrong: points under crates/) to `../../../docs/...` (repo root).
+
+--------------------------------------------------------------------------------
+10) MIGRATIONS
+--------------------------------------------------------------------------------
+- No database migrations added (worker is HTTP client only).
+
+--------------------------------------------------------------------------------
+11) PLAN / SPEC CONSISTENCY
+--------------------------------------------------------------------------------
+- plan/16-worker-http-lifecycle-complete.md: Status set to **completed**; added “Completed / Notes”
+  section describing modules, env vars, tests, Docker, docs updates.
+- plan/README.md index updated to point to -complete.md for task 16.
+- docs/TECH_STACK.md and IMPLEMENTATION_BOUNDARIES.md updated so “current implementation” matches
+  env-based worker config (YAML documented as future).
+
+--------------------------------------------------------------------------------
+12) BEHAVIOR SUMMARY (for operators)
+--------------------------------------------------------------------------------
+- `cargo run -p worker` requires CONTROL_PLANE_URL (or REMOTE_HARNESS_URL) and API_KEY
+  (or REMOTE_HARNESS_API_KEY).
+- Compose worker service: CONTROL_PLANE_URL=http://server:3000, API_KEY shared with server.
+- Worker registers with client_version = workspace package version (0.1.0), handles 409 as OK.
+- If a task is actually assigned before task 19 lands, worker completes it as **failed** with an
+  explicit error_message so sessions/jobs do not stall indefinitely.
+
+--------------------------------------------------------------------------------
+13) FULL SOURCE — key modules (as implemented at completion)
+--------------------------------------------------------------------------------
+
+--- crates/worker/src/lib.rs ---
+```rust
+//! Remote Harness worker: control-plane HTTP client (register, heartbeat, pull loop).
+//!
+//! Env configuration: see [`WorkerConfig::from_env`] and `crates/worker/README.md`.
+
+mod config;
+mod control_plane;
+
+pub use config::WorkerConfig;
+pub use control_plane::{ControlPlaneClient, ControlPlaneError, PullOutcome};
+
+use std::time::Duration;
+
+/// Run until SIGINT: register, background heartbeats, pull loop with backoff when idle.
+pub async fn run(config: WorkerConfig) -> Result<(), RunError> {
+    let client = ControlPlaneClient::new(&config)?;
+    client.register_idempotent(&config).await?;
+    client.heartbeat_idle(&config.worker_id).await?;
+
+    let hb_client = client.clone();
+    let hb_wid = config.worker_id.clone();
+    let hb_every = config.heartbeat_interval;
+    let heartbeat = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(hb_every);
+        loop {
+            tick.tick().await;
+            if let Err(e) = hb_client.heartbeat_idle(&hb_wid).await {
+                tracing::warn!(error = %e, "heartbeat failed");
+            }
+        }
+    });
+
+    let pull_result = pull_loop(&client, &config.worker_id).await;
+    heartbeat.abort();
+    pull_result
+}
+
+async fn pull_loop(client: &ControlPlaneClient, worker_id: &str) -> Result<(), RunError> {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown signal received, exiting");
+                return Ok(());
+            }
+            r = client.pull_task(worker_id) => {
+                match r {
+                    Ok(PullOutcome::NoWork) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                    }
+                    Ok(PullOutcome::Task(t)) => {
+                        backoff = Duration::from_secs(1);
+                        tracing::warn!(
+                            job_id = %t.job_id,
+                            session_id = %t.session_id,
+                            "task received; failing job until execution is implemented (plan task 19)"
+                        );
+                        client
+                            .complete_task_failed(
+                                &t.task_id,
+                                worker_id,
+                                "Task execution not yet implemented (worker plan task 19).",
+                            )
+                            .await?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "pull failed, retrying");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Top-level run failures (config or repeated control-plane errors surfaced from pull/complete).
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("configuration: {0}")]
+    Config(#[from] config::ConfigError),
+    #[error("control plane: {0}")]
+    ControlPlane(#[from] ControlPlaneError),
+}
+```
+
+--- crates/worker/src/config.rs ---
+(Full file in repo; includes WorkerConfig::from_env, default_worker_id via hostname or UUID,
+heartbeat interval parsing, ConfigError enum with thiserror messages.)
+
+--- crates/worker/src/control_plane.rs ---
+(Full file in repo; ControlPlaneClient with auth_headers Bearer, register_idempotent, heartbeat_idle,
+pull_task parsing 204 vs 200 JSON, complete_task_failed, truncate_body, platform_label,
+encode_path_segment.)
+
+--- crates/worker/src/main.rs ---
+(Full file in repo; tracing_subscriber with RUST_LOG default info, multi-thread runtime,
+WorkerConfig::from_env, worker::run.)
+
+--- crates/worker/tests/control_plane_client.rs ---
+(Full file in repo; six wiremock tests listed in section 7.)
+
+--- docker-compose.yml (worker service excerpt) ---
+```yaml
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    environment:
+      CONTROL_PLANE_URL: http://server:3000
+      API_KEY: ${API_KEY:-dev-key-change-in-production}
+    restart: unless-stopped
+```
+
+--- Dockerfile.worker ---
+(Full file in repo; rust:1.85-bookworm builder, cargo build --release -p worker, debian slim runtime,
+USER nobody, CMD worker.)
+
+--------------------------------------------------------------------------------
+14) OPEN ITEMS / FOLLOW-UPS (not part of task 16 scope)
+--------------------------------------------------------------------------------
+- Task 17–19: real Git + agent + full job loop (replace complete_task_failed path).
+- Task 26: formal Compose smoke assertions.
+- Optional: startup retry loop if server not listening yet (currently rely on restart policy).
+
+================================================================================
+END OF CONTEXT DUMP
+================================================================================

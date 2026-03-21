@@ -1,0 +1,228 @@
+# Agent transcript / context dump — plan task 23 (web sessions + workers)
+
+This file is a full-fidelity dump of the assistant turn: user instructions, task spec, investigation notes, commands run, outputs, file changes, and implementation rationale (everything that was in the working context for this task, serialized as text).
+
+---
+
+## 1. User request (verbatim)
+
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+Workspace rules referenced: AGENTS.md (no stubs; backend changes need CLI+UI; spec sync; no migration edits).
+
+User rules referenced: run commands myself; code citation format; focused diffs.
+
+---
+
+## 2. Discovery: pending plan files
+
+Glob `plan/*.pending.md` returned 0 files. Listing `plan/` showed tasks named `NN-...-pending.md` (suffix `-pending.md`). Sorted numeric pending tasks:
+
+- 23-web-sessions-workers-pending.md
+- 24-web-logs-sse-attach-pending.md
+- …
+
+Selected **23-web-sessions-workers-pending.md** as lowest-numbered pending task.
+
+Renamed: `23-web-sessions-workers-pending.md` → `23-web-sessions-workers-processing.md`
+
+---
+
+## 3. Task spec (full text after status edit)
+
+File: plan/23-web-sessions-workers-complete.md (content same as processing, status updated to complete)
+
+# 23 — Web: sessions and workers views
+
+**Status:** complete  
+**Dependencies:** 22, 11, 09
+
+## Objective
+
+**Dashboard**: list/create session; session detail with jobs; workers list with **heterogeneity banner** when ≥2 workers differ on `labels.platform` or WSL vs native Windows (CLIENT_EXPERIENCE §10, PROJECT_KICKOFF §6a — F).
+
+## Scope
+
+**In scope**
+
+- Paginated lists per API cursor pattern.
+- Session create form: workflow, repo, identity, `agent_cli`, branch options—reject with link to Settings on missing tokens (CLIENT_EXPERIENCE §5).
+- Optional confirm when `agent_cli` likely incompatible with pool (heuristic v1).
+
+**Out of scope**
+
+- Log SSE panel (24).
+
+## Spec references
+
+- API_OVERVIEW §4–5
+- ARCHITECTURE §4c
+
+## Acceptance criteria
+
+- Component tests or Playwright smoke for create → redirect to detail.
+- Banner snapshot or unit test with mocked worker list data.
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `npm test` / E2E optional | CI |
+
+---
+
+## 4. Docs / code read during implementation
+
+- docs/API_OVERVIEW.md — pagination (limit, cursor, next_cursor), POST /sessions body, GET /sessions, GET /sessions/:id, workers list.
+- docs/CLIENT_EXPERIENCE.md §5, §7, §8, §10 — credentials messaging, heterogeneity banner, PR/MR copy.
+- docs/ARCHITECTURE.md §4c — platform-specific workers; operational warning context.
+- crates/server/openapi.yaml — PaginatedWorkerSummaries, WorkerSummary (worker_id, labels, status active|stale), CreateSessionRequest, SessionDetail.
+- crates/api-types/src/sessions.rs — JSON field `ref` for git ref.
+- web/src/api/client.ts — controlPlaneJson, ControlPlaneHttpError.
+- web/src/App.tsx, AppLayout.tsx, HomePage.tsx, SettingsProvider — existing routing and settings.
+- crates/cli/src/main.rs — confirmed CLI already exposes session + worker commands (this task is Web-only on existing API).
+
+No database migrations were required (UI-only).
+
+---
+
+## 5. Design decisions
+
+**Pagination:** Sessions list and workers table use `@tanstack/react-query` `useInfiniteQuery` + “Load more”. Workers heterogeneity uses `listAllWorkers` (repeated GET /workers?limit=100 with cursor until `next_cursor` is null) so the banner reflects the full registry, not only the first page.
+
+**Heterogeneity detection (web/src/lib/workerPoolHeterogeneity.ts):**
+- Only `status === "active"` workers count as “non-stale”.
+- Requires at least two active workers with a defined `labels.platform` string to compare; if fewer than two defined keys, returns not heterogeneous (cannot detect).
+- `canonicalPlatformKey` maps `windows`/`win32`/`windows_nt` → `__windows_native__`, `wsl` → `wsl`, else lowercase trimmed `platform` string.
+- Heterogeneous if the set of canonical keys among qualifying workers has size ≥ 2 (covers linux+darwin, wsl+windows, etc.).
+
+**Agent CLI confirm heuristic:** `shouldConfirmAgentCliAgainstPool` returns true if there are zero active workers OR the pool is heterogeneous; triggers `window.confirm` before POST /sessions.
+
+**Session create:** Before POST, `GET /identities/:id` for `default` or typed identity; if `!has_git_token || !has_agent_token`, block with error and link to Settings (CLIENT_EXPERIENCE §5). Server 400 errors whose detail mentions token/credential are surfaced with the same Settings hint.
+
+**Workflows in UI:** chat, loop_n, loop_until_sentinel, inbox — params aligned with API_OVERVIEW (agent_cli, optional model, branch_mode, branch_name_prefix).
+
+**Session detail:** Jobs table shows error_message, pull_request_url, and `pullRequestExpectationHint` when `branch_mode === "pr"` and PR link missing (CLIENT_EXPERIENCE §8.1).
+
+**Banner:** `WorkerPoolHeterogeneityBanner` uses `role="alert"`; copy references Architecture §4c and in-repo path `docs/ARCHITECTURE.md` §4c (no broken external URL).
+
+---
+
+## 6. Files added
+
+- web/src/api/types.ts
+- web/src/api/sessions.ts
+- web/src/api/workers.ts
+- web/src/api/identities.ts
+- web/src/lib/workerPoolHeterogeneity.ts
+- web/src/lib/workerPoolHeterogeneity.test.ts
+- web/src/lib/sessionJobHints.ts
+- web/src/lib/sessionJobHints.test.ts
+- web/src/components/WorkerPoolHeterogeneityBanner.tsx
+- web/src/components/WorkerPoolHeterogeneityBanner.test.tsx
+- web/src/pages/SessionsListPage.tsx
+- web/src/pages/SessionCreatePage.tsx
+- web/src/pages/SessionCreatePage.test.tsx
+- web/src/pages/SessionDetailPage.tsx
+- web/src/pages/WorkersListPage.tsx
+- web/src/test/setup.ts
+
+---
+
+## 7. Files modified
+
+- web/package.json / package-lock.json — devDependencies: @testing-library/react, @testing-library/user-event, @testing-library/jest-dom
+- web/vite.config.ts — test.setupFiles: ./src/test/setup.ts
+- web/src/App.tsx — routes /sessions, /sessions/new, /sessions/:sessionId, /workers
+- web/src/layout/AppLayout.tsx — nav links Sessions, Workers
+- web/src/pages/HomePage.tsx — copy + quick links
+- web/README.md — routes + plan 23 reference
+- docs/CLIENT_EXPERIENCE.md — §7 implementation note: sessions/workers shipped; link to plan 23 complete
+- plan/README.md — task 23 row → complete.md
+- plan/23-web-sessions-workers-complete.md — renamed from processing; status complete
+
+---
+
+## 8. Commands executed and results
+
+### Rename pending → processing
+`mv plan/23-web-sessions-workers-pending.md plan/23-web-sessions-workers-processing.md` — exit 0
+
+### npm install (web)
+`cd web && npm install -D @testing-library/react @testing-library/user-event` — success, 295 packages audited
+
+`cd web && npm install -D @testing-library/jest-dom` — success, 303 packages audited
+
+### Tests
+`cd web && npm test` (vitest run):
+
+```
+ RUN  v3.2.4 /Users/chizbro/Desktop/code/utils/remote_harness_3/web
+
+ ✓ src/lib/workerPoolHeterogeneity.test.ts (10 tests)
+ ✓ src/lib/sessionJobHints.test.ts (2 tests)
+ ✓ src/api/errors.test.ts (4 tests)
+ ✓ src/components/WorkerPoolHeterogeneityBanner.test.tsx (2 tests)
+ ✓ src/pages/SessionCreatePage.test.tsx (1 test)
+
+ Test Files  5 passed (5)
+      Tests  19 passed (19)
+```
+
+### Lint, typecheck, build (web)
+`npm run lint` — eslint . — exit 0  
+`npm run typecheck` — tsc --noEmit — exit 0  
+`npm run build` — vite build — success (~338KB JS bundle)
+
+### Rust
+`cargo build --workspace` — Finished dev profile, success  
+`cargo clippy --workspace --all-targets -- -D warnings` — Finished, success
+
+### Rename processing → complete
+`mv plan/23-web-sessions-workers-processing.md plan/23-web-sessions-workers-complete.md` — exit 0
+
+---
+
+## 9. Migrations
+
+None added; nothing to run.
+
+---
+
+## 10. Test implementation notes
+
+- `SessionCreatePage.test.tsx` stubs `fetch` with `Request` parsing paths `/identities/*`, `/workers`, `/sessions` POST; returns one homogeneous active linux worker to avoid confirm (still stubs `confirm` → true).
+- `WorkerPoolHeterogeneityBanner.test.tsx` asserts role=alert text includes “Heterogeneous worker pool”, “WSL”, “Architecture §4c”.
+- Vitest setup imports `@testing-library/jest-dom/vitest` for matchers.
+
+---
+
+## 11. Follow-ups / not done (explicitly out of scope)
+
+- Plan 24: log SSE panel, attach UI on session detail (detail page mentions CLI workaround).
+- Playwright E2E: optional per spec; Vitest component test used instead.
+- Dedicated Settings “credentials” panel beyond existing Settings + playground OAuth — CLIENT_EXPERIENCE still points OAuth to playground.
+
+---
+
+## 12. Raw tool/error context
+
+- Initial glob `**/*.pending.md` under plan/ returned 0; corrected to suffix pattern `*-pending.md` by listing plan directory.
+- No `terminate` JSON emitted because task 23 was pending.
+
+---
+
+End of context dump for task **23-web-sessions-workers**.

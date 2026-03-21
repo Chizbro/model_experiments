@@ -1,0 +1,2360 @@
+# Remote Harness — REST contract (OpenAPI 3.0.3)
+#
+# Canonical artifact for JSON routes. Keep this file aligned with docs/API_OVERVIEW.md.
+#
+# SSE: Event field names and examples are documented in docs/SSE_EVENTS.md (companion).
+#      See docs/PROJECT_KICKOFF.md §6 — Communication & Docs.
+#
+openapi: 3.0.3
+info:
+  title: Remote Harness Control Plane API
+  version: 0.1.0
+  description: |
+    Control plane REST API. Human-readable API prose and behavior notes live in
+    `docs/API_OVERVIEW.md`; this spec is the machine-readable contract for codegen and review.
+
+servers:
+  - url: /
+    description: Relative to configured control plane base URL
+
+tags:
+  - name: health
+    description: Liveness and readiness (no authentication)
+  - name: apiKeys
+    description: Control plane API keys (bootstrap, create, list, revoke)
+  - name: sessions
+    description: Session lifecycle — chat jobs, retain flags, follow-up input (API key required)
+  - name: workers
+    description: Worker registry (register, heartbeat, list, get, delete)
+  - name: agents
+    description: Agent inboxes — enqueue and list pending tasks (API key required)
+  - name: identities
+    description: BYOL credentials per identity (API key required)
+  - name: oauth
+    description: Git provider OAuth for identity git_token (no API key; browser flow)
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      operationId: getReady
+      responses:
+        "200":
+          description: Service is ready to accept traffic
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+        "503":
+          description: Not ready (e.g. database unreachable when DATABASE_URL is set)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /health/idle:
+    get:
+      tags: [health]
+      summary: Idle check for sleep-inhibit helpers
+      operationId: getHealthIdle
+      responses:
+        "200":
+          description: No pending or assigned jobs (safe to idle)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckOk"
+        "503":
+          description: Work is queued or assigned (hold sleep inhibit)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckBusy"
+
+  /auth/github:
+    get:
+      tags: [oauth]
+      summary: Start GitHub OAuth for identity git_token
+      operationId: startGithubOauth
+      description: |
+        Redirects to GitHub with PKCE (S256). Sets HttpOnly `SameSite=Lax` cookie `_rh_oauth` for CSRF and PKCE verifier.
+        Requires `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`, `REDIRECT_AFTER_AUTH`, and database.
+        See docs/API_OVERVIEW.md §4b.
+      parameters:
+        - name: identity_id
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+          description: Identity id to store tokens on
+      responses:
+        "302":
+          description: Redirect to GitHub authorize URL
+        "503":
+          description: OAuth not configured, database missing, or `REDIRECT_AFTER_AUTH` unset
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /auth/github/callback:
+    get:
+      tags: [oauth]
+      summary: GitHub OAuth callback
+      operationId: githubOauthCallback
+      description: |
+        Validates CSRF cookie vs `state`, exchanges `code` for tokens, stores on identity, clears cookie, redirects to `REDIRECT_AFTER_AUTH`.
+      parameters:
+        - name: code
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: error
+          in: query
+          schema: { type: string }
+        - name: error_description
+          in: query
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect to `REDIRECT_AFTER_AUTH` with `oauth_success` or `oauth_error` query params
+        "400":
+          description: Invalid state or cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Misconfigured OAuth or database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /auth/gitlab:
+    get:
+      tags: [oauth]
+      summary: Start GitLab OAuth for identity git_token
+      operationId: startGitlabOauth
+      description: |
+        Same as GitHub but for GitLab (`GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, `GITLAB_REDIRECT_URI`, optional `GITLAB_BASE_URL`).
+      parameters:
+        - name: identity_id
+          in: query
+          required: false
+          schema:
+            type: string
+            default: default
+      responses:
+        "302":
+          description: Redirect to GitLab authorize URL
+        "503":
+          description: OAuth not configured or database / `REDIRECT_AFTER_AUTH` missing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /auth/gitlab/callback:
+    get:
+      tags: [oauth]
+      summary: GitLab OAuth callback
+      operationId: gitlabOauthCallback
+      description: Stores `git_base_url` from configured GitLab instance. Otherwise same as GitHub callback.
+      parameters:
+        - name: code
+          in: query
+          schema: { type: string }
+        - name: state
+          in: query
+          schema: { type: string }
+        - name: error
+          in: query
+          schema: { type: string }
+        - name: error_description
+          in: query
+          schema: { type: string }
+      responses:
+        "302":
+          description: Redirect to `REDIRECT_AFTER_AUTH` with result query params
+        "400":
+          description: Invalid state or cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Misconfigured OAuth or database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /api-keys/bootstrap:
+    post:
+      tags: [apiKeys]
+      summary: Create the first API key when none exist (no authentication)
+      operationId: bootstrapApiKey
+      description: |
+        Unauthenticated root-equivalent until a key exists. Returns 403 when `API_KEY`/`API_KEYS`
+        is set or when any non-revoked key exists. See docs/API_OVERVIEW.md — Bootstrap safety.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: First API key created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedResponse"
+        "403":
+          description: Bootstrap disabled (keys already exist or env bootstrap key configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured or unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /api-keys:
+    get:
+      tags: [apiKeys]
+      summary: List API keys
+      operationId: listApiKeys
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated API keys (no secrets)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedApiKeySummaries"
+        "400":
+          description: Invalid cursor or request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [apiKeys]
+      summary: Create API key
+      operationId: createApiKey
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: API key created (plain key returned once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /api-keys/{id}:
+    delete:
+      tags: [apiKeys]
+      summary: Revoke API key
+      operationId: deleteApiKey
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Key revoked
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /agents/{id}/inbox:
+    get:
+      tags: [agents]
+      summary: List pending inbox tasks for an agent
+      operationId: getAgentInbox
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Agent id (same as session params.agent_id for workflow inbox)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated pending inbox tasks
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedInboxTaskItems"
+        "400":
+          description: Invalid cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Agent not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [agents]
+      summary: Enqueue a task to an agent inbox
+      operationId: postAgentInbox
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostAgentInboxRequest"
+      responses:
+        "202":
+          description: Task accepted into inbox queue
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PostAgentInboxResponse"
+        "400":
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Agent not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: No running inbox session or conflict
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/register:
+    post:
+      tags: [workers]
+      summary: Register a worker
+      operationId: registerWorker
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterWorkerRequest"
+      responses:
+        "201":
+          description: Worker registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegisterWorkerResponse"
+        "400":
+          description: Invalid body or worker_version_incompatible
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: Worker id already registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/{id}/heartbeat:
+    post:
+      tags: [workers]
+      summary: Worker heartbeat
+      operationId: heartbeatWorker
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WorkerHeartbeatRequest"
+      responses:
+        "200":
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerHeartbeatResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/{id}/inbox-listener:
+    post:
+      tags: [workers]
+      summary: Register worker as inbox consumer for an agent_id
+      operationId: postWorkerInboxListener
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Worker id (must match pull worker_id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PostWorkerInboxListenerRequest"
+      responses:
+        "200":
+          description: Listener registered (or stolen from a stale worker)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PostWorkerInboxListenerResponse"
+        "400":
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Worker or agent not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: Worker stale or inbox listener held by another active worker
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers:
+    get:
+      tags: [workers]
+      summary: List workers
+      operationId: listWorkers
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated workers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedWorkerSummaries"
+        "400":
+          description: Invalid cursor
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/{id}:
+    get:
+      tags: [workers]
+      summary: Get worker
+      operationId: getWorker
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Worker detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerSummary"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    delete:
+      tags: [workers]
+      summary: Delete worker and reclaim assigned jobs
+      operationId: deleteWorker
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Worker removed
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Worker not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/tasks/pull:
+    post:
+      tags: [workers]
+      summary: Pull next task (lease reclaim, stale reclaim, assign)
+      operationId: pullTask
+      description: |
+        Runs lease expiry (when JOB_LEASE_SECONDS > 0), reclaims jobs assigned to stale workers
+        (bounded by MAX_JOB_RECLAIMS), then assigns the oldest pending job to the requesting worker.
+        Returns 204 when no work. Requires a fresh heartbeat (non-stale worker).
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PullTaskRequest"
+      responses:
+        "200":
+          description: Task assigned to this worker
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PullTaskResponse"
+        "204":
+          description: No pending work
+        "400":
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Worker not registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: Worker heartbeat is stale
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/tasks/{id}/complete:
+    post:
+      tags: [workers]
+      summary: Mark worker task complete or failed
+      operationId: completeWorkerTask
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Task id (same as job id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCompleteRequest"
+      responses:
+        "200":
+          description: Recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskCompleteResponse"
+        "400":
+          description: Invalid body
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Task not found or already completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: Worker mismatch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /workers/tasks/{id}/logs:
+    post:
+      tags: [workers]
+      summary: Append worker log batch for an assigned task
+      operationId: postWorkerTaskLogs
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: Task id (job id)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/WorkerLogIngestItem"
+      responses:
+        "202":
+          description: Batch accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkerLogsAcceptedResponse"
+        "400":
+          description: Invalid body or timestamps
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Task not found or not assigned
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: List sessions
+      operationId: listSessions
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            description: Filter by session status (e.g. pending, running, completed, failed)
+      responses:
+        "200":
+          description: Paginated sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedSessionSummaries"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [sessions]
+      summary: Create session (start workflow)
+      operationId: createSession
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSessionResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}:
+    get:
+      tags: [sessions]
+      summary: Get session
+      operationId: getSession
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Session with jobs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDetail"
+        "400":
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    patch:
+      tags: [sessions]
+      summary: Update session (retain_forever)
+      operationId: patchSession
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchSessionRetainRequest"
+      responses:
+        "204":
+          description: Updated
+        "400":
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    delete:
+      tags: [sessions]
+      summary: Delete session
+      operationId: deleteSession
+      description: |
+        Removes the session and dependent rows (jobs, central log lines) per database cascades.
+        See [API_OVERVIEW.md](../../docs/API_OVERVIEW.md) §4.
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}/input:
+    post:
+      tags: [sessions]
+      summary: Send chat follow-up or inbox message
+      operationId: sendSessionInput
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendSessionInputRequest"
+      responses:
+        "202":
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SendSessionInputResponse"
+        "400":
+          description: Invalid body or id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "409":
+          description: Session cannot accept input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}/jobs/{job_id}:
+    patch:
+      tags: [sessions]
+      summary: Update job (retain_forever)
+      operationId: patchSessionJob
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchSessionRetainRequest"
+      responses:
+        "204":
+          description: Updated
+        "400":
+          description: Invalid id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session or job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}/logs:
+    get:
+      tags: [sessions]
+      summary: List session log history (cursor pagination)
+      operationId: listSessionLogs
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: job_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: level
+          in: query
+          schema:
+            type: string
+        - name: last
+          in: query
+          description: Return the N most recent entries in chronological order (no cursor)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+      responses:
+        "200":
+          description: Paginated log entries
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedLogEntries"
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    delete:
+      tags: [sessions]
+      summary: Delete session logs (optional job scope)
+      operationId: deleteSessionLogs
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: job_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session or job not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}/logs/stream:
+    get:
+      tags: [sessions]
+      summary: Stream new log lines (SSE)
+      operationId: streamSessionLogs
+      description: |
+        Long-lived **Server-Sent Events** stream. Each message uses event name `log` and JSON
+        `data` matching one [`LogEntry`](#/components/schemas/LogEntry) (same shape as
+        `GET /sessions/{id}/logs`). Optional `job_id` and `level` query parameters filter the
+        stream the same way as list history. Heartbeat comments keep intermediaries from timing
+        out. Full event contract: `docs/SSE_EVENTS.md`.
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: job_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: level
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: 'Open SSE stream (Content-Type: text/event-stream)'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE frames: event "log" plus data line with JSON LogEntry; interleaved keep-alive comments.
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions/{id}/events:
+    get:
+      tags: [sessions]
+      summary: Stream session lifecycle events (SSE)
+      operationId: streamSessionEvents
+      description: |
+        Server-Sent Events for session and job lifecycle (`event: session_event`). Payload shape
+        and examples: `docs/SSE_EVENTS.md`.
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: 'Open SSE stream (Content-Type: text/event-stream)'
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE frames: event "session_event" plus data line with JSON payload; interleaved keep-alive comments.
+        "400":
+          description: Invalid path id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Session not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /identities/{id}:
+    get:
+      tags: [identities]
+      summary: Get identity credential flags (no secret values)
+      operationId: getIdentity
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            description: Identity id (e.g. default)
+      responses:
+        "200":
+          description: Whether git and agent tokens are stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityCredentials"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Identity not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    patch:
+      tags: [identities]
+      summary: Update identity tokens (merge; secrets never returned)
+      operationId: patchIdentity
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchIdentityRequest"
+      responses:
+        "204":
+          description: Updated
+        "400":
+          description: Invalid body or empty patch
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Identity not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /identities/{id}/auth-status:
+    get:
+      tags: [identities]
+      summary: Token health for Git (and agent presence) without secret values
+      operationId: getIdentityAuthStatus
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Auth status summary
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityAuthStatus"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Identity not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /identities/{id}/repositories:
+    get:
+      tags: [identities]
+      summary: List repositories visible to the stored Git token
+      operationId: listIdentityRepositories
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: provider
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [github, gitlab]
+          description: Required for manual PAT identities; implied for OAuth identities
+      responses:
+        "200":
+          description: Repo picker items
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdentityRepositoriesResponse"
+        "400":
+          description: Missing provider or no git token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing API key or Git provider rejected token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Identity not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "502":
+          description: Git provider API or network error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+components:
+  securitySchemes:
+    bearerApiKey:
+      type: http
+      scheme: bearer
+      description: "API key as Bearer token (`Authorization: Bearer <api_key>`)"
+    headerApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: "API key in `X-API-Key` header"
+
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+        log_retention_days_default:
+          type: integer
+          minimum: 0
+          description: Default scheduled log retention window in days (`LOG_RETENTION_DAYS_DEFAULT`); Web Settings surfacing (CLIENT_EXPERIENCE §9).
+        chat_history_max_turns:
+          type: integer
+          minimum: 0
+          description: Max user/assistant turns included on chat follow-up pull (`CHAT_HISTORY_MAX_TURNS`; `0` disables capping).
+
+    IdleCheckOk:
+      type: object
+      required: [idle]
+      properties:
+        idle:
+          type: boolean
+          enum: [true]
+
+    IdleCheckBusy:
+      type: object
+      required: [idle, pending_or_assigned_jobs]
+      properties:
+        idle:
+          type: boolean
+          enum: [false]
+        pending_or_assigned_jobs:
+          type: integer
+          minimum: 0
+
+    StandardError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: not_found
+            message:
+              type: string
+              example: Resource not found
+            details:
+              type: object
+              additionalProperties: true
+
+    WorkflowKind:
+      type: string
+      enum:
+        - chat
+        - loop_n
+        - loop_until_sentinel
+        - inbox
+
+    CreateSessionRequest:
+      type: object
+      required: [repo_url, workflow, params]
+      properties:
+        repo_url:
+          type: string
+        ref:
+          type: string
+          description: Git ref (branch or commit); default main when omitted
+        workflow:
+          $ref: "#/components/schemas/WorkflowKind"
+        params:
+          type: object
+          additionalProperties: true
+          description: Workflow-specific parameters (see API_OVERVIEW)
+        persona_id:
+          type: string
+        identity_id:
+          type: string
+        retain_forever:
+          type: boolean
+          default: false
+
+    CreateSessionResponse:
+      type: object
+      required: [session_id, status]
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+          description: pending until first job assign (chat/loop); running for inbox with no initial jobs
+          example: pending
+        web_url:
+          type: string
+          description: Optional deep link to Web UI for this session
+
+    SessionSummary:
+      type: object
+      required:
+        - session_id
+        - repo_url
+        - ref
+        - workflow
+        - status
+        - created_at
+      properties:
+        session_id:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        workflow:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    PaginatedSessionSummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        next_cursor:
+          type: string
+          nullable: true
+
+    SessionJobDetail:
+      type: object
+      required: [job_id, status, created_at]
+      properties:
+        job_id:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+        error_message:
+          type: string
+          nullable: true
+        pull_request_url:
+          type: string
+          nullable: true
+        commit_ref:
+          type: string
+          nullable: true
+          description: OID recorded at job completion when the worker reports a commit (may be absent if push/commit did not complete).
+        retain_forever:
+          type: boolean
+          default: false
+          description: When true, this job's logs are exempt from retention purge
+
+    SessionDetail:
+      type: object
+      required:
+        - session_id
+        - repo_url
+        - ref
+        - workflow
+        - status
+        - params
+        - jobs
+        - created_at
+        - updated_at
+        - retain_forever
+        - chat_history_truncated
+      properties:
+        session_id:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        workflow:
+          type: string
+        status:
+          type: string
+        params:
+          type: object
+          additionalProperties: true
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionJobDetail"
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        retain_forever:
+          type: boolean
+          description: When true, this session's logs are exempt from retention purge
+        chat_history_truncated:
+          type: boolean
+          description: Chat workflow only; true when prior turns exceed `chat_history_max_turns` so the next pull would cap history (aligned with Pull task `history_truncated`).
+        chat_history_max_turns:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Chat workflow only; server cap for history turns (same as `GET /health`); null when workflow is not chat.
+
+    PatchSessionRetainRequest:
+      type: object
+      required: [retain_forever]
+      properties:
+        retain_forever:
+          type: boolean
+
+    SendSessionInputRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: Chat follow-up text (workflow chat only).
+
+    SendSessionInputResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+
+    PostAgentInboxRequest:
+      type: object
+      required: [payload]
+      properties:
+        payload:
+          type: object
+          additionalProperties: true
+          description: Opaque JSON; must include non-empty string field `message` or `prompt` for worker prompt extraction
+        persona_id:
+          type: string
+          nullable: true
+
+    PostAgentInboxResponse:
+      type: object
+      required: [task_id]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+          description: Inbox queue row id until promoted to a job on worker pull
+
+    InboxTaskItem:
+      type: object
+      required: [task_id, payload, enqueued_at]
+      properties:
+        task_id:
+          type: string
+          format: uuid
+        payload:
+          type: object
+          additionalProperties: true
+        enqueued_at:
+          type: string
+          format: date-time
+
+    PaginatedInboxTaskItems:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboxTaskItem"
+        next_cursor:
+          type: string
+          nullable: true
+
+    PostWorkerInboxListenerRequest:
+      type: object
+      required: [agent_id]
+      properties:
+        agent_id:
+          type: string
+
+    PostWorkerInboxListenerResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    WorkerLogIngestItem:
+      type: object
+      required: [timestamp, level, message, source]
+      properties:
+        timestamp:
+          type: string
+          description: ISO 8601
+        level:
+          type: string
+          example: info
+        message:
+          type: string
+        source:
+          type: string
+          example: worker
+
+    WorkerLogsAcceptedResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+          enum: [true]
+
+    LogEntry:
+      type: object
+      required:
+        - id
+        - timestamp
+        - level
+        - session_id
+        - source
+        - message
+      properties:
+        id:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        level:
+          type: string
+        session_id:
+          type: string
+          format: uuid
+        job_id:
+          type: string
+          format: uuid
+          nullable: true
+        worker_id:
+          type: string
+          nullable: true
+        source:
+          type: string
+        message:
+          type: string
+
+    PaginatedLogEntries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        next_cursor:
+          type: string
+          nullable: true
+
+    CreateApiKeyRequest:
+      type: object
+      properties:
+        label:
+          type: string
+          nullable: true
+
+    ApiKeyCreatedResponse:
+      type: object
+      required: [id, key, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          description: Plain secret; shown once at creation
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    ApiKeySummary:
+      type: object
+      required: [id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+
+    PaginatedApiKeySummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeySummary"
+        next_cursor:
+          type: string
+          nullable: true
+
+    RegisterWorkerRequest:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+        host:
+          type: string
+          nullable: true
+        labels:
+          type: object
+          additionalProperties: true
+        capabilities:
+          type: array
+          items:
+            type: string
+        client_version:
+          type: string
+          description: Semver of worker binary; should match server major.minor
+          nullable: true
+
+    RegisterWorkerResponse:
+      type: object
+      required: [worker_id]
+      properties:
+        worker_id:
+          type: string
+
+    WorkerHeartbeatRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [idle, busy]
+        current_job_id:
+          type: string
+          nullable: true
+
+    WorkerHeartbeatResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    WorkerSummary:
+      type: object
+      required: [worker_id, labels, status]
+      properties:
+        worker_id:
+          type: string
+        host:
+          type: string
+          nullable: true
+        labels:
+          type: object
+          additionalProperties: true
+        status:
+          type: string
+          enum: [active, stale]
+        last_seen_at:
+          type: string
+          nullable: true
+          description: ISO 8601
+        capabilities:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: Present on GET /workers/{id}
+
+    PaginatedWorkerSummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/WorkerSummary"
+        next_cursor:
+          type: string
+          nullable: true
+
+    PullTaskRequest:
+      type: object
+      properties:
+        worker_id:
+          type: string
+          description: Worker id (required for v1; server does not infer from API key alone)
+
+    TaskCredentials:
+      type: object
+      required: [git_token, agent_token]
+      properties:
+        git_token:
+          type: string
+        agent_token:
+          type: string
+
+    PullTaskResponse:
+      type: object
+      required:
+        - task_id
+        - job_id
+        - session_id
+        - repo_url
+        - ref
+        - workflow
+        - task_input
+        - params
+        - credentials
+      properties:
+        task_id:
+          type: string
+        job_id:
+          type: string
+        session_id:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        workflow:
+          type: string
+        prompt_context:
+          type: string
+        task_input:
+          type: object
+          additionalProperties: true
+        params:
+          type: object
+          additionalProperties: true
+        credentials:
+          $ref: "#/components/schemas/TaskCredentials"
+
+    TaskCompleteRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [success, failed]
+        worker_id:
+          type: string
+          nullable: true
+        branch:
+          type: string
+          nullable: true
+        commit_ref:
+          type: string
+          nullable: true
+        mr_title:
+          type: string
+          nullable: true
+        mr_description:
+          type: string
+          nullable: true
+        error_message:
+          type: string
+          nullable: true
+        output:
+          type: string
+          nullable: true
+        sentinel_reached:
+          type: boolean
+          nullable: true
+          description: >
+            For workflow `loop_until_sentinel`, set `true` when the worker detected the session `params.sentinel`
+            literal substring in captured output for this iteration (v1: case-sensitive match). The server stops
+            enqueuing further iterations and marks the session completed. Omit or `false` to continue until the
+            configured max iteration cap.
+        assistant_reply:
+          type: string
+          nullable: true
+
+    TaskCompleteResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+
+    IdentityCredentials:
+      type: object
+      required: [has_git_token, has_agent_token]
+      properties:
+        has_git_token:
+          type: boolean
+        has_agent_token:
+          type: boolean
+
+    GitTokenStatus:
+      type: string
+      enum:
+        - healthy
+        - expiring_soon
+        - expired_refreshable
+        - expired_needs_reauth
+        - unknown
+        - not_configured
+
+    IdentityAuthStatus:
+      type: object
+      required: [git_token_status, message]
+      properties:
+        git_token_status:
+          $ref: "#/components/schemas/GitTokenStatus"
+        git_provider:
+          type: string
+          nullable: true
+          description: manual | oauth_github | oauth_gitlab when known
+        token_expires_at:
+          type: string
+          nullable: true
+          description: ISO 8601 when expiry is tracked
+        message:
+          type: string
+        agent_token_status:
+          type: string
+          nullable: true
+          description: not_configured | healthy when agent token presence is summarized
+
+    IdentityRepositoryItem:
+      type: object
+      required: [full_name, clone_url]
+      properties:
+        full_name:
+          type: string
+        clone_url:
+          type: string
+
+    IdentityRepositoriesResponse:
+      type: object
+      required: [items, provider]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/IdentityRepositoryItem"
+        provider:
+          type: string
+          enum: [github, gitlab]
+
+    PatchIdentityRequest:
+      type: object
+      description: |
+        JSON merge patch for stored tokens. Omit a property to leave it unchanged.
+        Set a property to JSON null to clear stored ciphertext. Plain strings set new values.
+      properties:
+        agent_token:
+          type: string
+          nullable: true
+        git_token:
+          type: string
+          nullable: true
+        refresh_token:
+          type: string
+          nullable: true

@@ -1,0 +1,2071 @@
+=== USER INSTRUCTIONS (verbatim) ===
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+=== SESSION NOTES / CONTEXT DUMP ===
+Discovered plan tasks use suffix -pending.md not *.pending.md.
+Next task: 22-web-shell-bootstrap-pending.md → implemented → 22-web-shell-bootstrap-complete.md
+
+=== COMMANDS RUN (representative) ===
+npm install @tanstack/react-query react-router-dom tailwindcss @tailwindcss/vite
+npm run build / lint / typecheck / test — all passed after fixes
+cargo clippy --workspace --all-targets -- -D warnings — passed
+cargo test --workspace --no-run — passed
+
+=== FILES TOUCHED ===
+NEW: web/src/api/client.ts, errors.ts, health.ts, errors.test.ts
+NEW: web/src/settings/storage.ts, settings-context.tsx
+NEW: web/src/context/SettingsProvider.tsx
+NEW: web/src/hooks/useSettings.ts
+NEW: web/src/layout/AppLayout.tsx
+NEW: web/src/pages/HomePage.tsx, SettingsPage.tsx, PlaygroundPage.tsx (from App split)
+MOD: web/src/App.tsx (routes only), main.tsx, index.css, vite.config.ts, package.json, package-lock.json
+DEL: web/src/context/SettingsContext.tsx (replaced by split files)
+DOC: docs/CLIENT_EXPERIENCE.md, docs/PROJECT_KICKOFF.md, plan/README.md, web/README.md
+PLAN: plan/22-web-shell-bootstrap-complete.md
+
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/plan/22-web-shell-bootstrap-complete.md ========
+# 22 — Web: SPA shell, CORS, first-run bootstrap
+
+**Status:** complete  
+**Dependencies:** 03 (web build), 04, 06, 08 (OAuth URLs optional until 08 done)
+
+## Objective
+
+**Vite + React + TypeScript** SPA with **client-only** API access ([TECH_STACK §4](../docs/TECH_STACK.md#4-web-ui)), **TanStack Query**, control-plane URL + API key storage, and **gated bootstrap** per [CLIENT_EXPERIENCE §7](../docs/CLIENT_EXPERIENCE.md#7-first-time-setup-web-ui) ([PROJECT_KICKOFF §6a — H](../docs/PROJECT_KICKOFF.md#6a-implementation-plan-concrete-checkpoints)).
+
+## Scope
+
+**In scope**
+
+- Settings: URL validation via `GET /health`; probe for bootstrap only when appropriate (`401` / documented empty keys).
+- **CORS** error detection path ([CLIENT_EXPERIENCE §3](../docs/CLIENT_EXPERIENCE.md#3-browser-network-tls-and-cors)).
+- API client module with shared error mapping ([CLIENT_EXPERIENCE §2.1](../docs/CLIENT_EXPERIENCE.md#21-web-ui-mapping)).
+- Base layout, routing shell, theme (Tailwind/shadcn per stack doc).
+
+**Out of scope**
+
+- Session list UI (23).
+
+## Spec references
+
+- [HOSTING — CORS](../docs/HOSTING.md)
+- [CLIENT_EXPERIENCE §7, §11](../docs/CLIENT_EXPERIENCE.md)
+
+## Acceptance criteria
+
+- `npm run build` passes; **no** server-side proxy to control plane.
+- Smoke: open UI → set URL → health ok → key → authenticated call succeeds.
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `npm test` / `npm run lint` if configured | CI |
+
+## Completed / Notes
+
+- **Routing:** `react-router-dom` with `AppLayout` (Home, API playground, Settings). Routes `/` and `/playground` require a persisted control plane URL (redirect to `/settings`).
+- **State:** `SettingsProvider` + `useSettings`; localStorage keys in `src/settings/storage.ts` (`rh_control_plane_url`, `rh_api_key`, `rh_wake_url`, bootstrap ineligible per base URL).
+- **TanStack Query:** health checks on Home and Settings; mutations for save URL, verify key, bootstrap.
+- **API layer:** `src/api/client.ts` (`controlPlaneFetch`, `controlPlaneJson`), `src/api/errors.ts` (`mapHttpError`, `mapFetchFailure` for CORS vs same-origin network). Vitest unit tests in `src/api/errors.test.ts`.
+- **Bootstrap UX:** Shown only when no API key is stored and `rh_bootstrap_ineligible:<base>` is not set; cleared after successful `GET /api-keys` or `403` from `POST /api-keys/bootstrap`.
+- **Theme:** Tailwind v4 via `@tailwindcss/vite`; prior monolith UI moved to **`/playground`** (OAuth links unchanged).
+- **Docs:** `docs/CLIENT_EXPERIENCE.md` §7 implementation note; `docs/PROJECT_KICKOFF.md` checkpoint **H** marked done.
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/App.tsx ========
+import { Navigate, Outlet, Route, Routes } from "react-router-dom";
+import { useSettings } from "./hooks/useSettings";
+import { AppLayout } from "./layout/AppLayout";
+import { HomePage } from "./pages/HomePage";
+import { PlaygroundPage } from "./pages/PlaygroundPage";
+import { SettingsPage } from "./pages/SettingsPage";
+
+function RequireStoredUrl() {
+  const { controlPlaneUrl } = useSettings();
+  if (!controlPlaneUrl) {
+    return <Navigate to="/settings" replace />;
+  }
+  return <Outlet />;
+}
+
+export function App() {
+  return (
+    <Routes>
+      <Route path="/" element={<AppLayout />}>
+        <Route path="settings" element={<SettingsPage />} />
+        <Route element={<RequireStoredUrl />}>
+          <Route index element={<HomePage />} />
+          <Route path="playground" element={<PlaygroundPage />} />
+        </Route>
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
+  );
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/main.tsx ========
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { StrictMode } from "react";
+import { createRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import { App } from "./App";
+import { SettingsProvider } from "./context/SettingsProvider";
+import "./index.css";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 30_000,
+      retry: 1,
+    },
+  },
+});
+
+createRoot(document.getElementById("root")!).render(
+  <StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <SettingsProvider>
+        <BrowserRouter>
+          <App />
+        </BrowserRouter>
+      </SettingsProvider>
+    </QueryClientProvider>
+  </StrictMode>,
+);
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/vite.config.ts ========
+import tailwindcss from "@tailwindcss/vite";
+import react from "@vitejs/plugin-react";
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  plugins: [react(), tailwindcss()],
+  test: {
+    environment: "jsdom",
+    passWithNoTests: true,
+  },
+});
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/index.css ========
+@import "tailwindcss";
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --color-background: oklch(0.985 0.002 247);
+  --color-foreground: oklch(0.21 0.034 264);
+  --color-muted: oklch(0.45 0.02 264);
+  --color-card: oklch(1 0 0);
+  --color-border: oklch(0.91 0.01 264);
+  --color-primary: oklch(0.35 0.12 264);
+  --color-primary-fg: oklch(0.99 0 0);
+  --color-destructive: oklch(0.55 0.2 25);
+  --radius-md: 0.5rem;
+}
+
+body {
+  @apply m-0 min-h-screen bg-background text-foreground antialiased;
+}
+
+code {
+  @apply rounded bg-black/5 px-1 py-0.5 text-[0.9em];
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/api/errors.ts ========
+/** Standard control-plane error envelope ([API_OVERVIEW §2](../../docs/API_OVERVIEW.md)). */
+export interface ApiErrorBody {
+  error?: {
+    code?: string;
+    message?: string;
+    details?: unknown;
+  };
+}
+
+export type FetchFailureKind = "network" | "cors_suspected" | "tls_or_unknown";
+
+export interface MappedApiError {
+  title: string;
+  detail: string;
+  actionHint?: string;
+  code?: string;
+  httpStatus?: number;
+}
+
+export function parseApiErrorBody(text: string): ApiErrorBody | null {
+  try {
+    return JSON.parse(text) as ApiErrorBody;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * User-facing copy for REST failures ([CLIENT_EXPERIENCE §2.1, §3](../../docs/CLIENT_EXPERIENCE.md)).
+ */
+export function mapHttpError(status: number, bodyText: string): MappedApiError {
+  const parsed = parseApiErrorBody(bodyText);
+  const code = parsed?.error?.code;
+  const message = parsed?.error?.message;
+
+  if (status === 401 || code === "unauthorized") {
+    return {
+      title: "Not authorized",
+      detail: message ?? "The server rejected this request (401).",
+      actionHint: "Check Settings → API key.",
+      code: code ?? "unauthorized",
+      httpStatus: status,
+    };
+  }
+  if (status === 400 || code === "invalid_request") {
+    return {
+      title: "Invalid request",
+      detail: message ?? "The server could not process this request (400).",
+      code: code ?? "invalid_request",
+      httpStatus: status,
+    };
+  }
+  if (status === 404 || code === "not_found") {
+    return {
+      title: "Not found",
+      detail: message ?? "That resource does not exist (404).",
+      code: code ?? "not_found",
+      httpStatus: status,
+    };
+  }
+  if (status === 409 || code === "conflict") {
+    return {
+      title: "Conflict",
+      detail: message ?? "This action conflicts with the current state (409).",
+      code: code ?? "conflict",
+      httpStatus: status,
+    };
+  }
+  if (status === 503 && code !== "not_ready") {
+    return {
+      title: "Service unavailable",
+      detail: message ?? "Sign-in or another dependency may be misconfigured (503).",
+      actionHint: "If this was OAuth: confirm provider env vars on the server.",
+      code,
+      httpStatus: status,
+    };
+  }
+  if (status >= 500) {
+    return {
+      title: "Server error",
+      detail: message ?? "Something went wrong on the server.",
+      actionHint: "Retry; if it persists, check control-plane logs.",
+      code,
+      httpStatus: status,
+    };
+  }
+  return {
+    title: `HTTP ${status}`,
+    detail: message ?? (bodyText.slice(0, 400) || "Unexpected response."),
+    code,
+    httpStatus: status,
+  };
+}
+
+/**
+ * When `fetch` throws (no response): distinguish unreachable vs likely CORS per CLIENT_EXPERIENCE §3.
+ */
+export function mapFetchFailure(
+  err: unknown,
+  opts: { baseUrl: string; uiOrigin: string },
+): { kind: FetchFailureKind; mapped: MappedApiError } {
+  const msg = err instanceof Error ? err.message : String(err);
+  const ui = new URL(opts.uiOrigin);
+  let apiHost: string;
+  try {
+    apiHost = new URL(opts.baseUrl).host;
+  } catch {
+    apiHost = "";
+  }
+  const crossOrigin = apiHost.length > 0 && apiHost !== ui.host;
+  const looksLikeFailedFetch =
+    err instanceof TypeError && (msg === "Failed to fetch" || msg.includes("NetworkError"));
+
+  if (looksLikeFailedFetch && crossOrigin) {
+    return {
+      kind: "cors_suspected",
+      mapped: {
+        title: "Browser blocked the request (CORS)",
+        detail:
+          "The browser could not complete a cross-origin request to the control plane. This often means the UI origin is not listed in CORS_ALLOWED_ORIGINS on the server.",
+        actionHint: "Ask your admin to add this UI origin to CORS_ALLOWED_ORIGINS. See docs/HOSTING.md and TROUBLESHOOTING §1a.",
+      },
+    };
+  }
+
+  if (looksLikeFailedFetch) {
+    return {
+      kind: "network",
+      mapped: {
+        title: "Cannot reach the control plane",
+        detail: `No response from ${opts.baseUrl}. The host may be down, unreachable, or blocked.`,
+        actionHint: "Confirm the URL, VPN/Tailscale, and that the server is running. Then retry.",
+      },
+    };
+  }
+
+  return {
+    kind: "tls_or_unknown",
+    mapped: {
+      title: "Secure connection or network error",
+      detail: msg || "The request failed before a response was received.",
+      actionHint: "Check TLS certificates, DNS, and that the URL matches the certificate hostname.",
+    },
+  };
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/api/client.ts ========
+import { mapFetchFailure, mapHttpError, type MappedApiError } from "./errors";
+
+export class ControlPlaneHttpError extends Error {
+  readonly mapped: MappedApiError;
+  readonly status: number;
+  readonly bodyText: string;
+
+  constructor(status: number, bodyText: string) {
+    const mapped = mapHttpError(status, bodyText);
+    super(mapped.detail);
+    this.name = "ControlPlaneHttpError";
+    this.mapped = mapped;
+    this.status = status;
+    this.bodyText = bodyText;
+  }
+}
+
+export interface JsonFetchOptions extends Omit<RequestInit, "body"> {
+  baseUrl: string;
+  path: string;
+  /** When set, sends Authorization: Bearer … */
+  apiKey?: string;
+  jsonBody?: unknown;
+}
+
+/**
+ * `fetch` to the control plane with optional JSON body and bearer auth.
+ * Throws ControlPlaneHttpError on non-OK JSON error responses.
+ */
+export async function controlPlaneFetch(opts: JsonFetchOptions): Promise<Response> {
+  const { baseUrl, path, apiKey, jsonBody, headers: hdrs, ...rest } = opts;
+  const url = `${baseUrl.replace(/\/$/, "")}${path.startsWith("/") ? path : `/${path}`}`;
+  const headers = new Headers(hdrs);
+  if (jsonBody !== undefined) {
+    headers.set("Content-Type", "application/json");
+  }
+  if (apiKey?.trim()) {
+    headers.set("Authorization", `Bearer ${apiKey.trim()}`);
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...rest,
+      headers,
+      body: jsonBody === undefined ? undefined : JSON.stringify(jsonBody),
+    });
+  } catch (e) {
+    const { mapped } = mapFetchFailure(e, {
+      baseUrl,
+      uiOrigin: typeof window !== "undefined" ? window.location.origin : "http://localhost",
+    });
+    const w = new Error(mapped.detail) as Error & { mapped?: MappedApiError };
+    w.name = "ControlPlaneNetworkError";
+    w.mapped = mapped;
+    throw w;
+  }
+
+  return res;
+}
+
+export async function controlPlaneJson<T>(opts: JsonFetchOptions): Promise<T> {
+  const res = await controlPlaneFetch(opts);
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ControlPlaneHttpError(res.status, text);
+  }
+  if (!text.length) {
+    return undefined as T;
+  }
+  return JSON.parse(text) as T;
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/api/health.ts ========
+import { controlPlaneFetch } from "./client";
+
+export async function fetchHealth(baseUrl: string): Promise<{ ok: boolean; status: number; snippet: string }> {
+  const res = await controlPlaneFetch({ baseUrl, path: "/health", method: "GET" });
+  const text = await res.text();
+  let snippet = `${res.status}`;
+  try {
+    const j = JSON.parse(text) as Record<string, unknown>;
+    snippet = `${res.status} ${JSON.stringify(j)}`;
+  } catch {
+    if (text.length > 0 && text.length < 200) {
+      snippet = `${res.status} ${text}`;
+    }
+  }
+  return { ok: res.ok, status: res.status, snippet };
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/api/errors.test.ts ========
+import { describe, expect, it } from "vitest";
+import { mapFetchFailure, mapHttpError } from "./errors";
+
+describe("mapHttpError", () => {
+  it("maps 401", () => {
+    const m = mapHttpError(401, '{"error":{"code":"unauthorized","message":"bad key"}}');
+    expect(m.title).toBe("Not authorized");
+    expect(m.code).toBe("unauthorized");
+  });
+
+  it("maps 500", () => {
+    const m = mapHttpError(500, "{}");
+    expect(m.title).toBe("Server error");
+  });
+});
+
+describe("mapFetchFailure", () => {
+  it("suspects CORS on cross-origin Failed to fetch", () => {
+    const { kind, mapped } = mapFetchFailure(new TypeError("Failed to fetch"), {
+      baseUrl: "http://api.example:3000",
+      uiOrigin: "http://localhost:5173",
+    });
+    expect(kind).toBe("cors_suspected");
+    expect(mapped.title).toContain("CORS");
+  });
+
+  it("uses network copy for same-origin Failed to fetch", () => {
+    const { kind, mapped } = mapFetchFailure(new TypeError("Failed to fetch"), {
+      baseUrl: "http://localhost:3000",
+      uiOrigin: "http://localhost:3000",
+    });
+    expect(kind).toBe("network");
+    expect(mapped.title).toContain("reach");
+  });
+});
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/settings/storage.ts ========
+const URL_KEY = "rh_control_plane_url";
+const API_KEY_KEY = "rh_api_key";
+const WAKE_URL_KEY = "rh_wake_url";
+const BOOTSTRAP_PREFIX = "rh_bootstrap_ineligible:";
+
+export function normalizeControlPlaneUrl(raw: string): string {
+  return raw.trim().replace(/\/+$/, "");
+}
+
+export function readStoredControlPlaneUrl(): string | null {
+  const v = localStorage.getItem(URL_KEY);
+  return v && v.trim().length > 0 ? normalizeControlPlaneUrl(v) : null;
+}
+
+export function writeStoredControlPlaneUrl(url: string): void {
+  localStorage.setItem(URL_KEY, normalizeControlPlaneUrl(url));
+}
+
+export function readStoredApiKey(): string {
+  return localStorage.getItem(API_KEY_KEY) ?? "";
+}
+
+export function writeStoredApiKey(key: string): void {
+  localStorage.setItem(API_KEY_KEY, key);
+}
+
+export function readStoredWakeUrl(): string {
+  return localStorage.getItem(WAKE_URL_KEY) ?? "";
+}
+
+export function writeStoredWakeUrl(url: string): void {
+  localStorage.setItem(WAKE_URL_KEY, url.trim());
+}
+
+export function bootstrapIneligibleKey(baseUrl: string): string {
+  return `${BOOTSTRAP_PREFIX}${normalizeControlPlaneUrl(baseUrl)}`;
+}
+
+export function readBootstrapIneligible(baseUrl: string): boolean {
+  return localStorage.getItem(bootstrapIneligibleKey(baseUrl)) === "1";
+}
+
+export function writeBootstrapIneligible(baseUrl: string, value: boolean): void {
+  const k = bootstrapIneligibleKey(baseUrl);
+  if (value) {
+    localStorage.setItem(k, "1");
+  } else {
+    localStorage.removeItem(k);
+  }
+}
+
+/** Default dev URL; Vite env can pre-fill Settings UI only (not auto-persisted). */
+export function envSuggestedControlPlaneUrl(): string {
+  const env = import.meta.env.VITE_CONTROL_PLANE_URL?.trim();
+  return env ? normalizeControlPlaneUrl(env) : "http://127.0.0.1:3000";
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/settings/settings-context.tsx ========
+import { createContext } from "react";
+
+export interface SettingsContextValue {
+  /** Persisted control plane base URL, or null until the user saves one in Settings. */
+  controlPlaneUrl: string | null;
+  setControlPlaneUrlPersisted: (url: string) => void;
+  apiKey: string;
+  setApiKeyPersisted: (key: string) => void;
+  wakeUrl: string;
+  setWakeUrlPersisted: (url: string) => void;
+  /** Shown as placeholder in Settings when URL not yet stored. */
+  suggestedControlPlaneUrl: string;
+}
+
+export const SettingsContext = createContext<SettingsContextValue | null>(null);
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/context/SettingsProvider.tsx ========
+import { useCallback, useMemo, useState, type ReactNode } from "react";
+import {
+  envSuggestedControlPlaneUrl,
+  normalizeControlPlaneUrl,
+  readStoredApiKey,
+  readStoredControlPlaneUrl,
+  readStoredWakeUrl,
+  writeStoredApiKey,
+  writeStoredControlPlaneUrl,
+  writeStoredWakeUrl,
+} from "../settings/storage";
+import { SettingsContext, type SettingsContextValue } from "../settings/settings-context";
+
+export function SettingsProvider({ children }: { children: ReactNode }) {
+  const [controlPlaneUrl, setControlPlaneUrl] = useState<string | null>(() => readStoredControlPlaneUrl());
+  const [apiKey, setApiKey] = useState(() => readStoredApiKey());
+  const [wakeUrl, setWakeUrl] = useState(() => readStoredWakeUrl());
+
+  const setControlPlaneUrlPersisted = useCallback((url: string) => {
+    const n = normalizeControlPlaneUrl(url);
+    writeStoredControlPlaneUrl(n);
+    setControlPlaneUrl(n);
+  }, []);
+
+  const setApiKeyPersisted = useCallback((key: string) => {
+    writeStoredApiKey(key);
+    setApiKey(key);
+  }, []);
+
+  const setWakeUrlPersisted = useCallback((url: string) => {
+    writeStoredWakeUrl(url);
+    setWakeUrl(url.trim());
+  }, []);
+
+  const value = useMemo<SettingsContextValue>(
+    () => ({
+      controlPlaneUrl,
+      setControlPlaneUrlPersisted,
+      apiKey,
+      setApiKeyPersisted,
+      wakeUrl,
+      setWakeUrlPersisted,
+      suggestedControlPlaneUrl: envSuggestedControlPlaneUrl(),
+    }),
+    [apiKey, controlPlaneUrl, setApiKeyPersisted, setControlPlaneUrlPersisted, setWakeUrlPersisted, wakeUrl],
+  );
+
+  return <SettingsContext.Provider value={value}>{children}</SettingsContext.Provider>;
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/hooks/useSettings.ts ========
+import { useContext } from "react";
+import { SettingsContext, type SettingsContextValue } from "../settings/settings-context";
+
+export function useSettings(): SettingsContextValue {
+  const v = useContext(SettingsContext);
+  if (!v) {
+    throw new Error("useSettings must be used within SettingsProvider");
+  }
+  return v;
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/layout/AppLayout.tsx ========
+import { NavLink, Outlet } from "react-router-dom";
+
+const linkClass = ({ isActive }: { isActive: boolean }) =>
+  [
+    "rounded-md px-3 py-2 text-sm font-medium transition-colors",
+    isActive ? "bg-primary text-primary-fg" : "text-muted hover:bg-black/5 hover:text-foreground",
+  ].join(" ");
+
+export function AppLayout() {
+  return (
+    <div className="flex min-h-screen flex-col">
+      <header className="border-b border-border bg-card">
+        <div className="mx-auto flex max-w-5xl flex-wrap items-center justify-between gap-3 px-4 py-3">
+          <div className="flex items-baseline gap-3">
+            <span className="text-lg font-semibold tracking-tight">Remote Harness</span>
+            <span className="text-xs text-muted">control plane UI</span>
+          </div>
+          <nav className="flex flex-wrap gap-1">
+            <NavLink to="/" className={linkClass} end>
+              Home
+            </NavLink>
+            <NavLink to="/playground" className={linkClass}>
+              API playground
+            </NavLink>
+            <NavLink to="/settings" className={linkClass}>
+              Settings
+            </NavLink>
+          </nav>
+        </div>
+      </header>
+      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-8">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/pages/HomePage.tsx ========
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "react-router-dom";
+import { fetchHealth } from "../api/health";
+import { useSettings } from "../hooks/useSettings";
+
+export function HomePage() {
+  const { controlPlaneUrl, apiKey, wakeUrl } = useSettings();
+
+  const health = useQuery({
+    queryKey: ["health", controlPlaneUrl],
+    queryFn: () => fetchHealth(controlPlaneUrl!),
+    enabled: Boolean(controlPlaneUrl),
+    retry: 1,
+  });
+
+  return (
+    <div className="space-y-8">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Home</h1>
+        <p className="mt-2 max-w-2xl text-sm text-muted">
+          Client-only SPA: the browser talks directly to your control plane (no UI server proxy). Configure the base URL and API key under
+          Settings, then use the playground to exercise the same REST surface as the CLI.
+        </p>
+      </div>
+
+      <div className="rounded-lg border border-border bg-card p-5 shadow-sm">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted">Connection</h2>
+        {!controlPlaneUrl ? (
+          <p className="mt-3 text-sm">
+            No control plane URL saved yet. Open{" "}
+            <Link className="text-primary underline decoration-primary/30 underline-offset-2" to="/settings">
+              Settings
+            </Link>{" "}
+            to validate <code className="text-foreground">GET /health</code> and store your URL.
+          </p>
+        ) : (
+          <dl className="mt-3 space-y-2 text-sm">
+            <div>
+              <dt className="text-muted">Base URL</dt>
+              <dd className="font-mono text-xs">{controlPlaneUrl}</dd>
+            </div>
+            <div>
+              <dt className="text-muted">API key</dt>
+              <dd>{apiKey.trim() ? "Saved in this browser" : "Not set"}</dd>
+            </div>
+            {wakeUrl.trim() ? (
+              <div>
+                <dt className="text-muted">Wake URL</dt>
+                <dd className="break-all font-mono text-xs">{wakeUrl.trim()}</dd>
+              </div>
+            ) : null}
+          </dl>
+        )}
+
+        {controlPlaneUrl ? (
+          <div className="mt-4 border-t border-border pt-4">
+            {health.isPending ? (
+              <p className="text-sm text-muted">Checking health…</p>
+            ) : health.isError ? (
+              <div className="space-y-2">
+                <p className="text-sm text-destructive">Health check failed: {(health.error as Error).message}</p>
+                {wakeUrl.trim() ? (
+                  <button
+                    type="button"
+                    className="rounded-md border border-border bg-card px-3 py-1.5 text-sm font-medium hover:bg-black/[0.03]"
+                    onClick={() => {
+                      void fetch(wakeUrl.trim(), { method: "GET", mode: "no-cors" }).catch(() => undefined);
+                    }}
+                  >
+                    Wake up (GET wake URL)
+                  </button>
+                ) : null}
+              </div>
+            ) : health.data?.ok ? (
+              <p className="text-sm text-green-800 dark:text-green-300">
+                <span className="font-medium">Healthy.</span> <span className="text-muted">{health.data.snippet}</span>
+              </p>
+            ) : (
+              <div className="space-y-2">
+                <p className="text-sm text-destructive">
+                  Health returned {health.data?.status}: {health.data?.snippet}
+                </p>
+                {wakeUrl.trim() ? (
+                  <button
+                    type="button"
+                    className="rounded-md border border-border bg-card px-3 py-1.5 text-sm font-medium hover:bg-black/[0.03]"
+                    onClick={() => {
+                      void fetch(wakeUrl.trim(), { method: "GET", mode: "no-cors" }).catch(() => undefined);
+                    }}
+                  >
+                    Wake up (GET wake URL)
+                  </button>
+                ) : null}
+              </div>
+            )}
+          </div>
+        ) : null}
+      </div>
+
+      <ul className="flex flex-wrap gap-3 text-sm">
+        <li>
+          <Link
+            className="inline-flex rounded-md border border-border bg-card px-4 py-2 font-medium shadow-sm hover:bg-black/[0.02]"
+            to="/settings"
+          >
+            Settings
+          </Link>
+        </li>
+        <li>
+          <Link
+            className="inline-flex rounded-md border border-border bg-card px-4 py-2 font-medium shadow-sm hover:bg-black/[0.02]"
+            to="/playground"
+          >
+            API playground
+          </Link>
+        </li>
+      </ul>
+
+      <p className="text-xs text-muted">
+        Session list and detail views ship in plan task 23. OAuth entry for Git remains available from the playground identities section.
+      </p>
+    </div>
+  );
+}
+
+======== FILE: /Users/chizbro/Desktop/code/utils/remote_harness_3/web/src/pages/SettingsPage.tsx ========
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { ControlPlaneHttpError, controlPlaneFetch, controlPlaneJson } from "../api/client";
+import { fetchHealth } from "../api/health";
+import { readBootstrapIneligible, writeBootstrapIneligible } from "../settings/storage";
+import { useSettings } from "../hooks/useSettings";
+
+interface PaginatedApiKeys {
+  items: unknown[];
+}
+
+export function SettingsPage() {
+  const qc = useQueryClient();
+  const {
+    controlPlaneUrl,
+    setControlPlaneUrlPersisted,
+    apiKey,
+    setApiKeyPersisted,
+    wakeUrl,
+    setWakeUrlPersisted,
+    suggestedControlPlaneUrl,
+  } = useSettings();
+
+  const [urlDraft, setUrlDraft] = useState(() => controlPlaneUrl ?? suggestedControlPlaneUrl);
+  const [keyDraft, setKeyDraft] = useState(apiKey);
+  const [wakeDraft, setWakeDraft] = useState(wakeUrl);
+  const [bootstrapLabel, setBootstrapLabel] = useState("browser-bootstrap");
+  const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
+  const [bootstrapResult, setBootstrapResult] = useState<string | null>(null);
+
+  const effectiveBase = controlPlaneUrl;
+  const showBootstrap =
+    Boolean(effectiveBase) && !readBootstrapIneligible(effectiveBase!) && !apiKey.trim();
+
+  const healthQuery = useQuery({
+    queryKey: ["health", effectiveBase],
+    queryFn: () => fetchHealth(effectiveBase!),
+    enabled: Boolean(effectiveBase),
+    retry: 0,
+  });
+
+  const saveUrlMutation = useMutation({
+    mutationFn: async (raw: string) => {
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        throw new Error("Enter a control plane URL.");
+      }
+      setControlPlaneUrlPersisted(trimmed);
+      await qc.invalidateQueries({ queryKey: ["health"] });
+      return fetchHealth(trimmed);
+    },
+  });
+
+  const saveKeyMutation = useMutation({
+    mutationFn: async (key: string) => {
+      setApiKeyPersisted(key);
+    },
+  });
+
+  const verifyKeyMutation = useMutation({
+    mutationFn: async (keyToUse: string) => {
+      if (!effectiveBase) {
+        throw new Error("Save a control plane URL first.");
+      }
+      const trimmed = keyToUse.trim();
+      if (!trimmed) {
+        throw new Error("Enter an API key first.");
+      }
+      const data = await controlPlaneJson<PaginatedApiKeys>({
+        baseUrl: effectiveBase,
+        path: "/api-keys?limit=5",
+        method: "GET",
+        apiKey: trimmed,
+      });
+      writeBootstrapIneligible(effectiveBase, true);
+      return data;
+    },
+    onSuccess: () => {
+      setVerifyMessage("Authenticated: GET /api-keys succeeded.");
+    },
+    onError: (e: unknown) => {
+      if (e instanceof ControlPlaneHttpError) {
+        setVerifyMessage(`${e.mapped.title}: ${e.mapped.detail}`);
+        return;
+      }
+      setVerifyMessage(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  const bootstrapMutation = useMutation({
+    mutationFn: async () => {
+      if (!effectiveBase) {
+        throw new Error("Save a control plane URL first.");
+      }
+      const res = await controlPlaneFetch({
+        baseUrl: effectiveBase,
+        path: "/api-keys/bootstrap",
+        method: "POST",
+        jsonBody: { label: bootstrapLabel.trim() || undefined },
+      });
+      const text = await res.text();
+      if (res.status === 403) {
+        writeBootstrapIneligible(effectiveBase, true);
+      }
+      if (!res.ok) {
+        throw new ControlPlaneHttpError(res.status, text);
+      }
+      const created = JSON.parse(text) as { key?: string };
+      if (created.key) {
+        setApiKeyPersisted(created.key);
+        setKeyDraft(created.key);
+        writeBootstrapIneligible(effectiveBase, true);
+      }
+      return created;
+    },
+    onSuccess: () => {
+      setBootstrapResult("Bootstrap succeeded — your new key was saved in this browser.");
+      void qc.invalidateQueries({ queryKey: ["health"] });
+    },
+    onError: (e: unknown) => {
+      if (e instanceof ControlPlaneHttpError) {
+        setBootstrapResult(`${e.mapped.title}: ${e.mapped.detail}`);
+        return;
+      }
+      const err = e as Error & { mapped?: { title: string; detail: string } };
+      if (err.mapped) {
+        setBootstrapResult(`${err.mapped.title}: ${err.mapped.detail}`);
+        return;
+      }
+      setBootstrapResult(e instanceof Error ? e.message : String(e));
+    },
+  });
+
+  return (
+    <div className="mx-auto max-w-xl space-y-10">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+        <p className="mt-2 text-sm text-muted">
+          First-time setup: confirm the control plane URL with <code className="text-foreground">GET /health</code>, then authenticate with an API key or a one-time bootstrap when the server allows it (see{" "}
+          <code className="text-foreground">docs/CLIENT_EXPERIENCE.md</code> §7).
+        </p>
+      </div>
+
+      <section className="space-y-3 rounded-lg border border-border bg-card p-5 shadow-sm">
+        <h2 className="text-base font-semibold">Control plane URL</h2>
+        <label className="block text-sm">
+          <span className="text-muted">Base URL (no trailing slash)</span>
+          <input
+            className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-sm"
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+            placeholder={suggestedControlPlaneUrl}
+            autoComplete="off"
+            spellCheck={false}
+          />
+        </label>
+        <button
+          type="button"
+          className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-fg hover:opacity-95 disabled:opacity-50"
+          disabled={saveUrlMutation.isPending}
+          onClick={() => saveUrlMutation.mutate(urlDraft)}
+        >
+          Save &amp; verify health
+        </button>
+        {saveUrlMutation.isError ? (
+          <p className="text-sm text-destructive">
+            {(saveUrlMutation.error as Error & { mapped?: { detail: string } }).mapped?.detail ??
+              (saveUrlMutation.error as Error).message}
+          </p>
+        ) : null}
+        {saveUrlMutation.isSuccess && saveUrlMutation.data ? (
+          <p className={`text-sm ${saveUrlMutation.data.ok ? "text-green-800 dark:text-green-300" : "text-destructive"}`}>
+            {saveUrlMutation.data.ok ? "Health OK: " : "Health failed: "}
+            {saveUrlMutation.data.snippet}
+          </p>
+        ) : null}
+        {effectiveBase && healthQuery.data && !saveUrlMutation.isSuccess ? (
+          <p className={`text-sm ${healthQuery.data.ok ? "text-muted" : "text-destructive"}`}>
+            Current: {healthQuery.data.ok ? "reachable" : "error"} — {healthQuery.data.snippet}
+          </p>
+        ) : null}
+      </section>
+
+      <section className="space-y-3 rounded-lg border border-border bg-card p-5 shadow-sm">
+        <h2 className="text-base font-semibold">Wake URL (optional)</h2>
+        <p className="text-sm text-muted">
+          If your control plane sleeps, store a GET URL that your infrastructure uses to wake it (<code className="text-foreground">docs/HOSTING.md</code> §4). The Home page offers this button when health checks fail.
+        </p>
+        <input
+          className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-sm"
+          value={wakeDraft}
+          onChange={(e) => setWakeDraft(e.target.value)}
+          placeholder="https://always-on.example/wake-harness"
+          autoComplete="off"
+        />
+        <button
+          type="button"
+          className="rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-black/[0.03]"
+          onClick={() => setWakeUrlPersisted(wakeDraft)}
+        >
+          Save wake URL
+        </button>
+      </section>
+
+      <section className="space-y-3 rounded-lg border border-border bg-card p-5 shadow-sm">
+        <h2 className="text-base font-semibold">API key</h2>
+        <p className="text-sm text-muted">Stored in this browser only (see HOSTING threat model).</p>
+        <input
+          className="w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-sm"
+          type="password"
+          autoComplete="off"
+          value={keyDraft}
+          onChange={(e) => setKeyDraft(e.target.value)}
+          placeholder="rh_…"
+        />
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-fg hover:opacity-95"
+            onClick={() => {
+              setVerifyMessage(null);
+              setApiKeyPersisted(keyDraft);
+              verifyKeyMutation.mutate(keyDraft);
+            }}
+            disabled={!effectiveBase || verifyKeyMutation.isPending}
+          >
+            Save key &amp; verify
+          </button>
+          <button
+            type="button"
+            className="rounded-md border border-border px-4 py-2 text-sm font-medium hover:bg-black/[0.03]"
+            onClick={() => {
+              setVerifyMessage(null);
+              saveKeyMutation.mutate(keyDraft);
+            }}
+          >
+            Save key only
+          </button>
+        </div>
+        {verifyMessage ? <p className="text-sm">{verifyMessage}</p> : null}
+      </section>
+
+      {showBootstrap ? (
+        <section className="space-y-3 rounded-lg border border-amber-200 bg-amber-50/80 p-5 dark:border-amber-900/50 dark:bg-amber-950/30">
+          <h2 className="text-base font-semibold">First API key (bootstrap)</h2>
+          <p className="text-sm text-muted">
+            Shown only when no key is stored yet. <code className="text-foreground">POST /api-keys/bootstrap</code> is disabled after the first key exists or when the server sets{" "}
+            <code className="text-foreground">API_KEY</code> / <code className="text-foreground">API_KEYS</code>.
+          </p>
+          <label className="block text-sm">
+            <span className="text-muted">Label (optional)</span>
+            <input
+              className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+              value={bootstrapLabel}
+              onChange={(e) => setBootstrapLabel(e.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-fg hover:opacity-95 disabled:opacity-50"
+            disabled={bootstrapMutation.isPending || !effectiveBase}
+            onClick={() => {
+              setBootstrapResult(null);
+              bootstrapMutation.mutate();
+            }}
+          >
+            Create first key (bootstrap)
+          </button>
+          {bootstrapResult ? <p className="text-sm">{bootstrapResult}</p> : null}
+        </section>
+      ) : null}
+
+      <section className="rounded-lg border border-border bg-card p-5 text-sm text-muted shadow-sm">
+        <p className="font-medium text-foreground">CORS</p>
+        <p className="mt-2">
+          If the UI origin differs from the API (including port), the control plane must list this origin in{" "}
+          <code className="text-foreground">CORS_ALLOWED_ORIGINS</code>. When requests fail with <code className="text-foreground">TypeError: Failed to fetch</code> across origins, the app surfaces a CORS hint (see{" "}
+          <code className="text-foreground">docs/TROUBLESHOOTING.md</code> §1a).
+        </p>
+      </section>
+    </div>
+  );
+}
+
+======== FILE: PlaygroundPage.tsx (first 80 lines) ========
+import { useEffect, useState, type CSSProperties } from "react";
+import { Link } from "react-router-dom";
+import { useSettings } from "../hooks/useSettings";
+
+type ProbeState = "pending" | "ok" | "error";
+
+interface ProbeRow {
+  label: string;
+  path: string;
+  state: ProbeState;
+  detail: string;
+}
+
+/** Keep in sync with workspace `[workspace.package] version` / api-types release (worker register semver gate). */
+const CONTROL_PLANE_RELEASE = "0.1.0";
+
+export function PlaygroundPage() {
+  const { controlPlaneUrl, apiKey } = useSettings();
+  const base = controlPlaneUrl ?? "";
+
+  const [rows, setRows] = useState<ProbeRow[]>([
+    { label: "GET /health", path: "/health", state: "pending", detail: "…" },
+    { label: "GET /ready", path: "/ready", state: "pending", detail: "…" },
+    { label: "GET /health/idle", path: "/health/idle", state: "pending", detail: "…" },
+  ]);
+  const [identityId, setIdentityId] = useState("default");
+  const [repoProvider, setRepoProvider] = useState("github");
+  const [identityGetOut, setIdentityGetOut] = useState("");
+  const [identityAuthOut, setIdentityAuthOut] = useState("");
+  const [identityReposOut, setIdentityReposOut] = useState("");
+  const [identityPatchAgent, setIdentityPatchAgent] = useState("");
+  const [identityPatchGit, setIdentityPatchGit] = useState("");
+  const [identityPatchOut, setIdentityPatchOut] = useState("");
+  const [workersOut, setWorkersOut] = useState("");
+  const [workerRegId, setWorkerRegId] = useState("");
+  const [workerRegVersion, setWorkerRegVersion] = useState(CONTROL_PLANE_RELEASE);
+  const [workerPullId, setWorkerPullId] = useState("");
+  const [workerPullOut, setWorkerPullOut] = useState("");
+  const [workerCompleteTaskId, setWorkerCompleteTaskId] = useState("");
+  const [workerCompleteWorkerId, setWorkerCompleteWorkerId] = useState("");
+  const [workerCompleteSentinelReached, setWorkerCompleteSentinelReached] = useState(false);
+  const [workerCompleteOut, setWorkerCompleteOut] = useState("");
+  const [sessionRepoUrl, setSessionRepoUrl] = useState("https://github.com/example/repo.git");
+  const [sessionWorkflow, setSessionWorkflow] = useState<"chat" | "loop_n" | "loop_until_sentinel">("chat");
+  const [sessionPrompt, setSessionPrompt] = useState("Hello");
+  const [sessionAgentCli, setSessionAgentCli] = useState("cursor");
+  const [sessionLoopN, setSessionLoopN] = useState("3");
+  const [sessionSentinel, setSessionSentinel] = useState("DONE");
+  const [sessionOut, setSessionOut] = useState("");
+  const [sessionIdField, setSessionIdField] = useState("");
+  const [sessionDetailOut, setSessionDetailOut] = useState("");
+  const [sessionInputMessage, setSessionInputMessage] = useState("");
+  const [sessionInputOut, setSessionInputOut] = useState("");
+  const [logsOut, setLogsOut] = useState("");
+  const [logsJobIdFilter, setLogsJobIdFilter] = useState("");
+  const [logsLastN, setLogsLastN] = useState("");
+  const [workerLogsTaskId, setWorkerLogsTaskId] = useState("");
+  const [workerLogsJson, setWorkerLogsJson] = useState(
+    '[{"timestamp":"2025-01-01T12:00:00.000Z","level":"info","message":"hello from UI","source":"worker"}]',
+  );
+
+  useEffect(() => {
+    if (!base) {
+      return;
+    }
+    let cancelled = false;
+
+    async function run() {
+      const next: ProbeRow[] = [];
+      for (const row of [
+        { label: "GET /health", path: "/health" },
+        { label: "GET /ready", path: "/ready" },
+        { label: "GET /health/idle", path: "/health/idle" },
+      ]) {
+        const url = `${base}${row.path}`;
+        try {
+          const res = await fetch(url, { method: "GET" });
+          const text = await res.text();
+          let detail = `${res.status}`;
+          try {
+… (remainder is prior App.tsx monolith: workers, sessions, logs, identities, OAuth links) …
+
+======== FILE: PlaygroundPage.tsx (FULL) ========
+import { useEffect, useState, type CSSProperties } from "react";
+import { Link } from "react-router-dom";
+import { useSettings } from "../hooks/useSettings";
+
+type ProbeState = "pending" | "ok" | "error";
+
+interface ProbeRow {
+  label: string;
+  path: string;
+  state: ProbeState;
+  detail: string;
+}
+
+/** Keep in sync with workspace `[workspace.package] version` / api-types release (worker register semver gate). */
+const CONTROL_PLANE_RELEASE = "0.1.0";
+
+export function PlaygroundPage() {
+  const { controlPlaneUrl, apiKey } = useSettings();
+  const base = controlPlaneUrl ?? "";
+
+  const [rows, setRows] = useState<ProbeRow[]>([
+    { label: "GET /health", path: "/health", state: "pending", detail: "…" },
+    { label: "GET /ready", path: "/ready", state: "pending", detail: "…" },
+    { label: "GET /health/idle", path: "/health/idle", state: "pending", detail: "…" },
+  ]);
+  const [identityId, setIdentityId] = useState("default");
+  const [repoProvider, setRepoProvider] = useState("github");
+  const [identityGetOut, setIdentityGetOut] = useState("");
+  const [identityAuthOut, setIdentityAuthOut] = useState("");
+  const [identityReposOut, setIdentityReposOut] = useState("");
+  const [identityPatchAgent, setIdentityPatchAgent] = useState("");
+  const [identityPatchGit, setIdentityPatchGit] = useState("");
+  const [identityPatchOut, setIdentityPatchOut] = useState("");
+  const [workersOut, setWorkersOut] = useState("");
+  const [workerRegId, setWorkerRegId] = useState("");
+  const [workerRegVersion, setWorkerRegVersion] = useState(CONTROL_PLANE_RELEASE);
+  const [workerPullId, setWorkerPullId] = useState("");
+  const [workerPullOut, setWorkerPullOut] = useState("");
+  const [workerCompleteTaskId, setWorkerCompleteTaskId] = useState("");
+  const [workerCompleteWorkerId, setWorkerCompleteWorkerId] = useState("");
+  const [workerCompleteSentinelReached, setWorkerCompleteSentinelReached] = useState(false);
+  const [workerCompleteOut, setWorkerCompleteOut] = useState("");
+  const [sessionRepoUrl, setSessionRepoUrl] = useState("https://github.com/example/repo.git");
+  const [sessionWorkflow, setSessionWorkflow] = useState<"chat" | "loop_n" | "loop_until_sentinel">("chat");
+  const [sessionPrompt, setSessionPrompt] = useState("Hello");
+  const [sessionAgentCli, setSessionAgentCli] = useState("cursor");
+  const [sessionLoopN, setSessionLoopN] = useState("3");
+  const [sessionSentinel, setSessionSentinel] = useState("DONE");
+  const [sessionOut, setSessionOut] = useState("");
+  const [sessionIdField, setSessionIdField] = useState("");
+  const [sessionDetailOut, setSessionDetailOut] = useState("");
+  const [sessionInputMessage, setSessionInputMessage] = useState("");
+  const [sessionInputOut, setSessionInputOut] = useState("");
+  const [logsOut, setLogsOut] = useState("");
+  const [logsJobIdFilter, setLogsJobIdFilter] = useState("");
+  const [logsLastN, setLogsLastN] = useState("");
+  const [workerLogsTaskId, setWorkerLogsTaskId] = useState("");
+  const [workerLogsJson, setWorkerLogsJson] = useState(
+    '[{"timestamp":"2025-01-01T12:00:00.000Z","level":"info","message":"hello from UI","source":"worker"}]',
+  );
+
+  useEffect(() => {
+    if (!base) {
+      return;
+    }
+    let cancelled = false;
+
+    async function run() {
+      const next: ProbeRow[] = [];
+      for (const row of [
+        { label: "GET /health", path: "/health" },
+        { label: "GET /ready", path: "/ready" },
+        { label: "GET /health/idle", path: "/health/idle" },
+      ]) {
+        const url = `${base}${row.path}`;
+        try {
+          const res = await fetch(url, { method: "GET" });
+          const text = await res.text();
+          let detail = `${res.status}`;
+          try {
+            const j = JSON.parse(text) as Record<string, unknown>;
+            detail = `${res.status} ${JSON.stringify(j)}`;
+          } catch {
+            if (text.length > 0 && text.length < 200) {
+              detail = `${res.status} ${text}`;
+            }
+          }
+          if (cancelled) {
+            return;
+          }
+          next.push({
+            label: row.label,
+            path: row.path,
+            state: res.ok ? "ok" : "error",
+            detail,
+          });
+        } catch (e) {
+          if (cancelled) {
+            return;
+          }
+          const msg = e instanceof Error ? e.message : String(e);
+          next.push({
+            label: row.label,
+            path: row.path,
+            state: "error",
+            detail: msg,
+          });
+        }
+      }
+      if (!cancelled) {
+        setRows(next);
+      }
+    }
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [base]);
+
+  async function fetchIdentityJson(path: string): Promise<string> {
+    if (!apiKey.trim()) {
+      return "Set an API key to call authenticated identity endpoints.";
+    }
+    const url = `${base}${path}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey.trim()}` },
+    });
+    const text = await res.text();
+    try {
+      const j = JSON.parse(text) as unknown;
+      return `${res.status} ${JSON.stringify(j, null, 2)}`;
+    } catch {
+      return `${res.status} ${text}`;
+    }
+  }
+
+  return (
+    <main style={{ fontFamily: "system-ui, sans-serif", maxWidth: 720, margin: "0 auto", padding: "0 1rem" }}>
+      <h1 style={{ fontWeight: 600 }}>API playground</h1>
+      <p style={{ color: "#444", lineHeight: 1.5 }}>
+        Control plane: <code>{base}</code> (set in <Link to="/settings">Settings</Link>).
+      </p>
+      <p style={{ color: "#444" }}>No-auth probes:</p>
+      <ul style={{ listStyle: "none", padding: 0 }}>
+        {rows.map((r) => (
+          <li
+            key={r.path}
+            style={{
+              border: "1px solid #ddd",
+              borderRadius: 8,
+              padding: "0.75rem 1rem",
+              marginBottom: "0.5rem",
+              background: r.state === "error" ? "#fff5f5" : r.state === "ok" ? "#f6fff8" : "#fafafa",
+            }}
+          >
+            <div style={{ fontWeight: 500 }}>{r.label}</div>
+            <div style={{ fontSize: "0.875rem", color: "#333", marginTop: 4 }}>{r.detail}</div>
+          </li>
+        ))}
+      </ul>
+
+      <section style={{ marginTop: "2rem" }}>
+        <h2 style={{ fontWeight: 600, fontSize: "1.1rem" }}>Workers</h2>
+        <p style={{ color: "#444", fontSize: "0.9rem", lineHeight: 1.5 }}>
+          Same API key as identities. Register sends <code>client_version</code> semver; must match control plane{" "}
+          <strong>major.minor</strong> (use <code>{CONTROL_PLANE_RELEASE}</code> for this repo release).
+        </p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
+        <button
+          type="button"
+          style={btn}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setWorkersOut("Set an API key first.");
+              return;
+            }
+            const url = `${base}/workers`;
+            const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey.trim()}` } });
+            const text = await res.text();
+            try {
+              const j = JSON.parse(text) as unknown;
+              setWorkersOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+            } catch {
+              setWorkersOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          GET /workers
+        </button>
+        </div>
+        <p style={{ color: "#444", fontSize: "0.9rem", marginTop: "1rem", lineHeight: 1.5 }}>
+          Pull / complete need a registered worker. Create a session below (identity must have agent + git tokens), then pull to claim the first job. For <code>loop_until_sentinel</code>, check “sentinel reached” on complete when the agent output contained the literal substring from session params.
+        </p>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Pull — worker id</span>
+          <input
+            value={workerPullId}
+            onChange={(e) => setWorkerPullId(e.target.value)}
+            placeholder="same id as register"
+            style={{ width: "100%", maxWidth: 360, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <button
+          type="button"
+          style={{ ...btn, marginBottom: "0.75rem" }}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setWorkerPullOut("Set an API key first.");
+              return;
+            }
+            const wid = workerPullId.trim();
+            if (!wid) {
+              setWorkerPullOut("Enter worker id.");
+              return;
+            }
+            const url = `${base}/workers/tasks/pull`;
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ worker_id: wid }),
+            });
+            const text = await res.text();
+            if (res.status === 204) {
+              setWorkerPullOut("204 No Content (no work)");
+              return;
+            }
+            try {
+              const j = JSON.parse(text) as unknown;
+              setWorkerPullOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+            } catch {
+              setWorkerPullOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          POST /workers/tasks/pull
+        </button>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Complete — task id (job UUID)</span>
+          <input
+            value={workerCompleteTaskId}
+            onChange={(e) => setWorkerCompleteTaskId(e.target.value)}
+            placeholder="uuid from pull response"
+            style={{ width: "100%", maxWidth: 420, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.5rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Complete — worker id (optional, recommended)</span>
+          <input
+            value={workerCompleteWorkerId}
+            onChange={(e) => setWorkerCompleteWorkerId(e.target.value)}
+            style={{ width: "100%", maxWidth: 360, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: "0.75rem", fontSize: "0.9rem", color: "#444" }}>
+          <input
+            type="checkbox"
+            checked={workerCompleteSentinelReached}
+            onChange={(e) => setWorkerCompleteSentinelReached(e.target.checked)}
+          />
+          sentinel_reached (loop_until_sentinel)
+        </label>
+        <button
+          type="button"
+          style={{ ...btn, marginBottom: "0.75rem" }}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setWorkerCompleteOut("Set an API key first.");
+              return;
+            }
+            const tid = workerCompleteTaskId.trim();
+            if (!tid) {
+              setWorkerCompleteOut("Enter task id.");
+              return;
+            }
+            const url = `${base}/workers/tasks/${encodeURIComponent(tid)}/complete`;
+            const body: Record<string, unknown> = { status: "success" };
+            const w = workerCompleteWorkerId.trim();
+            if (w) {
+              body.worker_id = w;
+            }
+            if (workerCompleteSentinelReached) {
+              body.sentinel_reached = true;
+            }
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+            });
+            const text = await res.text();
+            try {
+              const j = JSON.parse(text) as unknown;
+              setWorkerCompleteOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+            } catch {
+              setWorkerCompleteOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          POST /workers/tasks/:id/complete (success)
+        </button>
+        {workerPullOut ? <pre style={{ ...preBox, marginTop: 8 }}>{workerPullOut}</pre> : null}
+        {workerCompleteOut ? <pre style={{ ...preBox, marginTop: 8 }}>{workerCompleteOut}</pre> : null}
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Register worker id</span>
+          <input
+            value={workerRegId}
+            onChange={(e) => setWorkerRegId(e.target.value)}
+            placeholder="hostname-1"
+            style={{ width: "100%", maxWidth: 360, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.75rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>client_version (semver)</span>
+          <input
+            value={workerRegVersion}
+            onChange={(e) => setWorkerRegVersion(e.target.value)}
+            style={{ width: "100%", maxWidth: 200, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <button
+          type="button"
+          style={btn}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setWorkersOut("Set an API key first.");
+              return;
+            }
+            const id = workerRegId.trim();
+            if (!id) {
+              setWorkersOut("Enter a worker id.");
+              return;
+            }
+            const url = `${base}/workers/register`;
+            const body = {
+              id,
+              host: typeof window !== "undefined" ? window.location.hostname : "web-ui",
+              labels: { platform: "browser" },
+              capabilities: [],
+              client_version: workerRegVersion.trim() || CONTROL_PLANE_RELEASE,
+            };
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+            });
+            const text = await res.text();
+            try {
+              const j = JSON.parse(text) as unknown;
+              setWorkersOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+            } catch {
+              setWorkersOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          POST /workers/register
+        </button>
+        {workersOut ? <pre style={{ ...preBox, marginTop: 12 }}>{workersOut}</pre> : null}
+      </section>
+
+      <section style={{ marginTop: "2rem" }}>
+        <h2 style={{ fontWeight: 600, fontSize: "1.1rem" }}>Sessions</h2>
+        <p style={{ color: "#444", fontSize: "0.9rem", lineHeight: 1.5 }}>
+          Uses the same API key as below (Identities section). Workflows: <code>chat</code> (follow-up via POST /sessions/:id/input when <code>running</code>),{" "}
+          <code>loop_n</code>, <code>loop_until_sentinel</code> (literal substring; server caps iterations via <code>LOOP_UNTIL_SENTINEL_MAX_ITERATIONS</code>).
+        </p>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>workflow</span>
+          <select
+            value={sessionWorkflow}
+            onChange={(e) => setSessionWorkflow(e.target.value as typeof sessionWorkflow)}
+            style={{ width: "100%", maxWidth: 320, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          >
+            <option value="chat">chat</option>
+            <option value="loop_n">loop_n</option>
+            <option value="loop_until_sentinel">loop_until_sentinel</option>
+          </select>
+        </label>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>repo_url</span>
+          <input
+            value={sessionRepoUrl}
+            onChange={(e) => setSessionRepoUrl(e.target.value)}
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>prompt</span>
+          <input
+            value={sessionPrompt}
+            onChange={(e) => setSessionPrompt(e.target.value)}
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.75rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>agent_cli</span>
+          <input
+            value={sessionAgentCli}
+            onChange={(e) => setSessionAgentCli(e.target.value)}
+            placeholder="cursor or claude_code"
+            style={{ width: "100%", maxWidth: 360, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        {sessionWorkflow === "loop_n" ? (
+          <label style={{ display: "block", marginBottom: "0.75rem" }}>
+            <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>n (iterations)</span>
+            <input
+              value={sessionLoopN}
+              onChange={(e) => setSessionLoopN(e.target.value)}
+              inputMode="numeric"
+              style={{ width: "100%", maxWidth: 200, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+            />
+          </label>
+        ) : null}
+        {sessionWorkflow === "loop_until_sentinel" ? (
+          <label style={{ display: "block", marginBottom: "0.75rem" }}>
+            <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>sentinel (literal substring)</span>
+            <input
+              value={sessionSentinel}
+              onChange={(e) => setSessionSentinel(e.target.value)}
+              style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+            />
+          </label>
+        ) : null}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setSessionOut("Set an API key first.");
+                return;
+              }
+              const url = `${base}/sessions`;
+              const nParsed = Number.parseInt(sessionLoopN.trim(), 10);
+              const params: Record<string, string | number> = {
+                prompt: sessionPrompt.trim(),
+                agent_cli: sessionAgentCli.trim(),
+              };
+              if (sessionWorkflow === "loop_n") {
+                if (!Number.isFinite(nParsed) || nParsed < 1) {
+                  setSessionOut("loop_n requires a positive integer n.");
+                  return;
+                }
+                params.n = nParsed;
+              }
+              if (sessionWorkflow === "loop_until_sentinel") {
+                const s = sessionSentinel.trim();
+                if (!s) {
+                  setSessionOut("loop_until_sentinel requires a non-empty sentinel.");
+                  return;
+                }
+                params.sentinel = s;
+              }
+              const res = await fetch(url, {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${apiKey.trim()}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  repo_url: sessionRepoUrl.trim(),
+                  workflow: sessionWorkflow,
+                  params,
+                }),
+              });
+              const text = await res.text();
+              try {
+                const j = JSON.parse(text) as { session_id?: string };
+                if (j.session_id) {
+                  setSessionIdField(j.session_id);
+                }
+                setSessionOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+              } catch {
+                setSessionOut(`${res.status} ${text}`);
+              }
+            }}
+          >
+            POST /sessions
+          </button>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setSessionDetailOut("Set an API key first.");
+                return;
+              }
+              const id = sessionIdField.trim();
+              if (!id) {
+                setSessionDetailOut("Enter session id (or create a session first).");
+                return;
+              }
+              const url = `${base}/sessions/${encodeURIComponent(id)}`;
+              const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey.trim()}` } });
+              const text = await res.text();
+              try {
+                const j = JSON.parse(text) as unknown;
+                setSessionDetailOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+              } catch {
+                setSessionDetailOut(`${res.status} ${text}`);
+              }
+            }}
+          >
+            GET /sessions/:id
+          </button>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setSessionDetailOut("Set an API key first.");
+                return;
+              }
+              const id = sessionIdField.trim();
+              if (!id) {
+                setSessionDetailOut("Enter session id.");
+                return;
+              }
+              if (!window.confirm(`Delete session ${id} from the control plane? This removes jobs and central logs for that session.`)) {
+                return;
+              }
+              const url = `${base}/sessions/${encodeURIComponent(id)}`;
+              const res = await fetch(url, {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${apiKey.trim()}` },
+              });
+              const text = await res.text();
+              setSessionDetailOut(
+                res.status === 204 ? `${res.status} (session deleted)` : `${res.status} ${text}`,
+              );
+            }}
+          >
+            DELETE /sessions/:id
+          </button>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setSessionDetailOut("Set an API key first.");
+                return;
+              }
+              const url = `${base}/sessions`;
+              const res = await fetch(url, { headers: { Authorization: `Bearer ${apiKey.trim()}` } });
+              const text = await res.text();
+              try {
+                const j = JSON.parse(text) as unknown;
+                setSessionDetailOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+              } catch {
+                setSessionDetailOut(`${res.status} ${text}`);
+              }
+            }}
+          >
+            GET /sessions
+          </button>
+        </div>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Session id</span>
+          <input
+            value={sessionIdField}
+            onChange={(e) => setSessionIdField(e.target.value)}
+            placeholder="from create response"
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Follow-up message</span>
+          <input
+            value={sessionInputMessage}
+            onChange={(e) => setSessionInputMessage(e.target.value)}
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <button
+          type="button"
+          style={{ ...btn, marginBottom: "0.75rem" }}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setSessionInputOut("Set an API key first.");
+              return;
+            }
+            const id = sessionIdField.trim();
+            if (!id) {
+              setSessionInputOut("Enter session id.");
+              return;
+            }
+            const url = `${base}/sessions/${encodeURIComponent(id)}/input`;
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ message: sessionInputMessage.trim() }),
+            });
+            const text = await res.text();
+            try {
+              const j = JSON.parse(text) as unknown;
+              setSessionInputOut(`${res.status} ${JSON.stringify(j, null, 2)}`);
+            } catch {
+              setSessionInputOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          POST /sessions/:id/input
+        </button>
+        {sessionOut ? <pre style={preBox}>{sessionOut}</pre> : null}
+        {sessionDetailOut ? <pre style={preBox}>{sessionDetailOut}</pre> : null}
+        {sessionInputOut ? <pre style={preBox}>{sessionInputOut}</pre> : null}
+      </section>
+
+      <section style={{ marginTop: "2rem" }}>
+        <h2 style={{ fontWeight: 600, fontSize: "1.1rem" }}>Logs</h2>
+        <p style={{ color: "#444", fontSize: "0.9rem", lineHeight: 1.5 }}>
+          Same session id as above. <code>GET /sessions/:id/logs</code> and <code>DELETE /sessions/:id/logs</code>; workers post batches to{" "}
+          <code>POST /workers/tasks/:id/logs</code> (task id = job UUID from pull). Timestamps must be RFC 3339.
+        </p>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Optional job_id filter (list / delete)</span>
+          <input
+            value={logsJobIdFilter}
+            onChange={(e) => setLogsJobIdFilter(e.target.value)}
+            placeholder="uuid — omit for all session logs"
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.75rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>last (newest N lines, chronological)</span>
+          <input
+            value={logsLastN}
+            onChange={(e) => setLogsLastN(e.target.value)}
+            placeholder="e.g. 50 — leave empty for cursor pagination"
+            style={{ width: "100%", maxWidth: 200, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setLogsOut("Set an API key first.");
+                return;
+              }
+              const id = sessionIdField.trim();
+              if (!id) {
+                setLogsOut("Enter session id.");
+                return;
+              }
+              const u = new URL(`${base}/sessions/${encodeURIComponent(id)}/logs`);
+              const j = logsJobIdFilter.trim();
+              if (j) {
+                u.searchParams.set("job_id", j);
+              }
+              const last = logsLastN.trim();
+              if (last) {
+                u.searchParams.set("last", last);
+              } else {
+                u.searchParams.set("limit", "50");
+              }
+              const res = await fetch(u.toString(), { headers: { Authorization: `Bearer ${apiKey.trim()}` } });
+              const text = await res.text();
+              try {
+                const parsed = JSON.parse(text) as unknown;
+                setLogsOut(`${res.status} ${JSON.stringify(parsed, null, 2)}`);
+              } catch {
+                setLogsOut(`${res.status} ${text}`);
+              }
+            }}
+          >
+            GET /sessions/:id/logs
+          </button>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => {
+              if (!apiKey.trim()) {
+                setLogsOut("Set an API key first.");
+                return;
+              }
+              const id = sessionIdField.trim();
+              if (!id) {
+                setLogsOut("Enter session id.");
+                return;
+              }
+              const u = new URL(`${base}/sessions/${encodeURIComponent(id)}/logs`);
+              const j = logsJobIdFilter.trim();
+              if (j) {
+                u.searchParams.set("job_id", j);
+              }
+              const res = await fetch(u.toString(), {
+                method: "DELETE",
+                headers: { Authorization: `Bearer ${apiKey.trim()}` },
+              });
+              const text = await res.text();
+              setLogsOut(text.length > 0 ? `${res.status} ${text}` : `${res.status}`);
+            }}
+          >
+            DELETE /sessions/:id/logs
+          </button>
+        </div>
+        <label style={{ display: "block", marginBottom: "0.35rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>Worker POST — task id (job UUID)</span>
+          <input
+            value={workerLogsTaskId}
+            onChange={(e) => setWorkerLogsTaskId(e.target.value)}
+            placeholder="from pull response"
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.5rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>JSON array body</span>
+          <textarea
+            value={workerLogsJson}
+            onChange={(e) => setWorkerLogsJson(e.target.value)}
+            rows={3}
+            style={{ width: "100%", maxWidth: 560, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc", fontFamily: "monospace", fontSize: "0.8rem" }}
+          />
+        </label>
+        <button
+          type="button"
+          style={{ ...btn, marginBottom: "0.75rem" }}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setLogsOut("Set an API key first.");
+              return;
+            }
+            const tid = workerLogsTaskId.trim();
+            if (!tid) {
+              setLogsOut("Enter task id.");
+              return;
+            }
+            let body: unknown;
+            try {
+              body = JSON.parse(workerLogsJson) as unknown;
+            } catch (e) {
+              setLogsOut(e instanceof Error ? e.message : "Invalid JSON");
+              return;
+            }
+            const url = `${base}/workers/tasks/${encodeURIComponent(tid)}/logs`;
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+            });
+            const text = await res.text();
+            try {
+              const parsed = JSON.parse(text) as unknown;
+              setLogsOut(`${res.status} ${JSON.stringify(parsed, null, 2)}`);
+            } catch {
+              setLogsOut(`${res.status} ${text}`);
+            }
+          }}
+        >
+          POST /workers/tasks/:id/logs
+        </button>
+        {logsOut ? <pre style={preBox}>{logsOut}</pre> : null}
+      </section>
+
+      <section style={{ marginTop: "2rem" }}>
+        <h2 style={{ fontWeight: 600, fontSize: "1.1rem" }}>Identities (BYOL)</h2>
+        <p style={{ color: "#444", fontSize: "0.9rem", lineHeight: 1.5 }}>
+          Uses the API key from <Link to="/settings">Settings</Link>. Token values are never returned from the server; patch fields stay in the browser until you submit.
+        </p>
+        {!apiKey.trim() ? (
+          <p style={{ color: "#a33", fontSize: "0.9rem", marginBottom: "0.75rem" }}>
+            No API key configured — open Settings to add one.
+          </p>
+        ) : null}
+        <label style={{ display: "block", marginBottom: "0.75rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555", marginBottom: 4 }}>Identity id</span>
+          <input
+            value={identityId}
+            onChange={(e) => setIdentityId(e.target.value)}
+            style={{ width: "100%", maxWidth: 240, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+
+        <p style={{ color: "#444", fontSize: "0.9rem", lineHeight: 1.5, marginBottom: "0.75rem" }}>
+          Git via OAuth (no API key): opens the control plane in this browser tab. Configure provider env vars and{" "}
+          <code>REDIRECT_AFTER_AUTH</code> on the server (see repo README). After success you land on your redirect URL with{" "}
+          <code>oauth_success</code> in the query string.
+        </p>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "1rem" }}>
+          <a
+            href={`${base}/auth/github?identity_id=${encodeURIComponent(identityId.trim() || "default")}`}
+            style={{ ...btn, textDecoration: "none", display: "inline-block", color: "#111" }}
+          >
+            Sign in with GitHub
+          </a>
+          <a
+            href={`${base}/auth/gitlab?identity_id=${encodeURIComponent(identityId.trim() || "default")}`}
+            style={{ ...btn, textDecoration: "none", display: "inline-block", color: "#111" }}
+          >
+            Sign in with GitLab
+          </a>
+        </div>
+
+        <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem", marginBottom: "0.75rem" }}>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () => setIdentityGetOut(await fetchIdentityJson(`/identities/${encodeURIComponent(identityId.trim() || "default")}`))}
+          >
+            GET credentials
+          </button>
+          <button
+            type="button"
+            style={btn}
+            onClick={async () =>
+              setIdentityAuthOut(await fetchIdentityJson(`/identities/${encodeURIComponent(identityId.trim() || "default")}/auth-status`))
+            }
+          >
+            GET auth status
+          </button>
+        </div>
+        {(identityGetOut || identityAuthOut) && (
+          <div style={{ fontSize: "0.85rem", marginBottom: "1rem" }}>
+            {identityGetOut ? (
+              <pre style={preBox}>{identityGetOut}</pre>
+            ) : null}
+            {identityAuthOut ? (
+              <pre style={preBox}>{identityAuthOut}</pre>
+            ) : null}
+          </div>
+        )}
+
+        <div style={{ marginBottom: "0.5rem" }}>
+          <span style={{ fontSize: "0.85rem", color: "#555", marginRight: 8 }}>Repo list provider</span>
+          <select value={repoProvider} onChange={(e) => setRepoProvider(e.target.value)} style={{ padding: "0.35rem 0.5rem", borderRadius: 6 }}>
+            <option value="github">github</option>
+            <option value="gitlab">gitlab</option>
+          </select>
+          <button
+            type="button"
+            style={{ ...btn, marginLeft: 8 }}
+            onClick={async () => {
+              const id = encodeURIComponent(identityId.trim() || "default");
+              const q = `?provider=${encodeURIComponent(repoProvider)}`;
+              setIdentityReposOut(await fetchIdentityJson(`/identities/${id}/repositories${q}`));
+            }}
+          >
+            GET repositories
+          </button>
+        </div>
+        {identityReposOut ? <pre style={preBox}>{identityReposOut}</pre> : null}
+
+        <h3 style={{ fontWeight: 600, fontSize: "1rem", marginTop: "1.25rem" }}>PATCH tokens</h3>
+        <label style={{ display: "block", marginBottom: "0.5rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>agent_token</span>
+          <input
+            type="password"
+            autoComplete="off"
+            value={identityPatchAgent}
+            onChange={(e) => setIdentityPatchAgent(e.target.value)}
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <label style={{ display: "block", marginBottom: "0.75rem" }}>
+          <span style={{ display: "block", fontSize: "0.85rem", color: "#555" }}>git_token</span>
+          <input
+            type="password"
+            autoComplete="off"
+            value={identityPatchGit}
+            onChange={(e) => setIdentityPatchGit(e.target.value)}
+            style={{ width: "100%", maxWidth: 480, padding: "0.5rem 0.6rem", borderRadius: 6, border: "1px solid #ccc" }}
+          />
+        </label>
+        <button
+          type="button"
+          style={btn}
+          onClick={async () => {
+            if (!apiKey.trim()) {
+              setIdentityPatchOut("Set an API key first.");
+              return;
+            }
+            const body: Record<string, string> = {};
+            if (identityPatchAgent.trim()) {
+              body.agent_token = identityPatchAgent.trim();
+            }
+            if (identityPatchGit.trim()) {
+              body.git_token = identityPatchGit.trim();
+            }
+            if (Object.keys(body).length === 0) {
+              setIdentityPatchOut("Enter at least one token to PATCH.");
+              return;
+            }
+            const id = encodeURIComponent(identityId.trim() || "default");
+            const url = `${base}/identities/${id}`;
+            const res = await fetch(url, {
+              method: "PATCH",
+              headers: {
+                Authorization: `Bearer ${apiKey.trim()}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+            });
+            const text = await res.text();
+            setIdentityPatchOut(text.length > 0 ? `${res.status} ${text}` : `${res.status}`);
+          }}
+        >
+          PATCH identity
+        </button>
+        {identityPatchOut ? <pre style={{ ...preBox, marginTop: 8 }}>{identityPatchOut}</pre> : null}
+      </section>
+    </main>
+  );
+}
+
+const btn: CSSProperties = {
+  padding: "0.45rem 0.85rem",
+  borderRadius: 6,
+  border: "1px solid #bbb",
+  background: "#f8f8f8",
+  cursor: "pointer",
+  fontSize: "0.875rem",
+};
+
+const preBox: CSSProperties = {
+  background: "#f4f4f4",
+  padding: "0.75rem",
+  borderRadius: 6,
+  overflow: "auto",
+  fontSize: "0.8rem",
+  marginTop: 8,
+};

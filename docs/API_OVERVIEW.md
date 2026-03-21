@@ -4,8 +4,8 @@ Concrete REST and SSE contracts for the control plane. v1: **SSE only** for log 
 
 ### Spec delivery (implementation requirement)
 
-- **OpenAPI 3.x** (or equivalent) **checked into the repo** (path TBD alongside server crate, e.g. `crates/server/openapi.yaml`) is the **contract artifact** for REST shapes, security schemes, and tags. **This markdown doc and OpenAPI must stay in sync**; CI should fail if generated types or a schema-diff step diverges (see [CICD_DESIGN.md](CICD_DESIGN.md)). Each REST operation SHOULD have a stable **`operationId`** in OpenAPI for reviews and codegen; until OpenAPI exists, **HTTP method + path** in this document is the interim identifier.
-- **SSE event shapes** for logs and session events must be documented in that OpenAPI document (e.g. `text/event-stream` description + example events) **or** in a short companion `docs/SSE_EVENTS.md` linked from OpenAPI—pick one approach per repo and document it in [PROJECT_KICKOFF.md](PROJECT_KICKOFF.md).
+- **OpenAPI 3.x** **checked into the repo** at [`crates/server/openapi.yaml`](../crates/server/openapi.yaml) is the **contract artifact** for REST shapes, security schemes, and tags. **This markdown doc and OpenAPI must stay in sync**; CI fails if `operationId`s change without updating the allowlist in `crates/server/tests/openapi_contract.rs` (see [CICD_DESIGN.md §4](CICD_DESIGN.md#4-platform-placeholder--remaining-decisions)). Each REST operation SHOULD have a stable **`operationId`** in OpenAPI for reviews and codegen.
+- **SSE event shapes** for logs and session events are documented in companion **[SSE_EVENTS.md](SSE_EVENTS.md)** (linked from the OpenAPI file header); REST stays in `openapi.yaml`. This split is recorded in [PROJECT_KICKOFF.md](PROJECT_KICKOFF.md#6-communication--docs).
 - **CLI v1:** Output is **human-readable stderr** for errors (HTTP status, `error.code`, `error.message`). **`--json` is out of scope for v1** unless added explicitly to this doc and implemented for **all** relevant subcommands in the same release.
 - **One contract, two clients:** Do not describe **different** server behavior in CLI docs vs Web docs. [TECH_STACK.md](TECH_STACK.md) names stacks and commands/views that **map** to this API; it must not redefine parameters or status codes (link here instead). [CLIENT_EXPERIENCE.md](CLIENT_EXPERIENCE.md) is for presentation and safety (confirm delete, SSE backoff, bootstrap copy)—not for adding endpoints or changing payload meaning without an update here (and OpenAPI when present).
 - **Ship rule:** Any new or changed control-plane operation requires **server + CLI + Web** in the same delivery ([AGENTS.md](../AGENTS.md)).
@@ -22,8 +22,8 @@ Concrete REST and SSE contracts for the control plane. v1: **SSE only** for log 
 
 ### Health (no auth)
 
-- **`GET /health`** — Liveness. **Response:** `200 OK` + body `{ "status": "ok" }`. No API key required. Used by CLI and load balancers.
-- **`GET /ready`** — Readiness. **Response:** `200 OK` + body `{ "status": "ok" }`. No API key required. Use for Kubernetes or similar readiness probes.
+- **`GET /health`** — Liveness. **Response:** `200 OK` + body at minimum `{ "status": "ok" }`. **Also includes** (for Web Settings / operator UX): `log_retention_days_default` (integer days, from `LOG_RETENTION_DAYS_DEFAULT`) and `chat_history_max_turns` (integer, from `CHAT_HISTORY_MAX_TURNS`; `0` means capping disabled). Older clients may ignore these fields. No API key required. Used by CLI and load balancers.
+- **`GET /ready`** — Readiness. **Response:** `200 OK` + body same shape as **`GET /health`** (`status` plus optional public config fields above) when the process can serve traffic. If `DATABASE_URL` is configured, readiness requires a successful database ping; otherwise the probe succeeds without a database. **Response:** `503 Service Unavailable` + standard error body (§2) when not ready (e.g. DB down). No API key required. Use for Kubernetes or similar readiness probes. After SQLx migrations run at startup (see [ARCHITECTURE.md](ARCHITECTURE.md#2a-schema-migrations)), readiness may additionally require migration success; until then a successful ping is sufficient.
 - **`GET /health/idle`** — Idle check for sleep-inhibit (see [HOSTING.md](HOSTING.md)). No API key. **Response:** `200 OK` when there are no pending or assigned jobs (OK for OS to idle-sleep), body e.g. `{ "idle": true }`. **Response:** `503 Service Unavailable` when there is work (hold sleep inhibit), body e.g. `{ "idle": false, "pending_or_assigned_jobs": N }`. Host-side helpers (or future in-process code) can poll this to decide when to allow the machine to sleep.
 
 ---
@@ -86,20 +86,21 @@ List endpoints that support pagination use **cursor-based** pagination.
 - **identity_id** (optional): Session identity for BYOL credentials. Omit for `"default"`. See [Identities (§4a)](#4a-rest--identities-byol-credentials).
 - **retain_forever** (optional): If `true`, the session’s logs are exempt from retention purge. Default `false`. Can also be set later via PATCH /sessions/:id.
 - **params** (workflow-specific):
-  - **chat:** `{ "prompt": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model": "string"` (e.g. `"auto"` for Cursor; CLI default if omitted), `"branch_mode": "main | pr"`, `"branch_name_prefix": "string"`.
+  - **chat:** `{ "prompt": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model": "string"` (e.g. `"composer-2"` for Cursor—the worker passes **`--model`** on the Cursor agent argv; omit for the CLI default), `"branch_mode": "main | pr"`, `"branch_name_prefix": "string"`.
   - **loop_n:** `{ "prompt": "string", "n": integer, "agent_cli": "claude_code | cursor" }`. Optional: `"model"`, branch fields as above.
-  - **loop_until_sentinel:** `{ "prompt": "string", "sentinel": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model"`, branch fields. **`sentinel` (v1):** **literal substring** match only—the worker treats a match as “sentinel found” if the configured string appears **anywhere** in the captured agent output for that iteration (case sensitivity: **implementation-defined**; document in server config, default **case-sensitive**). **Regex and other pattern modes are not supported in v1** (future: separate param e.g. `sentinel_mode: "literal" | "regex"`).
-  - **inbox:** `{ "agent_id": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model"` (model for this inbox agent), branch fields.
+  - **loop_until_sentinel:** `{ "prompt": "string", "sentinel": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model"`, branch fields. **`sentinel` (v1):** **literal substring** match only—the worker treats a match as “sentinel found” if the configured string appears **anywhere** in the captured agent output for that iteration (case sensitivity: **implementation-defined**; server default **case-sensitive**—see env `LOOP_UNTIL_SENTINEL_MAX_ITERATIONS` / README). **Regex and other pattern modes are not supported in v1** (future: separate param e.g. `sentinel_mode: "literal" | "regex"`). The control plane enqueues **one job per iteration** until the worker sets `sentinel_reached: true` on **POST /workers/tasks/:id/complete**, or until a **configurable max iteration** cap is reached (no further jobs; session completes).
+  - **inbox:** `{ "agent_id": "string", "agent_cli": "claude_code | cursor" }`. Optional: `"model"` (model for this inbox agent), branch fields. No `prompt`. **`agent_id`:** ASCII letters, digits, `_`, `-`, max **128** chars. Creates the session in **`running`** with **no initial jobs**, registers an **`agents`** row for that `agent_id` if needed, and prepares the long-lived inbox session for **`POST /agents/:id/inbox`** (§8). **Do not** use **`POST /sessions/:id/input`** for inbox — use the agent inbox API.
 - **Response:** `201 Created` + body:
 
 ```json
 {
   "session_id": "string",
-  "status": "pending",
+  "status": "pending | running",
   "web_url": "string"
 }
 ```
 
+- **status:** **`pending`** for chat / loop workflows (until the first job is assigned); **`running`** for **inbox** (enqueue work via **`POST /agents/:id/inbox`** after a worker registers as listener — §8).
 - **web_url:** Optional deep link to Web UI for this session (e.g. `https://ui.example/sessions/<session_id>`). Omitted if not configured.
 
 ### List sessions
@@ -139,17 +140,26 @@ List endpoints that support pagination use **cursor-based** pagination.
   "workflow": "string",
   "status": "string",
   "params": {},
-  "jobs": [{ "job_id": "string", "status": "string", "created_at": "string", "error_message": "string|null", "pull_request_url": "string|null" }],
+  "jobs": [{ "job_id": "string", "status": "string", "created_at": "string", "error_message": "string|null", "pull_request_url": "string|null", "commit_ref": "string|null", "retain_forever": false }],
   "created_at": "string",
-  "updated_at": "string"
+  "updated_at": "string",
+  "retain_forever": false,
+  "chat_history_truncated": false,
+  "chat_history_max_turns": 50
 }
 ```
 
+- **retain_forever** (session): Mirrors `PATCH /sessions/:id`; when `true`, this session’s logs are exempt from retention purge (see [§6 — Logs](API_OVERVIEW.md#6-rest--logs)).
+- **jobs[].retain_forever:** Per-job override; mirrors `PATCH /sessions/:id/jobs/:job_id`.
 - **jobs[].error_message:** Populated when the worker or engine records a failure reason; **CLI and Web UI must show this** on job/session detail (see [CLIENT_EXPERIENCE.md — Git outcomes](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes)).
+- **jobs[].commit_ref:** Commit OID from the worker when recorded; **absent or null** after a completed run may mean push/commit did not finish—clients should explain per [CLIENT_EXPERIENCE §8.1](CLIENT_EXPERIENCE.md#81-mapping-api-state-to-user-visible-copy) (not “silent success”).
 - **jobs[].pull_request_url:** Set when the server successfully created a PR/MR; if `null` while the user expected one, the client must explain **why** using session `params` (e.g. `branch_mode`), job `status`, and [Architecture §9b](ARCHITECTURE.md#9b-when-the-control-plane-creates-a-prmr)—do not imply a silent platform bug. Copy rules: [CLIENT_EXPERIENCE §8](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes).
+- **chat_history_truncated** / **chat_history_max_turns:** For **`workflow === "chat"`** only. `chat_history_truncated` is `true` when completed follow-up turns exceed the server cap so the **next** worker pull would set `history_truncated` on the task payload (same rule as [Pull task](API_OVERVIEW.md#pull-task)). `chat_history_max_turns` mirrors `GET /health` (`CHAT_HISTORY_MAX_TURNS`); omitted or `null` when the workflow is not chat. Web/CLI use this for [CLIENT_EXPERIENCE §12](CLIENT_EXPERIENCE.md#12-long-chat-sessions) copy (the pull payload remains the authoritative per-job flag for workers).
+- **`status` vs `jobs[]` for chat:** After a successful worker completion, **`workflow === "chat"`** sessions often remain **`status: "running"`** so the client can call **`POST /sessions/:id/input`** for another turn; use **`jobs[].status`** for per-task progress.
+- **`status` vs `jobs[]` for inbox:** Sessions stay **`running`**. New work is **`POST /agents/:id/inbox`** (queued until **`POST /workers/tasks/pull`** promotes the row to a **`jobs`** entry for a worker that holds the inbox listener — §8). **`jobs[]`** reflects promoted runs only.
 - **404** if not found.
 
-### Send input (e.g. chat message)
+### Send input (chat follow-up)
 
 - **`POST /sessions/:id/input`**
 - **Request body:**
@@ -160,9 +170,10 @@ List endpoints that support pagination use **cursor-based** pagination.
 }
 ```
 
-- Used for chat workflow to send a follow-up message in the same session. Follow-up jobs pulled by the worker include **`session_prompt`** (original goal), **`message`**, **`history`** (prior user follow-ups), and **`history_assistant`** (prior assistant replies, no thinking/tool calls) so each agent run is multi-turn aware (see Pull task · **task_input**).
+- **Chat only:** send a follow-up message in the same session. **Inbox** workflows use **`POST /agents/:id/inbox`** (§8), not this endpoint.
+- Follow-up jobs pulled by the worker include **`session_prompt`** (original goal), **`message`**, **`history`**, **`history_assistant`**, and **`history_truncated`** (see Pull task · **task_input**). History capping uses **`CHAT_HISTORY_MAX_TURNS`** when the payload includes **`session_prompt`**.
 - **Response:** `202 Accepted` + body `{ "accepted": true }` or `200 OK` with updated session summary.
-- **404** if session not found; **409** if session not in a state that accepts input (e.g. not chat or not running).
+- **404** if session not found; **409** if session not **chat**, not **running**, or a job is already **pending** or **assigned**.
 
 ### Update session (retain_forever)
 
@@ -200,9 +211,12 @@ Sessions use an **identity** to resolve **agent_token** (Cursor/Claude API key) 
   "git_token_status": "healthy",
   "git_provider": "oauth_gitlab",
   "token_expires_at": "2026-03-18T13:00:00Z",
-  "message": "Token valid for ~55 minutes."
+  "message": "Token valid for ~55 minutes.",
+  "agent_token_status": "healthy"
 }
 ```
+
+- **`agent_token_status`** (optional in JSON when omitted): `not_configured` or `healthy` for BYOL agent API keys (no server-side expiry metadata in v1).
 
 - **`git_token_status`** values: `healthy`, `expiring_soon`, `expired_refreshable`, `expired_needs_reauth`, `unknown`, `not_configured`.
 - `expired_needs_reauth` means the token is expired and no refresh_token exists; the user must re-authenticate via OAuth.
@@ -333,6 +347,8 @@ Personas are user-defined, pre-configured prompts. When starting a session or en
 
 - **`PATCH /personas/:id`** — body `{ "name": "string", "prompt": "string" }` (partial). **DELETE /personas/:id** — remove persona. **404** if not found.
 
+**P1 design (resolution order, delete semantics, limits):** [PHASE2_DESIGN.md §2](PHASE2_DESIGN.md#2-personas).
+
 ---
 
 ## 5. REST — Workers
@@ -373,6 +389,8 @@ Workers register via `POST /workers/register` (see §9). CLI and Web UI can list
 ---
 
 ## 6. REST — Logs
+
+**P1 search (query param, FTS vs simple):** [PHASE2_DESIGN.md §5](PHASE2_DESIGN.md#5-log-search-l5-extension).
 
 **Client contract (consistent and complete):** Whenever a user opens logs for a context (session or job), the client **must** load the **full** history first, then stream. (1) Call `GET /sessions/:id/logs` (with optional `job_id`) and **paginate until all logs** for that context are loaded (no cap); (2) render those logs; (3) call `GET /sessions/:id/logs/stream` and append new events. This ensures the user always sees the complete backlog before any live entries. Same behavior in CLI and Web UI.
 
@@ -433,6 +451,15 @@ Workers register via `POST /workers/register` (see §9). CLI and Web UI can list
 
 ## 8. REST — Inboxes (P1)
 
+**Design:** listener claim, `inbox_tasks` queue, promotion to **`jobs`** on worker pull — [PHASE2_DESIGN.md §3](PHASE2_DESIGN.md#3-inboxes-and-cross-agent-tasks). **Prerequisite:** **`POST /sessions`** with **`workflow: inbox`** and the same **`params.agent_id`** (creates the **`agents`** row and running session). **Worker:** register with **`POST /workers/register`**, heartbeat, then **`POST /workers/:worker_id/inbox-listener`** with **`{ "agent_id": "…" }`** so **`POST /workers/tasks/pull`** promotes the next pending inbox row **before** the global pending-job FIFO.
+
+### Register inbox listener (worker)
+
+- **`POST /workers/:worker_id/inbox-listener`**
+- **Request body:** `{ "agent_id": "string" }` (must match **`params.agent_id`** on the inbox session).
+- **Behavior:** At most **one** active listener per **`agent_id`**. If another worker already holds the listener and is **not** stale, **`409 Conflict`** (`inbox_listener_taken`). If the previous listener’s worker is **stale**, the claim is **stolen**.
+- **Response:** `200 OK` + `{ "ok": true }`. **404** if worker or agent is unknown. **409** if this worker’s heartbeat is stale.
+
 ### Enqueue task to agent inbox
 
 - **`POST /agents/:id/inbox`**
@@ -445,9 +472,9 @@ Workers register via `POST /workers/register` (see §9). CLI and Web UI can list
 }
 ```
 
-- **payload:** Opaque object for the consuming agent (e.g. `{ "prompt": "string", "context": {} }`). Schema is agent-specific; control plane stores and forwards.
-- **persona_id** (optional): Persona to use when the agent processes this task. Control plane combines persona prompt + payload when the worker runs the task.
-- **Response:** `202 Accepted` + body `{ "task_id": "string" }`. **404** if agent id unknown.
+- **payload:** JSON object stored verbatim. **v1 validation:** must include a non-empty string **`message`** or **`prompt`** (worker prompt extraction matches chat follow-ups). Additional fields are allowed for agent-specific context.
+- **persona_id** (optional): Reserved for future persona resolution when personas are implemented; stored on the inbox row.
+- **Response:** `202 Accepted` + body `{ "task_id": "string" }` (inbox row UUID until promoted). **404** if **`agents`** row missing (create inbox session first). **409** with `no_inbox_session` if there is no **running** inbox session for this **`agent_id`**. The server emits a session SSE event **`inbox_task_enqueued`** on the inbox session (see [SSE_EVENTS.md](SSE_EVENTS.md)).
 
 ### List / poll inbox (for workers)
 
@@ -468,7 +495,7 @@ Workers register via `POST /workers/register` (see §9). CLI and Web UI can list
 }
 ```
 
-- Claim/dequeue is done via worker task pull (§9); this endpoint is for listing only in v1.
+- **Claim / dequeue:** **`POST /workers/tasks/pull`** promotes the oldest pending row into an **assigned** job on the inbox session for workers that registered **`POST /workers/:id/inbox-listener`** for that agent. This endpoint lists **pending** rows only.
 
 ---
 
@@ -496,6 +523,7 @@ Workers authenticate with the same API key (header). Base URL = control plane ro
 - **labels:** Optional key/value. Include **platform** (e.g. `"platform": "windows" | "wsl" | "macos" | "linux"`) for observability (UI filtering, display). v1: no platform affinity—engine assigns to any available worker. Other labels (e.g. `gpu=true`) for dispatch in P1.
 - **capabilities:** Optional list of strings (reserved for future use).
 - **client_version:** **Required for v1 implementations.** Semver string of the worker binary (e.g. `0.4.1`), same **major.minor** family as the control plane release. The server **MUST** reject incompatible workers with **`400 Bad Request`** and error body `code: "worker_version_incompatible"` and `message` describing required range (see [CLIENT_EXPERIENCE.md §13](CLIENT_EXPERIENCE.md#13-compatibility-and-upgrades)). If omitted during a transitional period, server **MAY** accept but **SHOULD** log a warning; new code should always send this field.
+- **Version policy (enforced on register):** The control plane parses **semver** for both its own version and `client_version`. **Major and minor must match** (e.g. worker `0.1.9` with server `0.1.0` is OK); **patch** may differ. Mismatched major/minor yields **`worker_version_incompatible`** (HTTP **400**). Server release is the `api-types` / workspace package version the binary was built with.
 - **Response:** `201 Created` + body `{ "worker_id": "string" }` (echo or server-assigned). **409** if id already registered (e.g. restart with same id).
 
 ### Heartbeat
@@ -538,11 +566,11 @@ Workers authenticate with the same API key (header). Base URL = control plane ro
 ```
 
 - **prompt_context:** When a persona was specified for the session, this is that persona's prompt text (system/context for the agent). Omitted or empty when no persona. The worker passes this as the agent's context (e.g. system prompt).
-- **task_input:** The task-specific input for this run. The worker passes this as the user/task input to the CLI. See also **Send input** (§4) for sending chat follow-up messages via `POST /sessions/:id/input`.
+- **task_input:** The task-specific input for this run. The worker passes this as the user/task input to the CLI. **Chat:** follow-ups via **`POST /sessions/:id/input`** (§4). **Inbox:** enqueue via **`POST /agents/:id/inbox`** (§8); pull promotes queue rows into jobs.
   - **Chat — first job:** `{ "prompt": "string", ... }` (same shape as session `params` for the workflow), i.e. the initial user message from session create.
   - **Chat — follow-up jobs** (after `POST /sessions/:id/input`): `{ "session_prompt": "string", "message": "string", "history": ["string", ...], "history_assistant": ["string", ...], "history_truncated": false }`. **`session_prompt`** is the original create-session prompt. **`history`** lists prior user follow-ups. **`history_assistant`** lists prior assistant reply text (user/assistant messages only; no thinking or tool calls). **`message`** is the current follow-up. **Long sessions:** The server **MUST** cap how much history is included so `task_input` stays bounded. **Defaults (v1):** keep at most the last **50** user turns in `history` and the last **50** assistant turns in `history_assistant` (server config: e.g. `CHAT_HISTORY_MAX_TURNS`, default `50`). Older turns are dropped from the payload (full transcript may still appear in logs/UI). When any drops occur, set **`history_truncated`: `true`**; clients **MUST** show [CLIENT_EXPERIENCE.md — Long chat](CLIENT_EXPERIENCE.md#12-long-chat-sessions).
   - **Loop workflows:** `{ "prompt": "string", "iteration_index": number, ... }`.
-  - **Inbox:** listener flag or payload as documented for inbox.
+  - **Inbox:** same follow-up shape as chat (**`session_prompt`**, **`message`**, **`history`**, **`history_assistant`**, **`history_truncated`**) after promotion from **`POST /agents/:id/inbox`**; **`session_prompt`** is empty when the session was created without **`params.prompt`**.
 - **params:** Other workflow params (repo, ref, workflow type, branch_mode, etc.) as in session create; may duplicate fields for convenience. **credentials:** Per-job tokens (git clone/push and agent CLI). Worker uses them only for this task.
 - **Response (no work):** `204 No Content` or `200 OK` with `{ "task_id": null }`. Worker should poll again after a delay (e.g. long-poll or backoff).
 
@@ -592,7 +620,7 @@ Workers authenticate with the same API key (header). Base URL = control plane ro
 - **error_message:** When status is `failed`, optional human-readable error.
 - **output:** Optional. Agent output snippet (e.g. last N chars); used for sentinel detection in **loop_until_sentinel** (**literal substring** search per session `params.sentinel`, v1).
 - **sentinel_reached:** Optional boolean. When `true`, worker detected the sentinel substring in output; server may mark the session completed for loop_until_sentinel workflow.
-- **assistant_reply:** Optional. For **chat** workflow only: assistant reply text from this job (user and assistant messages only; no thinking, tool calls, or system events). Server appends it to the session so the next follow-up job receives it in **task_input.history_assistant**.
+- **assistant_reply:** Optional. For **chat** and **inbox** workflows: assistant reply text from this job (user and assistant messages only; no thinking, tool calls, or system events). Server stores it so the next pull receives it in **task_input.history_assistant**.
 - **Response:** `200 OK` + body `{ "ok": true }`. **404** if task unknown or already completed.
 
 ---
@@ -614,7 +642,7 @@ Workers authenticate with the same API key (header). Base URL = control plane ro
 | Sessions | GET | /sessions/:id | Get session |
 | Sessions | PATCH | /sessions/:id | Update session (e.g. retain_forever) |
 | Sessions | PATCH | /sessions/:id/jobs/:job_id | Update job (retain_forever) |
-| Sessions | POST | /sessions/:id/input | Send input (e.g. chat) |
+| Sessions | POST | /sessions/:id/input | Chat follow-up input only |
 | Sessions | DELETE | /sessions/:id | Delete session |
 | Identities | GET | /identities/:id | Get credentials status (no token values) |
 | Identities | GET | /identities/:id/auth-status | Get token health (expiry, refresh capability) |
@@ -637,6 +665,7 @@ Workers authenticate with the same API key (header). Base URL = control plane ro
 | Inboxes | GET | /agents/:id/inbox | List inbox tasks |
 | Worker | POST | /workers/register | Register worker |
 | Worker | POST | /workers/:id/heartbeat | Heartbeat |
+| Worker | POST | /workers/:id/inbox-listener | Claim inbox consumer for agent_id |
 | Worker | POST | /workers/tasks/pull | Pull task |
 | Worker | POST | /workers/tasks/:id/logs | Send log batch |
 | Worker | POST | /workers/tasks/:id/complete | Mark task complete |

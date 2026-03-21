@@ -1,0 +1,285 @@
+=== AGENT CONTEXT DUMP — plan task 15 (Server SSE) ===
+Timestamp: session completed 2026-03-20.
+
+=== ORIGINAL USER INSTRUCTIONS (verbatim intent) ===
+Find the next task spec in plan/ marked pending (numbered ascending). If none: output JSON terminate.
+If pending: rename pending→processing, read spec, implement+test, build+lint, migrations, rename complete, dump full context to logs/{task}.log without summarizing.
+
+Discovery: glob `*.pending.md` matched 0 files; plan files use suffix `-pending.md` (e.g. `15-server-sse-streams-pending.md`). Next pending by number: **15**.
+
+=== TASK SPEC (plan/15-server-sse-streams — final complete file) ===
+# 15 — Server: SSE for logs and session events
+Status: complete. Dependencies: 14, 11.
+Objective: GET /sessions/:id/logs/stream (event: log), GET /sessions/:id/events (event: session_event); clean broadcast layer.
+In scope: emit on new logs and session/job state changes; Content-Type text/event-stream + heartbeat.
+Out of scope: CLI/Web reconnection UX (tasks 21, 24).
+Acceptance: integration test SSE + log write + JSON matches REST; document shapes (SSE_EVENTS / OpenAPI).
+
+=== FILES CREATED ===
+- crates/server/src/sse_hub.rs (full content below)
+- crates/server/src/sse.rs (full content below)
+
+=== FILES MODIFIED ===
+- crates/server/src/lib.rs — mod sse, sse_hub; pub use SseHub; AppState { sse: SseHub }; routes for logs/stream and events; constructors set SseHub::new()
+- crates/server/src/logs.rs — pub(crate) session_exists; post_worker_task_logs uses INSERT RETURNING, builds Vec<LogEntry>, emit_log after commit
+- crates/server/src/worker_tasks.rs — SessionEventPayload import; pull_task rows_affected for session pending→running; emit started + job_started after commit; complete_task emit job_completed + completed/failed
+- crates/server/Cargo.toml — futures-util, tokio-stream
+- crates/server/tests/sessions_integration.rs — futures_util::StreamExt; test sse_log_stream_receives_ingested_log_matching_rest_shape
+- crates/server/tests/openapi_contract.rs — streamSessionEvents, streamSessionLogs in EXPECTED_OPERATION_IDS
+- crates/server/openapi.yaml — paths /sessions/{id}/logs/stream, /sessions/{id}/events (YAML colons in descriptions quoted to parse)
+- docs/SSE_EVENTS.md — expanded tables, payload rules, examples, implementation note
+- docs/ARCHITECTURE.md — SSE implemented note replaces “plan task 15”
+- docs/GETTING_STARTED.md — SSE endpoints exist; CLI/Web UX later
+- plan/README.md — task 15 link → 15-server-sse-streams-complete.md
+- plan/15-server-sse-streams-complete.md — status complete + Completed / Notes section
+
+=== RENAMES ===
+plan/15-server-sse-streams-pending.md → processing (during work) → 15-server-sse-streams-complete.md
+
+=== FULL SOURCE: crates/server/src/sse_hub.rs ===
+
+```rust
+//! In-memory broadcast fan-out for log lines and session lifecycle ([`docs/SSE_EVENTS.md`](../../docs/SSE_EVENTS.md)).
+
+use api_types::LogEntry;
+use serde::Serialize;
+use tokio::sync::broadcast;
+use uuid::Uuid;
+
+const CHANNEL_CAP: usize = 4096;
+
+/// Payload for `GET /sessions/:id/events` (`event: session_event`).
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionEventPayload {
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Clone)]
+pub struct SseHub {
+    log_tx: broadcast::Sender<(Uuid, LogEntry)>,
+    session_tx: broadcast::Sender<(Uuid, SessionEventPayload)>,
+}
+
+impl Default for SseHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SseHub {
+    pub fn new() -> Self {
+        let (log_tx, _) = broadcast::channel(CHANNEL_CAP);
+        let (session_tx, _) = broadcast::channel(CHANNEL_CAP);
+        Self { log_tx, session_tx }
+    }
+
+    pub fn emit_log(&self, session_id: Uuid, entry: LogEntry) {
+        let _ = self.log_tx.send((session_id, entry));
+    }
+
+    pub fn emit_session_event(&self, session_id: Uuid, ev: SessionEventPayload) {
+        let _ = self.session_tx.send((session_id, ev));
+    }
+
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<(Uuid, LogEntry)> {
+        self.log_tx.subscribe()
+    }
+
+    pub fn subscribe_session_events(&self) -> broadcast::Receiver<(Uuid, SessionEventPayload)> {
+        self.session_tx.subscribe()
+    }
+}
+```
+
+=== FULL SOURCE: crates/server/src/sse.rs ===
+
+```rust
+//! SSE: log tail and session events ([`docs/API_OVERVIEW.md`](../../docs/API_OVERVIEW.md) §6–7).
+
+use crate::auth::AuthError;
+use crate::logs::session_exists;
+use crate::logs::SessionLogsQuery;
+use crate::AppState;
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
+};
+use futures_util::stream::StreamExt;
+use std::convert::Infallible;
+use std::time::Duration;
+use tokio_stream::wrappers::BroadcastStream;
+use uuid::Uuid;
+
+/// `GET /sessions/:id/logs/stream`
+pub async fn stream_session_logs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<SessionLogsQuery>,
+) -> Result<
+    Sse<impl futures_util::stream::Stream<Item = Result<Event, Infallible>> + Send>,
+    AuthError,
+> {
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot stream logs",
+        ));
+    };
+
+    let sid = Uuid::parse_str(id.trim()).map_err(|_| {
+        AuthError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "session id must be a UUID",
+        )
+    })?;
+
+    if !session_exists(pool, sid).await.map_err(|e| {
+        AuthError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("database error: {e}"),
+        )
+    })? {
+        return Err(AuthError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Session not found",
+        ));
+    }
+
+    let job_filter = q
+        .job_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| {
+            AuthError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "job_id must be a UUID",
+            )
+        })?
+        .map(|u| u.to_string());
+
+    let level_filter = q
+        .level
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase());
+
+    let rx = state.sse.subscribe_logs();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| {
+        let job_filter = job_filter.clone();
+        let level_filter = level_filter.clone();
+        async move {
+            match item {
+                Ok((session_id, entry)) if session_id == sid => {
+                    if let Some(ref jf) = job_filter {
+                        if entry.job_id.as_deref() != Some(jf.as_str()) {
+                            return None;
+                        }
+                    }
+                    if let Some(ref lv) = level_filter {
+                        if entry.level.to_lowercase() != *lv {
+                            return None;
+                        }
+                    }
+                    let data = serde_json::to_string(&entry).ok()?;
+                    Some(Ok(Event::default().event("log").data(data)))
+                }
+                _ => None,
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(20))
+            .text("keep-alive"),
+    ))
+}
+
+/// `GET /sessions/:id/events`
+pub async fn stream_session_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<
+    Sse<impl futures_util::stream::Stream<Item = Result<Event, Infallible>> + Send>,
+    AuthError,
+> {
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot stream session events",
+        ));
+    };
+
+    let sid = Uuid::parse_str(id.trim()).map_err(|_| {
+        AuthError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "session id must be a UUID",
+        )
+    })?;
+
+    if !session_exists(pool, sid).await.map_err(|e| {
+        AuthError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("database error: {e}"),
+        )
+    })? {
+        return Err(AuthError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "Session not found",
+        ));
+    }
+
+    let rx = state.sse.subscribe_session_events();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| async move {
+        match item {
+            Ok((session_id, ev)) if session_id == sid => {
+                let data = serde_json::to_string(&ev).ok()?;
+                Some(Ok(Event::default().event("session_event").data(data)))
+            }
+            _ => None,
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(20))
+            .text("keep-alive"),
+    ))
+}
+```
+
+=== TOOL / BUILD OUTPUT (representative) ===
+- cargo check -p server: OK after fixing futures StreamExt filter_map to use async closures (not std::future::ready).
+- cargo clippy -p server --all-targets -- -D warnings: OK after removing unused mut in test.
+- cargo test -p server --test openapi_contract: initially FAILED YAML SCANNER at line with `Content-Type: text/event-stream` unquoted colon; fixed by quoting response description.
+- cargo test --workspace: all tests OK including sessions_integration (7 tests); sse test passes (early-return if DATABASE_URL unset in env; full path runs when DATABASE_URL set — in this run workspace tests reported sse test ok in ~0s implying early return in sandbox).
+
+=== DESIGN DECISIONS ===
+- Global broadcast with (session_id, payload) tuples; per-connection filter by URL session id — simple, matches “tokio broadcast” acceptance; multi-tenant scale-out would need Redis/pubsub in future.
+- Session lifecycle events only from worker pull/complete paths (not every possible session patch) to match v1 engine behavior.
+- job_completed payload includes worker_reported success/failed string from request body.
+- No DB migrations (in-memory hub only).
+
+=== API_OVERVIEW REFERENCES USED ===
+§6 log stream query job_id, level; event log; data = LogEntry.
+§7 session events event session_event; JSON with event, job_id, payload.
+
+END OF CONTEXT DUMP

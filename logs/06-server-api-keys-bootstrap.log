@@ -1,0 +1,2730 @@
+=== REMOTE HARNESS PLAN TASK 06 — CONTEXT DUMP (FULL ASSISTANT WINDOW CONTENTS) ===
+Generated: 2026-03-20 (session)
+Task: 06-server-api-keys-bootstrap (was *-pending.md, renamed processing during work, completed as *-complete.md)
+
+--------------------------------------------------------------------------------
+USER REQUEST (verbatim)
+--------------------------------------------------------------------------------
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+--------------------------------------------------------------------------------
+WORKSPACE / ENV NOTES (from message metadata)
+--------------------------------------------------------------------------------
+OS: darwin 23.6.0, shell zsh, workspace /Users/chizbro/Desktop/code/utils/remote_harness_3, git repo, date Friday Mar 20 2026.
+
+AGENTS.md rules recalled: no stubs; backend exposed in CLI+UI; spec sync; no migration edits (only new migrations — none added this task, schema already had api_keys).
+
+Plan task 06 explicitly scoped Web UI out (task 22). CLI api-key commands added per AGENTS + acceptance; Web Settings for keys deferred to task 22.
+
+--------------------------------------------------------------------------------
+DISCOVERY: PENDING TASK FILES
+--------------------------------------------------------------------------------
+Glob `**/*.pending.md` returned 0 — filenames use pattern `NN-...-pending.md` (suffix before .md).
+Lowest numbered pending after completed 00–05: plan/06-server-api-keys-bootstrap-pending.md
+
+Action: mv plan/06-server-api-keys-bootstrap-pending.md -> plan/06-server-api-keys-bootstrap-processing.md
+
+--------------------------------------------------------------------------------
+TASK SPEC (06 — full text as read)
+--------------------------------------------------------------------------------
+# 06 — Server: API key authentication and bootstrap
+
+**Status:** pending  
+**Dependencies:** 04, 05
+
+## Objective
+
+Implement **Bearer / X-API-Key** validation for protected routes and full **API key lifecycle** + **`POST /api-keys/bootstrap`** per API_OVERVIEW §4c and CLIENT_EXPERIENCE §7.
+
+## Scope
+
+**In scope**
+- Middleware or extractor: reject missing/invalid key with standard error body §2.
+- `POST /api-keys`, `GET /api-keys` (pagination), `DELETE /api-keys/:id`.
+- Bootstrap: **201** when no keys exist; **403** when keys already exist; documented safety copy for operators.
+- Optional env `API_KEY` bootstrap key if spec requires—align with HOSTING.
+
+**Out of scope**
+- Web UI (task 22)—server-only.
+
+## Acceptance criteria
+- Integration tests: authenticated vs `401`; bootstrap only when empty DB keys.
+- OpenAPI + implementation synced; hashes stored, plaintext shown once on create.
+
+--------------------------------------------------------------------------------
+IMPLEMENTATION DECISIONS
+--------------------------------------------------------------------------------
+- Auth: axum middleware `from_fn_with_state` + `auth::require_api_key`; 401 JSON StandardError (code unauthorized).
+- Key hash: SHA-256 hex lowercase (`key_material::hash_api_key_secret`); store in `api_keys.key_hash`.
+- Plaintext format: `rh_` + 64 hex chars (32 random bytes).
+- Env keys: `API_KEY` (single) and `API_KEYS` (comma-separated); hashes collected at startup into `ServerConfig.api_key_hashes_env: HashSet<String>`. If non-empty, bootstrap returns 403. Env keys authenticate without DB rows.
+- Bootstrap: also 403 if COUNT(non-revoked api_keys) > 0; 503 if no DATABASE_URL.
+- Revoke: `UPDATE api_keys SET revoked_at = now()`; list filters `revoked_at IS NULL`.
+- Pagination: cursor = base64url no pad of `{rfc3339_ms}|{uuid}`; SQL `(created_at, id) < ($cursor_time, $cursor_id)` ORDER BY created_at DESC, id DESC; fetch limit+1.
+- Axum 0.8 path params: `/api-keys/{id}` not `:id` (router panic fix).
+- Protected routes merged sub-router: `/api-keys` POST+GET, `/api-keys/{id}` DELETE, `/sessions` GET+POST stub returning 501 + StandardError not_implemented (OpenAPI already required auth on sessions).
+- Public: `/health`, `/ready`, `/health/idle`, `/api-keys/bootstrap`, `/` root string.
+- Integration tests: `crates/server/tests/api_keys_integration.rs`; `#![allow(clippy::await_holding_lock)]` + `std::sync::Mutex` to serialize DB tests; conditional on DATABASE_URL like migrations test.
+- No new SQL migration (initial schema already defines api_keys).
+
+--------------------------------------------------------------------------------
+FILES TOUCHED (create / modify)
+--------------------------------------------------------------------------------
+NEW:
+- crates/api-types/src/api_keys.rs
+- crates/server/src/auth.rs
+- crates/server/src/key_material.rs
+- crates/server/src/keys.rs
+- crates/server/tests/api_keys_integration.rs
+- plan/06-server-api-keys-bootstrap-complete.md
+- logs/06-server-api-keys-bootstrap.log (this file)
+
+MODIFIED:
+- crates/api-types/src/lib.rs
+- crates/server/Cargo.toml
+- crates/server/src/lib.rs
+- crates/server/src/config.rs
+- crates/server/openapi.yaml
+- crates/server/tests/openapi_contract.rs
+- crates/cli/Cargo.toml
+- crates/cli/src/main.rs
+- docs/GETTING_STARTED.md
+- plan/README.md
+
+REMOVED:
+- plan/06-server-api-keys-bootstrap-pending.md (via rename chain to processing then replaced by complete file)
+- plan/06-server-api-keys-bootstrap-processing.md (deleted after writing complete)
+
+--------------------------------------------------------------------------------
+FULL SOURCE: crates/api-types/src/api_keys.rs
+--------------------------------------------------------------------------------
+
+================================================================================
+FILE: crates/api-types/src/api_keys.rs
+================================================================================
+
+//! API key control-plane types ([`docs/API_OVERVIEW.md`](../../docs/API_OVERVIEW.md) §4c).
+
+use crate::pagination::Paginated;
+use serde::{Deserialize, Serialize};
+
+/// Request body for `POST /api-keys` and `POST /api-keys/bootstrap`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CreateApiKeyRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Response when a key is created (plaintext `key` is shown once).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyCreatedResponse {
+    pub id: String,
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: String,
+}
+
+/// One row in `GET /api-keys` (no secret).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeySummary {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: String,
+}
+
+/// Paginated list of API key summaries.
+pub type PaginatedApiKeySummaries = Paginated<ApiKeySummary>;
+
+================================================================================
+FILE: crates/api-types/src/lib.rs
+================================================================================
+
+//! Shared request/response types and identifiers for the control plane, worker, and CLI.
+
+mod api_keys;
+mod error;
+mod health;
+mod pagination;
+mod workflow;
+
+pub use api_keys::{
+    ApiKeyCreatedResponse, ApiKeySummary, CreateApiKeyRequest, PaginatedApiKeySummaries,
+};
+pub use error::{StandardErrorBody, StandardErrorResponse};
+pub use health::{HealthStatusResponse, IdleCheckResponse};
+pub use pagination::Paginated;
+pub use workflow::WorkflowKind;
+
+pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn standard_error_deserialize_and_round_trip() {
+        let json = r#"{"error":{"code":"not_found","message":"Session not found","details":{"session_id":"abc"}}}"#;
+        let first: StandardErrorResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(first.error.code, "not_found");
+        assert_eq!(first.error.message, "Session not found");
+        assert_eq!(first.error.details, Some(json!({"session_id": "abc"})));
+
+        let serialized = serde_json::to_string(&first).unwrap();
+        let second: StandardErrorResponse = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn standard_error_optional_details_omitted() {
+        let json = r#"{"error":{"code":"unauthorized","message":"Invalid API key"}}"#;
+        let v: StandardErrorResponse = serde_json::from_str(json).unwrap();
+        assert!(v.error.details.is_none());
+    }
+
+    #[test]
+    fn workflow_kind_snake_case_strings() {
+        let chat: WorkflowKind = serde_json::from_str("\"chat\"").unwrap();
+        assert_eq!(chat, WorkflowKind::Chat);
+        let sentinel: WorkflowKind = serde_json::from_str("\"loop_until_sentinel\"").unwrap();
+        assert_eq!(sentinel, WorkflowKind::LoopUntilSentinel);
+    }
+
+    #[test]
+    fn paginated_next_cursor_null_becomes_none() {
+        let json = r#"{"items":[],"next_cursor":null}"#;
+        let p: Paginated<String> = serde_json::from_str(json).unwrap();
+        assert!(p.items.is_empty());
+        assert_eq!(p.next_cursor, None);
+    }
+}
+
+================================================================================
+FILE: crates/server/src/config.rs
+================================================================================
+
+//! Environment-backed control plane configuration (see plan task 04).
+
+use std::env;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+/// Central server configuration loaded from the environment.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Address for the HTTP listener (host + port).
+    pub bind_addr: SocketAddr,
+    /// PostgreSQL URL when persistence is enabled; absence means DB-optional dev mode.
+    pub database_url: Option<String>,
+    /// Allowed `Origin` values for CORS when the middleware is wired (placeholder).
+    pub cors_allowed_origins: Vec<String>,
+    /// Default log retention window in days (engine tasks consume this).
+    pub log_retention_days_default: u32,
+    /// Soft cap for raw log bytes per session before trim policies apply (placeholder).
+    pub log_retention_max_bytes_per_session_default: u64,
+    /// Workers not heartbeating within this window may be treated as stale (placeholder).
+    pub worker_stale_threshold: Duration,
+    /// Job lease / reclaim tuning placeholder (seconds).
+    pub job_lease_stale_threshold_secs: u64,
+    /// SHA-256 (hex, lowercase) of keys from `API_KEY` / `API_KEYS` for auth and bootstrap gating.
+    pub api_key_hashes_env: std::collections::HashSet<String>,
+}
+
+impl ServerConfig {
+    /// Minimal config for tests and examples (no database).
+    pub fn test_without_db() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:0".parse().expect("valid test bind"),
+            database_url: None,
+            cors_allowed_origins: vec![],
+            log_retention_days_default: 30,
+            log_retention_max_bytes_per_session_default: 50 * 1024 * 1024,
+            worker_stale_threshold: Duration::from_secs(120),
+            job_lease_stale_threshold_secs: 300,
+            api_key_hashes_env: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Load configuration from environment variables with documented defaults.
+    pub fn from_env() -> Result<Self, String> {
+        let port: u16 = env::var("PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3000);
+
+        let host = env::var("BIND_HOST")
+            .or_else(|_| env::var("HOST"))
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
+        let bind_addr: SocketAddr = format!("{host}:{port}")
+            .parse()
+            .map_err(|e| format!("invalid BIND_HOST/PORT: {e}"))?;
+
+        let database_url = env::var("DATABASE_URL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let cors_allowed_origins = env::var("CORS_ORIGINS")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|o| o.trim().to_string())
+                    .filter(|o| !o.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let log_retention_days_default = env::var("LOG_RETENTION_DAYS_DEFAULT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(30);
+
+        let log_retention_max_bytes_per_session_default =
+            env::var("LOG_RETENTION_MAX_BYTES_PER_SESSION_DEFAULT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50 * 1024 * 1024);
+
+        let worker_stale_secs: u64 = env::var("WORKER_STALE_THRESHOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                env::var("WORKER_STALE_SECONDS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            })
+            .unwrap_or(120);
+
+        let job_lease_stale_threshold_secs = env::var("JOB_LEASE_STALE_THRESHOLD_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
+
+        let api_key_hashes_env = collect_env_api_key_hashes();
+
+        Ok(Self {
+            bind_addr,
+            database_url,
+            cors_allowed_origins,
+            log_retention_days_default,
+            log_retention_max_bytes_per_session_default,
+            worker_stale_threshold: Duration::from_secs(worker_stale_secs),
+            job_lease_stale_threshold_secs,
+            api_key_hashes_env,
+        })
+    }
+}
+
+fn collect_env_api_key_hashes() -> std::collections::HashSet<String> {
+    let mut plaintexts: Vec<String> = Vec::new();
+    if let Ok(v) = env::var("API_KEY") {
+        let t = v.trim().to_string();
+        if !t.is_empty() {
+            plaintexts.push(t);
+        }
+    }
+    if let Ok(v) = env::var("API_KEYS") {
+        for part in v.split(',') {
+            let t = part.trim().to_string();
+            if !t.is_empty() {
+                plaintexts.push(t);
+            }
+        }
+    }
+
+    let mut out = std::collections::HashSet::new();
+    for p in plaintexts {
+        out.insert(crate::key_material::hash_api_key_secret(&p));
+    }
+    out
+}
+
+================================================================================
+FILE: crates/server/src/key_material.rs
+================================================================================
+
+//! API key hashing (SHA-256 hex, lowercase) for storage and comparison.
+
+use sha2::{Digest, Sha256};
+
+/// Deterministic hash of a presented API secret (matches stored `api_keys.key_hash`).
+pub fn hash_api_key_secret(plaintext: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(plaintext.as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Random secret prefix `rh_` + 64 hex chars (256-bit).
+pub fn generate_api_key_plaintext() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    format!("rh_{}", hex::encode(bytes))
+}
+
+================================================================================
+FILE: crates/server/tests/api_keys_integration.rs
+================================================================================
+
+//! API key auth, bootstrap, and lifecycle (plan task 06).
+#![allow(clippy::await_holding_lock)]
+// `std::sync::Mutex` serializes DB-heavy cases; holding the guard across `.await` is intentional here.
+
+use std::sync::{Arc, Mutex};
+
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
+use server::{router, run_database_migrations, AppState, ServerConfig};
+use sqlx::postgres::PgPoolOptions;
+use tower::ServiceExt;
+
+static API_KEY_DB_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+fn hash_secret(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
+}
+
+async fn connect(url: &str) -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect(url)
+        .await
+        .expect("connect DATABASE_URL")
+}
+
+fn state(cfg: ServerConfig, db: Option<sqlx::PgPool>) -> AppState {
+    AppState {
+        config: Arc::new(cfg),
+        db,
+    }
+}
+
+#[tokio::test]
+async fn post_api_keys_without_auth_returns_401() {
+    let cfg = ServerConfig::test_without_db();
+    let app = router(state(cfg, None));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn get_sessions_without_auth_returns_401() {
+    let cfg = ServerConfig::test_without_db();
+    let app = router(state(cfg, None));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/sessions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn bootstrap_and_db_lifecycle_with_database() {
+    let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        eprintln!("skipping API key DB integration test: DATABASE_URL unset");
+        return;
+    };
+
+    let _guard = API_KEY_DB_TEST_MUTEX.lock().unwrap();
+
+    let pool = connect(&url).await;
+    run_database_migrations(&pool).await.expect("migrations");
+
+    sqlx::query("DELETE FROM api_keys")
+        .execute(&pool)
+        .await
+        .expect("truncate api_keys");
+
+    let mut cfg = ServerConfig::test_without_db();
+    cfg.database_url = Some(url.clone());
+    cfg.api_key_hashes_env = std::collections::HashSet::new();
+
+    let app = router(state(cfg.clone(), Some(pool.clone())));
+
+    let boot = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys/bootstrap")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"label":"bootstrap"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(boot.status(), StatusCode::CREATED);
+    let boot_body = axum::body::to_bytes(boot.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&boot_body).unwrap();
+    let plain_key = created["key"].as_str().unwrap().to_string();
+    assert!(plain_key.starts_with("rh_"));
+    assert_eq!(created["label"], "bootstrap");
+
+    let boot2 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys/bootstrap")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(boot2.status(), StatusCode::FORBIDDEN);
+
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api-keys")
+                .header("Authorization", format!("Bearer {plain_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let list_body = axum::body::to_bytes(list.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&list_body).unwrap();
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    assert!(
+        !listed["items"][0].as_object().unwrap().contains_key("key"),
+        "list response must not include secret key"
+    );
+
+    let id = created["id"].as_str().unwrap();
+
+    let del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api-keys/{id}"))
+                .header("Authorization", format!("Bearer {plain_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    let list_empty = app
+        .oneshot(
+            Request::builder()
+                .uri("/api-keys")
+                .header("Authorization", format!("Bearer {plain_key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list_empty.status(), StatusCode::OK);
+    let list_empty_body = axum::body::to_bytes(list_empty.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let listed_empty: serde_json::Value = serde_json::from_slice(&list_empty_body).unwrap();
+    assert!(listed_empty["items"].as_array().unwrap().is_empty());
+
+    sqlx::query("DELETE FROM api_keys")
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+#[tokio::test]
+async fn bootstrap_forbidden_when_env_api_key_configured() {
+    let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        eprintln!("skipping bootstrap env test: DATABASE_URL unset");
+        return;
+    };
+
+    let _guard = API_KEY_DB_TEST_MUTEX.lock().unwrap();
+
+    let pool = connect(&url).await;
+    run_database_migrations(&pool).await.expect("migrations");
+    sqlx::query("DELETE FROM api_keys")
+        .execute(&pool)
+        .await
+        .expect("truncate api_keys");
+
+    let mut cfg = ServerConfig::test_without_db();
+    cfg.database_url = Some(url.clone());
+    cfg.api_key_hashes_env = std::iter::once(hash_secret("from-env")).collect();
+
+    let app = router(state(cfg, Some(pool.clone())));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys/bootstrap")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn auth_accepts_x_api_key_header() {
+    let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        eprintln!("skipping X-API-Key test: DATABASE_URL unset");
+        return;
+    };
+
+    let _guard = API_KEY_DB_TEST_MUTEX.lock().unwrap();
+
+    let pool = connect(&url).await;
+    run_database_migrations(&pool).await.expect("migrations");
+    sqlx::query("DELETE FROM api_keys")
+        .execute(&pool)
+        .await
+        .expect("truncate api_keys");
+
+    let mut cfg = ServerConfig::test_without_db();
+    cfg.database_url = Some(url);
+    let app = router(state(cfg, Some(pool)));
+
+    let boot = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api-keys/bootstrap")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(boot.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let plain_key = created["key"].as_str().unwrap();
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .uri("/api-keys")
+                .header("X-API-Key", plain_key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn wrong_api_key_returns_401() {
+    let Some(url) = std::env::var("DATABASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    else {
+        eprintln!("skipping wrong key test: DATABASE_URL unset");
+        return;
+    };
+
+    let _guard = API_KEY_DB_TEST_MUTEX.lock().unwrap();
+
+    let pool = connect(&url).await;
+    run_database_migrations(&pool).await.expect("migrations");
+    sqlx::query("DELETE FROM api_keys")
+        .execute(&pool)
+        .await
+        .expect("truncate api_keys");
+
+    let mut cfg = ServerConfig::test_without_db();
+    cfg.database_url = Some(url);
+    let app = router(state(cfg, Some(pool)));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api-keys")
+                .header(
+                    "Authorization",
+                    "Bearer rh_not_a_real_key_00000000000000000000000000000000",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+================================================================================
+FILE: crates/server/tests/openapi_contract.rs
+================================================================================
+
+//! OpenAPI contract checks: valid YAML, version, and operationId allowlist.
+//!
+//! When you add or remove REST operations in `openapi.yaml`, update
+//! `EXPECTED_OPERATION_IDS` so CI catches edits that skip the paired Rust update.
+
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::PathBuf;
+
+const EXPECTED_OPERATION_IDS: &[&str] = &[
+    "bootstrapApiKey",
+    "createApiKey",
+    "createSession",
+    "deleteApiKey",
+    "getHealth",
+    "getHealthIdle",
+    "getReady",
+    "listApiKeys",
+    "listSessions",
+];
+
+fn openapi_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("openapi.yaml")
+}
+
+fn collect_operation_ids(doc: &serde_yaml::Value) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let Some(paths) = doc.get("paths").and_then(|p| p.as_mapping()) else {
+        return out;
+    };
+    for (_, methods) in paths {
+        let Some(methods) = methods.as_mapping() else {
+            continue;
+        };
+        for (key, op) in methods {
+            let Some(key_str) = key.as_str() else {
+                continue;
+            };
+            if !matches!(
+                key_str,
+                "get" | "post" | "put" | "patch" | "delete" | "head" | "options" | "trace"
+            ) {
+                continue;
+            }
+            if let Some(id) = op.get("operationId").and_then(|v| v.as_str()) {
+                out.insert(id.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn openapi_yaml_parseable_and_operation_ids_match_allowlist() {
+    let raw = fs::read_to_string(openapi_path()).expect("read openapi.yaml");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&raw).expect("openapi.yaml must parse");
+
+    let ver = doc
+        .get("openapi")
+        .and_then(|v| v.as_str())
+        .expect("openapi field");
+    assert!(ver.starts_with("3."), "expected OpenAPI 3.x, got {ver:?}");
+
+    let found = collect_operation_ids(&doc);
+    let expected: BTreeSet<String> = EXPECTED_OPERATION_IDS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+
+    assert_eq!(
+        found, expected,
+        "openapi.yaml operationIds must match EXPECTED_OPERATION_IDS in openapi_contract.rs.\n\
+         Found: {found:?}\n\
+         Expected: {expected:?}\n\
+         After changing the spec, update the allowlist (and implement the route)."
+    );
+}
+
+================================================================================
+FILE: crates/server/openapi.yaml (full)
+================================================================================
+
+# Remote Harness — REST contract (OpenAPI 3.0.3)
+#
+# Canonical artifact for JSON routes. Keep this file aligned with docs/API_OVERVIEW.md.
+#
+# SSE: Event field names and examples are documented in docs/SSE_EVENTS.md (companion).
+#      See docs/PROJECT_KICKOFF.md §6 — Communication & Docs.
+#
+openapi: 3.0.3
+info:
+  title: Remote Harness Control Plane API
+  version: 0.1.0
+  description: |
+    Control plane REST API. Human-readable API prose and behavior notes live in
+    `docs/API_OVERVIEW.md`; this spec is the machine-readable contract for codegen and review.
+
+servers:
+  - url: /
+    description: Relative to configured control plane base URL
+
+tags:
+  - name: health
+    description: Liveness and readiness (no authentication)
+  - name: apiKeys
+    description: Control plane API keys (bootstrap, create, list, revoke)
+  - name: sessions
+    description: Session lifecycle (API key required when implemented)
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /ready:
+    get:
+      tags: [health]
+      summary: Readiness probe
+      operationId: getReady
+      responses:
+        "200":
+          description: Service is ready to accept traffic
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+        "503":
+          description: Not ready (e.g. database unreachable when DATABASE_URL is set)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /health/idle:
+    get:
+      tags: [health]
+      summary: Idle check for sleep-inhibit helpers
+      operationId: getHealthIdle
+      responses:
+        "200":
+          description: No pending or assigned jobs (safe to idle)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckOk"
+        "503":
+          description: Work is queued or assigned (hold sleep inhibit)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdleCheckBusy"
+
+  /api-keys/bootstrap:
+    post:
+      tags: [apiKeys]
+      summary: Create the first API key when none exist (no authentication)
+      operationId: bootstrapApiKey
+      description: |
+        Unauthenticated root-equivalent until a key exists. Returns 403 when `API_KEY`/`API_KEYS`
+        is set or when any non-revoked key exists. See docs/API_OVERVIEW.md — Bootstrap safety.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: First API key created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedResponse"
+        "403":
+          description: Bootstrap disabled (keys already exist or env bootstrap key configured)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured or unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /api-keys:
+    get:
+      tags: [apiKeys]
+      summary: List API keys
+      operationId: listApiKeys
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Paginated API keys (no secrets)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedApiKeySummaries"
+        "400":
+          description: Invalid cursor or request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [apiKeys]
+      summary: Create API key
+      operationId: createApiKey
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateApiKeyRequest"
+      responses:
+        "201":
+          description: API key created (plain key returned once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreatedResponse"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /api-keys/{id}:
+    delete:
+      tags: [apiKeys]
+      summary: Revoke API key
+      operationId: deleteApiKey
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Key revoked
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "404":
+          description: Key not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "503":
+          description: Database not configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+  /sessions:
+    get:
+      tags: [sessions]
+      summary: List sessions
+      operationId: listSessions
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          schema:
+            type: string
+        - name: status
+          in: query
+          schema:
+            type: string
+            description: Filter by session status (e.g. pending, running, completed, failed)
+      responses:
+        "200":
+          description: Paginated sessions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaginatedSessionSummaries"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "501":
+          description: Not implemented yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+    post:
+      tags: [sessions]
+      summary: Create session (start workflow)
+      operationId: createSession
+      security:
+        - bearerApiKey: []
+        - headerApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSessionRequest"
+      responses:
+        "201":
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateSessionResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "401":
+          description: Missing or invalid API key
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+        "501":
+          description: Not implemented yet
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StandardError"
+
+components:
+  securitySchemes:
+    bearerApiKey:
+      type: http
+      scheme: bearer
+      description: "API key as Bearer token (`Authorization: Bearer <api_key>`)"
+    headerApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: "API key in `X-API-Key` header"
+
+  schemas:
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    IdleCheckOk:
+      type: object
+      required: [idle]
+      properties:
+        idle:
+          type: boolean
+          enum: [true]
+
+    IdleCheckBusy:
+      type: object
+      required: [idle, pending_or_assigned_jobs]
+      properties:
+        idle:
+          type: boolean
+          enum: [false]
+        pending_or_assigned_jobs:
+          type: integer
+          minimum: 0
+
+    StandardError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: not_found
+            message:
+              type: string
+              example: Resource not found
+            details:
+              type: object
+              additionalProperties: true
+
+    WorkflowKind:
+      type: string
+      enum:
+        - chat
+        - loop_n
+        - loop_until_sentinel
+        - inbox
+
+    CreateSessionRequest:
+      type: object
+      required: [repo_url, workflow, params]
+      properties:
+        repo_url:
+          type: string
+        ref:
+          type: string
+          description: Git ref (branch or commit); default main when omitted
+        workflow:
+          $ref: "#/components/schemas/WorkflowKind"
+        params:
+          type: object
+          additionalProperties: true
+          description: Workflow-specific parameters (see API_OVERVIEW)
+        persona_id:
+          type: string
+        identity_id:
+          type: string
+        retain_forever:
+          type: boolean
+          default: false
+
+    CreateSessionResponse:
+      type: object
+      required: [session_id, status]
+      properties:
+        session_id:
+          type: string
+        status:
+          type: string
+          example: pending
+        web_url:
+          type: string
+          description: Optional deep link to Web UI for this session
+
+    SessionSummary:
+      type: object
+      required:
+        - session_id
+        - repo_url
+        - ref
+        - workflow
+        - status
+        - created_at
+      properties:
+        session_id:
+          type: string
+        repo_url:
+          type: string
+        ref:
+          type: string
+        workflow:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    PaginatedSessionSummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionSummary"
+        next_cursor:
+          type: string
+          nullable: true
+
+    CreateApiKeyRequest:
+      type: object
+      properties:
+        label:
+          type: string
+          nullable: true
+
+    ApiKeyCreatedResponse:
+      type: object
+      required: [id, key, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        key:
+          type: string
+          description: Plain secret; shown once at creation
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          description: ISO 8601 timestamp
+
+    ApiKeySummary:
+      type: object
+      required: [id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+
+    PaginatedApiKeySummaries:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeySummary"
+        next_cursor:
+          type: string
+          nullable: true
+
+================================================================================
+FILE: crates/server/src/lib.rs
+================================================================================
+
+//! Remote Harness control plane HTTP server.
+
+mod auth;
+mod config;
+mod key_material;
+mod keys;
+
+pub use config::ServerConfig;
+
+use api_types::{
+    HealthStatusResponse, IdleCheckResponse, StandardErrorBody, StandardErrorResponse,
+};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    middleware,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
+};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
+use std::sync::Arc;
+
+/// Shared application state for handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<ServerConfig>,
+    pub db: Option<PgPool>,
+}
+
+/// Build the HTTP router with the given state.
+pub fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/health/idle", get(health_idle))
+        .route("/api-keys/bootstrap", post(keys::bootstrap_api_key))
+        .route(
+            "/",
+            get(|| async {
+                format!(
+                    "remote-harness server (api-types {})",
+                    api_types::CRATE_VERSION
+                )
+            }),
+        )
+        .merge(
+            Router::new()
+                .route(
+                    "/api-keys",
+                    post(keys::create_api_key).get(keys::list_api_keys),
+                )
+                .route("/api-keys/{id}", delete(keys::delete_api_key))
+                .route(
+                    "/sessions",
+                    get(keys::sessions_not_implemented).post(keys::sessions_not_implemented),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth::require_api_key,
+                )),
+        )
+        .with_state(state)
+}
+
+async fn health() -> Json<HealthStatusResponse> {
+    Json(HealthStatusResponse::ok())
+}
+
+async fn ready(State(state): State<AppState>) -> Result<Json<HealthStatusResponse>, ReadyError> {
+    let Some(pool) = &state.db else {
+        return Ok(Json(HealthStatusResponse::ok()));
+    };
+
+    sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| ReadyError::new(format!("database not reachable: {e}")))?;
+
+    Ok(Json(HealthStatusResponse::ok()))
+}
+
+struct ReadyError {
+    message: String,
+}
+
+impl ReadyError {
+    fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
+impl IntoResponse for ReadyError {
+    fn into_response(self) -> Response {
+        let body = StandardErrorResponse {
+            error: StandardErrorBody {
+                code: "not_ready".to_string(),
+                message: self.message,
+                details: None,
+            },
+        };
+        (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
+    }
+}
+
+/// Conservative stub: always idle until the task queue exists (plan task 04).
+async fn health_idle() -> Json<IdleCheckResponse> {
+    Json(IdleCheckResponse {
+        idle: true,
+        pending_or_assigned_jobs: None,
+    })
+}
+
+/// Apply embedded SQLx migrations from `crates/server/migrations` (idempotent).
+pub async fn run_database_migrations(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("./migrations").run(pool).await
+}
+
+/// Connect to Postgres when `DATABASE_URL` is set. Fails fast if the URL is present but invalid.
+pub async fn connect_database(config: &ServerConfig) -> Result<Option<PgPool>, sqlx::Error> {
+    let Some(url) = config.database_url.as_deref() else {
+        return Ok(None);
+    };
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(url)
+        .await?;
+
+    Ok(Some(pool))
+}
+
+================================================================================
+FILE: crates/server/src/auth.rs
+================================================================================
+
+//! Bearer / `X-API-Key` validation for protected routes.
+
+use crate::key_material::hash_api_key_secret;
+use crate::AppState;
+use api_types::{StandardErrorBody, StandardErrorResponse};
+use axum::{
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+    Json,
+};
+
+/// Reject requests without a valid API key (env or non-revoked DB row).
+pub async fn require_api_key(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AuthError> {
+    let headers = request.headers();
+    let Some(presented) = extract_presented_key(headers) else {
+        return Err(AuthError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing API key; send Authorization: Bearer <key> or X-API-Key",
+        ));
+    };
+
+    if !key_is_valid(&state, presented).await {
+        return Err(AuthError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid or revoked API key",
+        ));
+    }
+
+    Ok(next.run(request).await)
+}
+
+fn extract_presented_key(headers: &HeaderMap) -> Option<&str> {
+    if let Some(v) = headers.get(AUTHORIZATION) {
+        let s = v.to_str().ok()?;
+        let prefix = "Bearer ";
+        if s.len() > prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+            let token = s[prefix.len()..].trim();
+            if !token.is_empty() {
+                return Some(token);
+            }
+        }
+    }
+    if let Some(v) = headers.get("x-api-key") {
+        let s = v.to_str().ok()?.trim();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    None
+}
+
+async fn key_is_valid(state: &AppState, presented: &str) -> bool {
+    let hash = hash_api_key_secret(presented);
+    if state.config.api_key_hashes_env.contains(&hash) {
+        return true;
+    }
+    let Some(pool) = &state.db else {
+        return false;
+    };
+
+    sqlx::query_scalar::<_, bool>(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM api_keys
+            WHERE key_hash = $1 AND revoked_at IS NULL
+        )
+        "#,
+    )
+    .bind(&hash)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
+pub struct AuthError {
+    status: StatusCode,
+    body: StandardErrorResponse,
+}
+
+impl AuthError {
+    pub fn new(status: StatusCode, code: &str, message: &str) -> Self {
+        Self {
+            status,
+            body: StandardErrorResponse {
+                error: StandardErrorBody {
+                    code: code.to_string(),
+                    message: message.to_string(),
+                    details: None,
+                },
+            },
+        }
+    }
+}
+
+impl IntoResponse for AuthError {
+    fn into_response(self) -> Response {
+        (self.status, Json(self.body)).into_response()
+    }
+}
+
+================================================================================
+FILE: crates/server/src/keys.rs
+================================================================================
+
+//! `POST/GET/DELETE /api-keys` and bootstrap ([`docs/API_OVERVIEW.md`](../../docs/API_OVERVIEW.md) §4c).
+
+use crate::auth::AuthError;
+use crate::key_material::{generate_api_key_plaintext, hash_api_key_secret};
+use crate::AppState;
+use api_types::{
+    ApiKeyCreatedResponse, ApiKeySummary, CreateApiKeyRequest, PaginatedApiKeySummaries,
+    StandardErrorBody, StandardErrorResponse,
+};
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Json,
+};
+use base64::prelude::{Engine as _, BASE64_URL_SAFE_NO_PAD};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Deserialize;
+use sqlx::PgPool;
+use uuid::Uuid;
+
+const DEFAULT_PAGE_LIMIT: i64 = 20;
+const MAX_PAGE_LIMIT: i64 = 100;
+
+#[derive(Debug, Deserialize)]
+pub struct ListKeysQuery {
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// `POST /api-keys/bootstrap` — unauthenticated; 403 if any env or DB key exists.
+pub async fn bootstrap_api_key(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Result<(StatusCode, Json<ApiKeyCreatedResponse>), AuthError> {
+    if !state.config.api_key_hashes_env.is_empty() {
+        return Err(AuthError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Bootstrap is disabled: API_KEY or API_KEYS is set in the server environment",
+        ));
+    }
+
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot bootstrap API keys",
+        ));
+    };
+
+    let active_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM api_keys WHERE revoked_at IS NULL")
+            .fetch_one(pool)
+            .await
+            .map_err(|e| {
+                AuthError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    &format!("database error: {e}"),
+                )
+            })?;
+
+    if active_count > 0 {
+        return Err(AuthError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Bootstrap is disabled: at least one API key already exists",
+        ));
+    }
+
+    insert_new_key(pool, body.label)
+        .await
+        .map(|r| (StatusCode::CREATED, Json(r)))
+}
+
+/// `POST /api-keys` — authenticated.
+pub async fn create_api_key(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Result<(StatusCode, Json<ApiKeyCreatedResponse>), AuthError> {
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot create API keys",
+        ));
+    };
+
+    insert_new_key(pool, body.label)
+        .await
+        .map(|r| (StatusCode::CREATED, Json(r)))
+}
+
+async fn insert_new_key(
+    pool: &PgPool,
+    label: Option<String>,
+) -> Result<ApiKeyCreatedResponse, AuthError> {
+    let plaintext = generate_api_key_plaintext();
+    let key_hash = hash_api_key_secret(&plaintext);
+
+    let row: (Uuid, Option<String>, DateTime<Utc>) = sqlx::query_as(
+        r#"
+        INSERT INTO api_keys (key_hash, label)
+        VALUES ($1, $2)
+        RETURNING id, label, created_at
+        "#,
+    )
+    .bind(&key_hash)
+    .bind(label.as_deref())
+    .fetch_one(pool)
+    .await
+    .map_err(|e| {
+        AuthError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("database error: {e}"),
+        )
+    })?;
+
+    Ok(ApiKeyCreatedResponse {
+        id: row.0.to_string(),
+        key: plaintext,
+        label: row.1,
+        created_at: row.2.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+/// `GET /api-keys` — authenticated; cursor pagination (newest first).
+pub async fn list_api_keys(
+    State(state): State<AppState>,
+    Query(q): Query<ListKeysQuery>,
+) -> Result<Json<PaginatedApiKeySummaries>, AuthError> {
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot list API keys",
+        ));
+    };
+
+    let limit = q
+        .limit
+        .unwrap_or(DEFAULT_PAGE_LIMIT)
+        .clamp(1, MAX_PAGE_LIMIT);
+
+    let cursor = q
+        .cursor
+        .as_deref()
+        .map(parse_cursor)
+        .transpose()
+        .map_err(|msg| {
+            AuthError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("invalid cursor: {msg}"),
+            )
+        })?;
+
+    let fetch = limit + 1;
+    let rows: Vec<(Uuid, Option<String>, DateTime<Utc>)> = if let Some((c_at, c_id)) = cursor {
+        sqlx::query_as(
+            r#"
+            SELECT id, label, created_at
+            FROM api_keys
+            WHERE revoked_at IS NULL
+              AND (created_at, id) < ($1, $2)
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(c_at)
+        .bind(c_id)
+        .bind(fetch)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, label, created_at
+            FROM api_keys
+            WHERE revoked_at IS NULL
+            ORDER BY created_at DESC, id DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(fetch)
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|e| {
+        AuthError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("database error: {e}"),
+        )
+    })?;
+
+    let has_more = rows.len() > limit as usize;
+    let page_rows: Vec<_> = rows.into_iter().take(limit as usize).collect();
+
+    let next_cursor = if has_more {
+        page_rows
+            .last()
+            .map(|(id, _, created_at)| encode_cursor(*created_at, *id))
+    } else {
+        None
+    };
+
+    let items: Vec<ApiKeySummary> = page_rows
+        .into_iter()
+        .map(|(id, label, created_at)| ApiKeySummary {
+            id: id.to_string(),
+            label,
+            created_at: created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        })
+        .collect();
+
+    Ok(Json(PaginatedApiKeySummaries { items, next_cursor }))
+}
+
+fn encode_cursor(created_at: DateTime<Utc>, id: Uuid) -> String {
+    let raw = format!(
+        "{}|{}",
+        created_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+        id
+    );
+    BASE64_URL_SAFE_NO_PAD.encode(raw.as_bytes())
+}
+
+fn parse_cursor(s: &str) -> Result<(DateTime<Utc>, Uuid), String> {
+    let bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map_err(|e| e.to_string())?;
+    let raw = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+    let (t, id) = raw
+        .split_once('|')
+        .ok_or_else(|| "expected '<rfc3339>|<uuid>'".to_string())?;
+    let created_at = DateTime::parse_from_rfc3339(t)
+        .map_err(|e| e.to_string())?
+        .with_timezone(&Utc);
+    let id = Uuid::parse_str(id).map_err(|e| e.to_string())?;
+    Ok((created_at, id))
+}
+
+/// `DELETE /api-keys/:id` — soft revoke; 404 if missing.
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, AuthError> {
+    let Some(pool) = &state.db else {
+        return Err(AuthError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_ready",
+            "Database is not configured; cannot revoke API keys",
+        ));
+    };
+
+    let res = sqlx::query(
+        r#"
+        UPDATE api_keys
+        SET revoked_at = now()
+        WHERE id = $1 AND revoked_at IS NULL
+        "#,
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        AuthError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            &format!("database error: {e}"),
+        )
+    })?;
+
+    if res.rows_affected() == 0 {
+        return Err(AuthError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "API key not found",
+        ));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Placeholder until session implementation (still requires API key per OpenAPI).
+pub async fn sessions_not_implemented() -> impl IntoResponse {
+    let body = StandardErrorResponse {
+        error: StandardErrorBody {
+            code: "not_implemented".to_string(),
+            message: "Sessions API is not implemented yet".to_string(),
+            details: None,
+        },
+    };
+    (StatusCode::NOT_IMPLEMENTED, Json(body))
+}
+
+================================================================================
+FILE: crates/cli/src/main.rs
+================================================================================
+
+use api_types::{
+    ApiKeyCreatedResponse, CreateApiKeyRequest, HealthStatusResponse, IdleCheckResponse,
+    PaginatedApiKeySummaries, StandardErrorResponse,
+};
+use clap::{Parser, Subcommand};
+use std::process::ExitCode;
+
+/// Remote Harness CLI (full command surface in plan tasks 20–21).
+#[derive(Parser, Debug)]
+#[command(name = "remote-harness", version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Control plane base URL (overrides REMOTE_HARNESS_URL / CONTROL_PLANE_URL)
+    #[arg(long, global = true, env = "CONTROL_PLANE_URL")]
+    control_plane_url: Option<String>,
+
+    /// API key for authenticated control-plane calls (or REMOTE_HARNESS_API_KEY / API_KEY)
+    #[arg(long, global = true, env = "REMOTE_HARNESS_API_KEY")]
+    remote_harness_api_key: Option<String>,
+
+    #[arg(long, global = true, hide = true, env = "API_KEY")]
+    api_key: Option<String>,
+
+    /// Print shared crate version marker and exit
+    #[arg(long, default_value_t = false)]
+    version_marker: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Call GET /health on the control plane
+    Health,
+    /// Call GET /ready on the control plane
+    Ready,
+    /// Call GET /health/idle on the control plane
+    Idle,
+    /// Create, list, revoke, or bootstrap control-plane API keys
+    ApiKey {
+        #[command(subcommand)]
+        action: ApiKeyCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiKeyCommand {
+    /// POST /api-keys (requires API key)
+    Create {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// GET /api-keys (requires API key)
+    List {
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// DELETE /api-keys/:id (requires API key)
+    Delete { id: String },
+    /// POST /api-keys/bootstrap (no API key). Unauthenticated root access until keys exist.
+    Bootstrap {
+        #[arg(long)]
+        label: Option<String>,
+    },
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    if args.version_marker {
+        println!("api-types {}", api_types::CRATE_VERSION);
+        return ExitCode::SUCCESS;
+    }
+
+    let base = resolve_base_url(&args);
+    match args.command {
+        Some(Command::Health) => match run_health(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Ready) => match run_ready(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Idle) => match run_idle(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::ApiKey { ref action }) => match run_api_key(&base, &args, action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            println!(
+                "remote-harness CLI — see docs/GETTING_STARTED.md (api-types {})",
+                api_types::CRATE_VERSION
+            );
+            println!("Tip: cargo run -p cli -- health   # GET /health");
+            println!("Tip: cargo run -p cli -- ready    # GET /ready");
+            println!("Tip: cargo run -p cli -- idle     # GET /health/idle");
+            println!("Tip: cargo run -p cli -- api-key bootstrap");
+            println!("Tip: cargo run -p cli -- --version-marker");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn resolve_base_url(args: &Args) -> String {
+    args.control_plane_url
+        .clone()
+        .or_else(|| std::env::var("REMOTE_HARNESS_URL").ok())
+        .or_else(|| std::env::var("CONTROL_PLANE_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string())
+}
+
+fn resolve_auth_key(args: &Args) -> Option<String> {
+    args.remote_harness_api_key
+        .clone()
+        .or_else(|| args.api_key.clone())
+}
+
+fn run_api_key(base: &str, args: &Args, action: &ApiKeyCommand) -> Result<(), String> {
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        ApiKeyCommand::Bootstrap { label } => {
+            eprintln!(
+                "WARNING: POST /api-keys/bootstrap is unauthenticated root-equivalent until a key exists."
+            );
+            eprintln!(
+                "Do not expose the control plane to the internet until bootstrap returns 403. See docs/API_OVERVIEW.md — Bootstrap safety."
+            );
+            let url = format!("{base}/api-keys/bootstrap");
+            let body = CreateApiKeyRequest {
+                label: label.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            handle_api_key_created(resp, &url)
+        }
+        ApiKeyCommand::Create { label } => {
+            let key = resolve_auth_key(args).ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, or pass --remote-harness-api-key"
+                    .to_string()
+            })?;
+            let url = format!("{base}/api-keys");
+            let body = CreateApiKeyRequest {
+                label: label.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            handle_api_key_created(resp, &url)
+        }
+        ApiKeyCommand::List { limit, cursor } => {
+            let key = resolve_auth_key(args).ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, or pass --remote-harness-api-key"
+                    .to_string()
+            })?;
+            let mut url = reqwest::Url::parse(&format!("{base}/api-keys"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                if let Some(l) = limit {
+                    pairs.append_pair("limit", &l.to_string());
+                }
+                if let Some(ref c) = cursor {
+                    pairs.append_pair("cursor", c);
+                }
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: PaginatedApiKeySummaries =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                for item in &body.items {
+                    let label = item.label.as_deref().unwrap_or("(no label)");
+                    println!("{}  {}  {}", item.id, label, item.created_at);
+                }
+                if let Some(c) = body.next_cursor {
+                    println!("next_cursor: {c}");
+                }
+                Ok(())
+            } else {
+                Err(http_error_message(resp, &url_str))
+            }
+        }
+        ApiKeyCommand::Delete { id } => {
+            let key = resolve_auth_key(args).ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, or pass --remote-harness-api-key"
+                    .to_string()
+            })?;
+            let url = format!("{base}/api-keys/{}", id.trim());
+            let resp = client
+                .delete(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("revoked API key {}", id.trim());
+                Ok(())
+            } else {
+                Err(http_error_message(resp, &url))
+            }
+        }
+    }
+}
+
+fn handle_api_key_created(resp: reqwest::blocking::Response, url: &str) -> Result<(), String> {
+    if resp.status() == reqwest::StatusCode::CREATED {
+        let body: ApiKeyCreatedResponse =
+            resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        println!("id:         {}", body.id);
+        println!("label:      {:?}", body.label);
+        println!("created_at: {}", body.created_at);
+        println!();
+        println!("API key (store this; shown once):");
+        println!("{}", body.key);
+        return Ok(());
+    }
+    Err(http_error_message(resp, url))
+}
+
+fn http_error_message(resp: reqwest::blocking::Response, url: &str) -> String {
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if let Ok(err) = serde_json::from_str::<StandardErrorResponse>(&text) {
+        format!(
+            "HTTP {} from {} — {}: {}",
+            status.as_u16(),
+            url,
+            err.error.code,
+            err.error.message
+        )
+    } else if text.is_empty() {
+        format!("HTTP {} from {}", status.as_u16(), url)
+    } else {
+        format!("HTTP {} from {} — {}", status.as_u16(), url, text)
+    }
+}
+
+fn run_health(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} from {} — expected 200 OK",
+            status.as_u16(),
+            url
+        ));
+    }
+    let body: HealthStatusResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+    if body.status != "ok" {
+        return Err(format!(
+            "unexpected health payload: status={:?} (expected \"ok\")",
+            body.status
+        ));
+    }
+    println!("control plane healthy ({url})");
+    Ok(())
+}
+
+fn run_ready(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/ready");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::OK {
+        let body: HealthStatusResponse =
+            resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        if body.status != "ok" {
+            return Err(format!(
+                "unexpected ready payload: status={:?} (expected \"ok\")",
+                body.status
+            ));
+        }
+        println!("control plane ready ({url})");
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let body: StandardErrorResponse = resp
+            .json()
+            .map_err(|e| format!("invalid JSON error body: {e}"))?;
+        return Err(format!(
+            "not ready (HTTP 503): {} — {}",
+            body.error.code, body.error.message
+        ));
+    }
+    Err(format!(
+        "HTTP {} from {} — expected 200 OK or 503",
+        status.as_u16(),
+        url
+    ))
+}
+
+fn run_idle(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health/idle");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::OK {
+        let body: IdleCheckResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        if body.idle {
+            println!("control plane idle (OK to sleep) ({url})");
+            return Ok(());
+        }
+        let n = body
+            .pending_or_assigned_jobs
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return Err(format!("not idle: pending_or_assigned_jobs={n} ({url})"));
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let body: IdleCheckResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        let n = body
+            .pending_or_assigned_jobs
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return Err(format!(
+            "not idle (HTTP 503): pending_or_assigned_jobs={n} ({url})"
+        ));
+    }
+    Err(format!(
+        "HTTP {} from {} — expected 200 or 503",
+        status.as_u16(),
+        url
+    ))
+}
+
+================================================================================
+FILE: crates/server/Cargo.toml
+================================================================================
+
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness control plane HTTP API"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = { version = "0.8", features = ["json"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+hex = "0.4"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "tls-rustls-ring",
+    "macros",
+    "migrate",
+    "chrono",
+    "uuid",
+] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "tls-rustls-ring",
+] }
+tower = { version = "0.5", features = ["util"] }
+
+================================================================================
+FILE: crates/cli/Cargo.toml
+================================================================================
+
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness CLI (commands land in plan tasks 20–21)"
+
+[[bin]]
+name = "remote-harness"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+
+================================================================================
+FILE: docs/GETTING_STARTED.md
+================================================================================
+
+# Getting Started (local development)
+
+Run the full stack locally: PostgreSQL, control plane, worker, Web UI, and the CLI on your machine. **macOS- or Docker-specific notes** (e.g. Docker Desktop, mounting the agent binary) are called out inline—Linux and Windows follow the same patterns unless noted.
+
+**Two ways:**
+
+1. **Docker Compose (recommended)** — One `docker compose up`; crash restart on laptops; server, worker, DB, and web UI in containers; you only run the **CLI** on the host. See [§1](#1-docker-compose-recommended).
+2. **Bare metal** — `cargo run` for server and worker, local Postgres (or container DB only), **npm run dev** for the Web UI. See [§2](#2-bare-metal-four-terminals).
+
+Deep topology and sleep behavior: [HOSTING.md](HOSTING.md).
+
+---
+
+## Prerequisites
+
+**Either path:**
+
+- **Rust** (e.g. `rustup`) — required for the **CLI** from your machine; also required for **bare-metal** server and worker.
+
+**Docker path additionally:**
+
+- **Docker** and **Docker Compose** (e.g. Docker Desktop on macOS/Windows, or Docker Engine + Compose plugin on Linux)
+
+**Bare-metal path additionally:**
+
+- **Node.js** (for the Web UI dev server)
+- **PostgreSQL** — Docker one-off container (below) or local install (e.g. `brew install postgresql@16` then `brew services start postgresql@16`)
+
+**SQLite:** Supported for minimal setups per [TECH_STACK.md §1](TECH_STACK.md) and [HOSTING.md §3](HOSTING.md). This guide uses **PostgreSQL**. If you use SQLite, set **`DATABASE_URL`** per server docs.
+
+---
+
+## URLs and consistency
+
+From your **host** machine, the API is usually:
+
+| Setup | Control plane URL | Typical UI URL |
+|-------|-------------------|----------------|
+| **Docker Compose** (published ports) | `http://localhost:3000` | `http://localhost:5173` (web container → host 5173) |
+| **Bare metal** (this guide) | `http://127.0.0.1:3000` | `http://localhost:5173` (Vite) |
+
+Use **one host form** (`localhost` vs `127.0.0.1`) for the API consistently with **OAuth callback URLs**, **cookie scope**, and **CORS**. The examples below use the table above; adjust if you standardize on one form everywhere.
+
+---
+
+## 1. Docker Compose (recommended)
+
+### 1.1 Configuration
+
+One shared **API key** for server, worker, and CLI/UI. Default: `dev-key-change-in-production`. Override:
+
+```bash
+export API_KEY="your-secret-key"
+```
+
+Run `docker compose` in the same shell, or put `API_KEY=...` in a **`.env`** file in the repo root.
+
+### 1.2 Start everything
+
+From the repo root:
+
+```bash
+docker compose up --build
+```
+
+First run builds Rust and the Web image; later runs reuse images. If the worker failed with **"Name or service not known"** for host `server`, rebuild: `docker compose build --no-cache server worker && docker compose up -d`.
+
+You should see: **postgres** healthy → **server** on 3000 → **worker** registered → **web** on host **5173** (container port 80 mapped to 5173).
+
+Stop: `Ctrl+C`. Background: `docker compose up -d --build`.
+
+**Migrations / `VersionMismatch` after `git pull`:** Reset the DB volume and rebuild:
+
+```bash
+docker compose down -v
+docker compose up -d --build
+```
+
+See [TROUBLESHOOTING.md §1b](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migration-checksum-errors).
+
+**SQLx offline / `cargo sqlx prepare`:** Migrations use `sqlx::migrate!`, which **embeds** the files under `crates/server/migrations` at **compile time**—no live database is required to build. The `cargo sqlx prepare` flow and `.sqlx/` metadata are for **compile-time checked queries** (`query!`, etc.), not for the migration macro; see [TROUBLESHOOTING.md §1b](TROUBLESHOOTING.md#1b-versionmismatch--sqlx-migration-checksum-errors) if you add those macros later.
+
+**Sleep-inhibit:** From the **host**, poll `GET http://localhost:3000/health/idle` (or your published port). **200** = OK to sleep; **503** = busy. See [HOSTING.md §4a](HOSTING.md#4a-idle-sleep--sleep-inhibit).
+
+#### Worker and backend lifecycle
+
+- **Restart:** Services use **`restart: unless-stopped`** — auto-restart after panic/OOM while the host is awake.
+- **Sleep/wake:** Host sleep suspends the Docker VM; on wake, containers resume and the worker re-heartbeats. See [HOSTING.md §9](HOSTING.md#9-docker-and-sleep-detailed-behavior).
+- **Scale workers:** `docker compose up --scale worker=N` (e.g. `N=2`).
+- **Stuck jobs:** Stale workers → reclaim; see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+### 1.3 Use the UI (Docker)
+
+1. Open **http://localhost:5173**
+2. **Settings:** Control plane URL **http://localhost:3000**, API key **matching `API_KEY`**
+
+### 1.4 Agent CLI in the worker container
+
+The worker image includes the **Cursor Agent CLI**. Sessions with `agent_cli: "cursor"` work without extra setup (`/root/.local/bin/agent`).
+
+- **Override (Linux host):** Mount the binary and set e.g. `CURSOR_AGENT_PATH`.
+- **macOS host:** Do not mount the Mac `agent` binary into the Linux worker — use the image CLI or run the worker **bare metal** on the Mac.
+
+For **Claude Code**, set `CLAUDE_CLI_PATH` inside the image or mount a Linux `claude` binary.
+
+### 1.5 CLI from your laptop (Docker)
+
+```bash
+export REMOTE_HARNESS_URL="http://localhost:3000"
+export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
+cargo run -p cli -- health
+cargo run -p cli -- ready
+# API keys (see API_OVERVIEW §4c): create/list/revoke need a key; bootstrap is unauthenticated only when no keys exist and the server has no API_KEY/API_KEYS env keys.
+cargo run -p cli -- api-key list
+cargo run -p cli -- api-key create --label ci
+# cargo run -p cli -- api-key bootstrap   # first-run only; prints operator warning
+```
+
+Or `~/.config/remote-harness/config.yaml` with `control_plane_url` and `api_key`.
+
+Session, logs, and attach commands ship in later plan tasks; until then the control plane may return **501** on `/sessions` for authenticated callers.
+
+### 1.6 Logs (Docker)
+
+**UI:** Session → log panel (history then stream). **CLI:** `logs tail` / `attach`. Logs live in Postgres on the server; browser and CLI call the same API URL.
+
+### 1.7 What this setup uses
+
+| Piece | Purpose |
+|-------|--------|
+| **docker-compose.yml** | `postgres`, `server`, `worker`, `web`; server/worker share one image; Postgres healthcheck before server. |
+| **Dockerfile** (repo root) | Builds server + worker; worker image includes Cursor CLI. |
+| **web/Dockerfile** | Vite build + nginx; SPA `try_files` → `index.html`. |
+| **CORS** | UI origin `http://localhost:5173` (and often `127.0.0.1:5173`) must be allowed; see `CORS_ALLOWED_ORIGINS` and [TROUBLESHOOTING.md §1a](TROUBLESHOOTING.md#1a-cors-errors-in-the-browser). |
+
+### 1.8 Optional: API key without exporting env
+
+```bash
+API_KEY=my-secret docker compose up --build
+```
+
+Use `my-secret` in UI Settings and `REMOTE_HARNESS_API_KEY`.
+
+---
+
+## 2. Bare metal (four terminals)
+
+**Crash restart:** Bare-metal `cargo run` does **not** auto-restart. For laptops, prefer [§1](#1-docker-compose-recommended) or [HOSTING.md](HOSTING.md).
+
+### 2.1 Database
+
+**Option A — Postgres in Docker (DB only)**
+
+```bash
+docker run -d --name remote-harness-db \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=remote_harness \
+  -p 5432:5432 \
+  postgres:16
+```
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5432/remote_harness"
+```
+
+**Option B — Local PostgreSQL**
+
+```bash
+createdb remote_harness
+export DATABASE_URL="postgres://localhost/remote_harness"
+```
+
+(Adjust user/password if needed.)
+
+### 2.2 Environment
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5432/remote_harness"   # or postgres://localhost/remote_harness
+export API_KEY="dev-key-change-in-production"
+export CONTROL_PLANE_URL="http://127.0.0.1:3000"
+export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
+```
+
+Optional server/worker tuning:
+
+| Variable | Component | Default |
+|----------|-----------|--------|
+| `BIND_HOST` or `HOST` | server | `0.0.0.0` |
+| `PORT` | server | `3000` |
+| `DATABASE_URL` | server | unset (no DB / readiness skips ping); use `?sslmode=disable` with local Postgres when using TLS-disabled listeners |
+| `CORS_ORIGINS` | server | unset (comma-separated origins; CORS middleware not yet wired) |
+| `LOG_RETENTION_DAYS_DEFAULT` | server | `30` |
+| `LOG_RETENTION_MAX_BYTES_PER_SESSION_DEFAULT` | server | `52428800` |
+| `WORKER_STALE_THRESHOLD_SECS` or `WORKER_STALE_SECONDS` | server | `120` |
+| `JOB_LEASE_STALE_THRESHOLD_SECS` | server | `300` |
+| `MAX_JOB_RECLAIMS` | server | `3` (reserved; queue not wired yet) |
+| `JOB_LEASE_SECONDS` | server | `0` (disabled); e.g. `21600` = 6h lease / `[JOB_LEASE_EXPIRED]` |
+| `HEARTBEAT_INTERVAL_SECS` | worker | `30` |
+
+Worker config file: `~/.config/remote-harness-worker/config.yaml` or `REMOTE_HARNESS_CONFIG` (YAML; env overrides file). See [Worker README](../crates/worker/README.md).
+
+### 2.3 Commands
+
+**Terminal 1 — Backend**
+
+```bash
+cd /path/to/remote_harness_3
+export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5432/remote_harness"
+export API_KEY="dev-key-change-in-production"
+cargo run -p server
+```
+
+Wait for `listening` on `0.0.0.0:3000`. Migrations run on startup.
+
+**Terminal 2 — Worker**
+
+```bash
+cd /path/to/remote_harness_3
+export CONTROL_PLANE_URL="http://127.0.0.1:3000"
+export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
+cargo run -p worker
+```
+
+**Terminal 3 — Web UI**
+
+```bash
+cd /path/to/remote_harness_3/web
+npm install
+npm run dev
+```
+
+Open the URL Vite prints. The home page polls **`/health`**, **`/ready`**, and **`/health/idle`** against the base URL (default `http://127.0.0.1:3000`, or **`VITE_CONTROL_PLANE_URL`**). **Settings (later):** control plane URL, API key **dev-key-change-in-production**.
+
+**Terminal 4 — CLI (optional)**
+
+```bash
+cd /path/to/remote_harness_3
+export REMOTE_HARNESS_URL="http://127.0.0.1:3000"
+export REMOTE_HARNESS_API_KEY="dev-key-change-in-production"
+cargo run -p cli -- health
+cargo run -p cli -- ready
+cargo run -p cli -- idle
+```
+
+Or `~/.config/remote-harness/config.yaml`.
+
+### 2.4 Quick check
+
+- `curl -s -H "Authorization: Bearer dev-key-change-in-production" http://127.0.0.1:3000/health` → `{"status":"ok"}`
+- `GET /workers` with the same header → includes your worker
+- UI: Settings OK, then create a session
+
+### 2.5 One-liner env (bare metal)
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@127.0.0.1:5432/remote_harness" API_KEY="dev-key-change-in-production" CONTROL_PLANE_URL="http://127.0.0.1:3000" REMOTE_HARNESS_API_KEY="dev-key-change-in-production" REMOTE_HARNESS_URL="http://127.0.0.1:3000"
+```
+
+---
+
+## 3. Credentials and OAuth (BYOL)
+
+Applies to **both** Docker and bare metal. The worker needs **agent_token** (e.g. Cursor key) and **git_token** (e.g. GitHub PAT) before sessions run; otherwise session creation is rejected.
+
+Use the **control plane URL** from [URLs and consistency](#urls-and-consistency) in the examples below (`localhost:3000` vs `127.0.0.1:3000`).
+
+### 3.1 UI Settings (recommended)
+
+**Settings → Credentials (BYOL):** Git token and Agent token → **Save**. Optional **Sign in with GitHub** or **Sign in with GitLab** if the server is configured ([§3.5](#35-gitlab-oauth-sign-in-with-gitlab), [§3.6](#36-github-oauth-sign-in-with-github)).
+
+### 3.2 PATCH default identity (curl)
+
+```bash
+curl -s -X PATCH \
+  -H "Authorization: Bearer dev-key-change-in-production" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_token":"YOUR_CURSOR_API_KEY","git_token":"YOUR_GITHUB_PAT"}' \
+  http://localhost:3000/identities/default
+```
+
+(Bare metal: use `http://127.0.0.1:3000/identities/default` if that is your API URL.)
+
+Use a Git PAT with **`repo`** (or equivalent). With GitHub/GitLab OAuth, the UI can offer a **repo picker**; you can also paste a clone URL. The CLI accepts **`--repo owner/repo`** (via list-repositories) or **`--repo-url`** with a clone URL.
+
+### 3.3 CLI — `credentials set`
+
+```bash
+cargo run -p cli -- credentials set
+```
+
+Masked prompts, or:
+
+```bash
+cargo run -p cli -- credentials set --git-token "ghp_xxx" --agent-token "cursor_xxx"
+export GIT_TOKEN="ghp_xxx" AGENT_TOKEN="cursor_xxx"
+cargo run -p cli -- credentials set
+```
+
+Set `REMOTE_HARNESS_URL` and `REMOTE_HARNESS_API_KEY` to your control plane first.
+
+### 3.4 Per-session tokens (optional)
+
+On **`POST /sessions`**, put **`agent_token`**, **`git_token`**, and workflow fields (e.g. **`prompt`**, **`agent_cli`**: `"cursor"` or `"claude_code"`) in **params**. Params merge with the identity; supplied tokens override for that session only without updating the stored identity.
+
+### 3.5 GitLab OAuth (Sign in with GitLab)
+
+Configure the **server** (e.g. repo root **`.env`** for Compose, or env for bare metal):
+
+- **GITLAB_CLIENT_ID** — [GitLab Application](https://gitlab.com/-/user_settings/applications) (or self‑hosted GitLab).
+- **GITLAB_CLIENT_SECRET**
+- **GITLAB_REDIRECT_URI** — callback on the **API** host, e.g. `http://localhost:3000/auth/gitlab/callback` (not the UI port).
+- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings`.
+- **GITLAB_BASE_URL** (optional) — self‑hosted GitLab base URL; omit for gitlab.com. Do not set to your harness app URL.
+
+Register the same callback under the GitLab app’s **Redirect URI**. Scopes include `read_repository`, `write_repository`, `api`. Flow uses CSRF + PKCE; refresh tokens refreshed when supported.
+
+### 3.6 GitHub OAuth (Sign in with GitHub)
+
+Configure the server:
+
+- **GITHUB_CLIENT_ID** — [GitHub OAuth App](https://github.com/settings/developers)
+- **GITHUB_CLIENT_SECRET**
+- **GITHUB_REDIRECT_URI** — e.g. `http://localhost:3000/auth/github/callback` (must match the OAuth app **Authorization callback URL** exactly).
+- **REDIRECT_AFTER_AUTH** — e.g. `http://localhost:5173/settings`.
+
+After authorization, the server stores the token on the identity and redirects to Settings (e.g. `?credentials=github_ok`).
+
+---
+
+*See also: [CLIENT_EXPERIENCE.md](CLIENT_EXPERIENCE.md) · [HOSTING.md §13 — Production checklist](HOSTING.md#13-production-and-first-run-checklist) · [TROUBLESHOOTING.md](TROUBLESHOOTING.md)*
+
+================================================================================
+FILE: plan/06-server-api-keys-bootstrap-complete.md
+================================================================================
+
+# 06 — Server: API key authentication and bootstrap
+
+**Status:** complete  
+**Dependencies:** 04, 05
+
+## Objective
+
+Implement **Bearer / X-API-Key** validation for protected routes and full **API key lifecycle** + **`POST /api-keys/bootstrap`** per [API_OVERVIEW §4c](../docs/API_OVERVIEW.md#4c-rest--api-keys-control-plane-auth) and [CLIENT_EXPERIENCE §7](../docs/CLIENT_EXPERIENCE.md#7-first-time-setup-web-ui).
+
+## Scope
+
+**In scope**
+
+- Middleware or extractor: reject missing/invalid key with standard error body §2.
+- `POST /api-keys`, `GET /api-keys` (pagination), `DELETE /api-keys/:id`.
+- Bootstrap: **201** when no keys exist; **403** when keys already exist; documented safety copy for operators ([API_OVERVIEW — Bootstrap safety](../docs/API_OVERVIEW.md#bootstrap-safety-operators-must-read-this)).
+- Optional env `API_KEY` bootstrap key if spec requires—align with HOSTING.
+
+**Out of scope**
+
+- Web UI (task 22)—server-only.
+
+## Spec references
+
+- [API_OVERVIEW §2, §4c](../docs/API_OVERVIEW.md)
+- [HOSTING §13–14](../docs/HOSTING.md#13-production-and-first-run-checklist)
+
+## Acceptance criteria
+
+- Integration tests: authenticated vs `401`; bootstrap only when empty DB keys.
+- OpenAPI + implementation synced; hashes stored, plaintext shown once on create.
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `cargo test` integration | CI |
+
+## Completed / Notes
+
+- Server: `auth::require_api_key` middleware on `/api-keys` (except bootstrap) and `/sessions` stubs; SHA-256 hex hashes in `api_keys`; `API_KEY` / `API_KEYS` env accepted for auth and disable bootstrap when set.
+- CLI: `api-key create | list | delete | bootstrap` with `--remote-harness-api-key` / env; bootstrap prints operator warnings on stderr.
+- OpenAPI: `bootstrapApiKey`, `createApiKey`, `listApiKeys`, `deleteApiKey`; session routes document **501** until implemented.
+- Integration tests: `crates/server/tests/api_keys_integration.rs`.
+
+================================================================================
+FILE: plan/README.md
+================================================================================
+
+# Implementation plan
+
+Tasks are **ordered**, **batchable** (related work grouped to reduce context switching), and each file lists **how to verify** the work immediately and how to **re-run** checks later.
+
+## How to use
+
+1. Work through tasks in numeric order unless a task’s **Dependencies** section says otherwise.
+2. After completing a task, rename the file: replace `-pending` with `-done` (e.g. `05-database-schema-and-migrations-done.md`) and optionally add a short “Completed / Notes” section at the bottom.
+3. If scope changes, update the task file and the **spec** in `docs/` per [AGENTS.md](../AGENTS.md).
+
+## Canonical specs
+
+| Topic | Document |
+|--------|-----------|
+| Features & priorities | [docs/PRODUCT.md](../docs/PRODUCT.md) |
+| REST + SSE + worker pull | [docs/API_OVERVIEW.md](../docs/API_OVERVIEW.md) |
+| UX (errors, SSE, bootstrap, retention) | [docs/CLIENT_EXPERIENCE.md](../docs/CLIENT_EXPERIENCE.md) |
+| Workers, reclaim, Git §9, logging | [docs/ARCHITECTURE.md](../docs/ARCHITECTURE.md) |
+| Worker HTTPS Git / libgit2 | [docs/GIT_CLONE_SPEC.md](../docs/GIT_CLONE_SPEC.md) |
+| CI expectations | [docs/CICD_DESIGN.md](../docs/CICD_DESIGN.md) |
+| Stack & repo layout | [docs/TECH_STACK.md](../docs/TECH_STACK.md) |
+| Crate boundaries & tests | [docs/IMPLEMENTATION_BOUNDARIES.md](../docs/IMPLEMENTATION_BOUNDARIES.md) |
+| Phases & §6a checkpoints | [docs/PROJECT_KICKOFF.md](../docs/PROJECT_KICKOFF.md) |
+
+## Task index
+
+| # | File | Summary |
+|---|------|---------|
+| 00 | [00-upfront-design-boundaries-complete.md](00-upfront-design-boundaries-complete.md) | Crate boundaries, config, test layers |
+| 01 | [01-monorepo-docker-tooling-complete.md](01-monorepo-docker-tooling-complete.md) | Workspace, Compose, images |
+| 02 | [02-api-types-openapi-baseline-complete.md](02-api-types-openapi-baseline-complete.md) | Shared types + OpenAPI artifact |
+| 03 | [03-ci-rust-web-openapi-complete.md](03-ci-rust-web-openapi-complete.md) | Pipeline + drift checks |
+| 04 | [04-server-health-config-complete.md](04-server-health-config-complete.md) | Health/ready/idle, config |
+| 05 | [05-database-migrations-complete.md](05-database-migrations-complete.md) | Schema, SQLx migrations |
+| 06 | [06-server-api-keys-bootstrap-complete.md](06-server-api-keys-bootstrap-complete.md) | Auth + bootstrap |
+| 07 | [07-server-identities-byol-pending.md](07-server-identities-byol-pending.md) | Identities CRUD/status/repos |
+| 08 | [08-server-oauth-git-pending.md](08-server-oauth-git-pending.md) | GitHub/GitLab OAuth |
+| 09 | [09-server-worker-registry-versioning-pending.md](09-server-worker-registry-versioning-pending.md) | Register, heartbeat, `worker_version_incompatible` |
+| 10 | [10-server-queue-reclaim-lease-pending.md](10-server-queue-reclaim-lease-pending.md) | Pull, reclaim, lease |
+| 11 | [11-server-sessions-chat-engine-pending.md](11-server-sessions-chat-engine-pending.md) | Sessions API + chat jobs |
+| 12 | [12-server-chat-history-cap-pending.md](12-server-chat-history-cap-pending.md) | `history_truncated`, caps |
+| 13 | [13-server-loop-workflows-pending.md](13-server-loop-workflows-pending.md) | `loop_n`, literal sentinel |
+| 14 | [14-server-logs-retention-pending.md](14-server-logs-retention-pending.md) | Ingest, pagination, purge |
+| 15 | [15-server-sse-streams-pending.md](15-server-sse-streams-pending.md) | Log + session event SSE |
+| 16 | [16-worker-http-lifecycle-pending.md](16-worker-http-lifecycle-pending.md) | Register, poll, heartbeat |
+| 17 | [17-worker-git-ops-spec-pending.md](17-worker-git-ops-spec-pending.md) | GIT_CLONE_SPEC compliance |
+| 18 | [18-worker-agent-cli-platform-pending.md](18-worker-agent-cli-platform-pending.md) | Claude/Cursor per OS |
+| 19 | [19-worker-task-execution-pending.md](19-worker-task-execution-pending.md) | Full job loop + complete/logs |
+| 20 | [20-cli-core-pending.md](20-cli-core-pending.md) | Config, human errors, no `--json` |
+| 21 | [21-cli-full-api-surface-pending.md](21-cli-full-api-surface-pending.md) | Sessions, workers, logs, credentials, keys |
+| 22 | [22-web-shell-bootstrap-pending.md](22-web-shell-bootstrap-pending.md) | SPA, URL/key, OAuth entry |
+| 23 | [23-web-sessions-workers-pending.md](23-web-sessions-workers-pending.md) | Lists + detail |
+| 24 | [24-web-logs-sse-attach-pending.md](24-web-logs-sse-attach-pending.md) | History + SSE + attach |
+| 25 | [25-web-ux-spec-checkpoints-pending.md](25-web-ux-spec-checkpoints-pending.md) | Outcomes, banner, retention copy |
+| 26 | [26-e2e-compose-smoke-pending.md](26-e2e-compose-smoke-pending.md) | Docker smoke / integration |
+| 27 | [27-phase2-personas-inboxes-design-pending.md](27-phase2-personas-inboxes-design-pending.md) | P1 design backlog |
+
+================================================================================
+VERIFICATION: cargo test --all-targets (last run) — all passed; DATABASE_URL present locally for DB tests.
+cargo clippy --all-targets --all-features -- -D warnings — passed after fixes.
+Web: npm run lint, typecheck, build — passed.
+No new migrations added.
+================================================================================
+END CONTEXT DUMP
+================================================================================
+

@@ -1,0 +1,175 @@
+=== USER REQUEST (verbatim) ===
+
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+=== DISCOVERY ===
+
+Glob `*.pending.md` under plan/ returned 0 files. Actual plan tasks use the suffix `-pending.md` (e.g. `07-server-identities-byol-pending.md`). Sorted by numeric prefix, the lowest pending task was **07-server-identities-byol-pending.md**.
+
+Renamed: `07-server-identities-byol-pending.md` → `07-server-identities-byol-processing.md` → (after work) `07-server-identities-byol-complete.md`.
+
+=== PLAN TASK 07 (full spec text after edits) ===
+
+# 07 — Server: identities (BYOL credentials)
+
+**Status:** complete  
+**Dependencies:** 06
+
+## Objective
+
+**Identity** APIs for Git + agent tokens: status endpoints without leaking secrets, PATCH merge behavior with session params, repo list for picker—**one vertical slice** so BYOL is coherent before OAuth ([API_OVERVIEW §4a](../docs/API_OVERVIEW.md#4a-rest--identities-byol-credentials)).
+
+## Scope
+
+**In scope**
+
+- `GET /identities/:id` — `has_git_token`, `has_agent_token` (exact shape per OpenAPI).
+- `GET /identities/:id/auth-status` — statuses from spec (`healthy`, `expiring_soon`, ...).
+- `PATCH /identities/:id` — partial token updates; **never** return token values.
+- `GET /identities/:id/repositories` — GitHub/GitLab list using stored token; map errors to 401/502 per spec.
+- Session create rejection when default identity missing tokens (once sessions exist—coordinate with 11).
+
+**Out of scope**
+
+- OAuth token refresh logic lives partly here but **browser redirects** are task 08.
+
+## Spec references
+
+- [PRODUCT — BYOL](../docs/PRODUCT.md#bring-your-own-licence-byol)
+- [CLIENT_EXPERIENCE §5](../docs/CLIENT_EXPERIENCE.md#5-credentials-and-byol)
+
+## Acceptance criteria
+
+- Integration tests with mocked GitHub/GitLab HTTP client or stub provider (avoid live network in default CI).
+- OpenAPI reflects all fields; no plaintext tokens in responses.
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `cargo test` + contract tests | CI |
+
+=== AGENTS.MD CONSTRAINTS (excerpt) ===
+
+- NEVER WRITE A STUB IMPLEMENTATION for the task — full implementation required.
+- Backend functionality must be exposed in CLI and Web.
+- Spec updates when behavior/docs change.
+- Never edit existing migrations; add new migrations for schema changes.
+
+=== IMPLEMENTATION SUMMARY (files created/changed) ===
+
+NEW:
+- crates/server/migrations/20250320110000_identity_oauth_metadata.sql
+  - ALTER TABLE identities ADD refresh_token_ciphertext BYTEA, token_expires_at TIMESTAMPTZ, git_provider TEXT, git_base_url TEXT
+- crates/api-types/src/identities.rs — IdentityCredentialsResponse, IdentityAuthStatusResponse, IdentityRepositoryItem, IdentityRepositoriesResponse, PatchIdentityRequest (double Option for merge PATCH)
+- crates/server/src/git_repos.rs — ResolvedGitProvider, GitRepoListError, GitRepoListClient (async_trait), LiveGitRepoListClient (reqwest → GitHub user/repos, GitLab projects), StubGitRepoListClient (Mutex result for tests)
+- crates/server/src/identities.rs — handlers get_identity, get_auth_status, list_repositories, patch_identity; compute_git_auth / compute_agent_auth; merge_token_field; resolve_git_provider; pub async fn session_identity_tokens_sufficient(pool, identity_id, params) for task 11
+
+MODIFIED:
+- crates/api-types/src/lib.rs — pub use identities::*
+- crates/server/Cargo.toml — async-trait, reqwest (json, rustls-tls), serde_json
+- crates/server/src/lib.rs — mod git_repos, identities; AppState { git_repo_client: Arc<dyn GitRepoListClient> }; AppState::new() Result (builds Live client); AppState::with_git_client for tests; routes under API key middleware; pub use GitRepoListError, session_identity_tokens_sufficient
+- crates/server/src/main.rs — AppState::new(...)
+- crates/server/tests/api_keys_integration.rs — imports; get_identity_without_auth_returns_401; identities_byol_flow_with_stubbed_git_client (bootstrap key, GET/PATCH/GET, auth-status, stub repos 200/401/502, 404 missing, empty PATCH 400, session_identity_tokens_sufficient assertion)
+- crates/server/tests/health_integration.rs — StubGitRepoListClient via with_git_client
+- crates/server/tests/migrations_integration.rs — assert 4 new identity columns exist
+- crates/server/tests/openapi_contract.rs — operationIds: getIdentity, getIdentityAuthStatus, listIdentityRepositories, patchIdentity
+- crates/server/openapi.yaml — tags identities; paths /identities/{id} get+patch, /auth-status, /repositories; schemas IdentityCredentials, IdentityAuthStatus, GitTokenStatus, IdentityRepositoryItem, IdentityRepositoriesResponse, PatchIdentityRequest
+- crates/cli/src/main.rs — Command::Identity + IdentityCommand (Get, AuthStatus, Repos, Patch); run_identity using blocking reqwest
+- web/src/App.tsx — Identities (BYOL) section: API key, identity id, GET credentials/auth/repos, PATCH tokens (password fields)
+- docs/API_OVERVIEW.md — auth-status example includes agent_token_status; bullet for agent_token_status
+- docs/GETTING_STARTED.md — CLI identity examples + note Web UI section
+- plan/README.md — row 07 link → 07-server-identities-byol-complete.md
+
+=== SESSION CREATE / TASK 11 COORDINATION ===
+
+POST /sessions remains 501 (not implemented). Spec asked for rejection when default identity missing tokens once sessions exist. Implemented **session_identity_tokens_sufficient** exported from server crate: merges DB identity ciphertext presence with non-empty `agent_token` / `git_token` strings in session `params` (JSON). Task 11 should call this and return 400 when false.
+
+=== AUTH-STATUS LOGIC ===
+
+- No git token → git_token_status not_configured
+- Git token, no token_expires_at → healthy (manual / no metadata)
+- Expiry > now+5m → healthy with message
+- Expiry within 5m → expiring_soon
+- Expired + refresh ciphertext present → expired_refreshable
+- Expired + no refresh + oauth_github|oauth_gitlab → expired_needs_reauth
+- Expired + no refresh + otherwise → unknown
+- agent_token_status: not_configured | healthy (no expiry metadata v1)
+
+=== REPOSITORIES ===
+
+- resolve_git_provider: oauth_github/oauth_gitlab from row → fixed provider; else require ?provider=github|gitlab
+- GitRepoListError::Unauthorized → HTTP 401; BadGateway → HTTP 502
+- Live client: GitHub GET api.github.com/user/repos; GitLab GET {base}/api/v4/projects?membership=true; PRIVATE-TOKEN header for GitLab
+
+=== PATCH SEMANTICS ===
+
+PatchIdentityRequest uses Option<Option<String>> per field: omitted = no change; JSON null = clear ciphertext; string = UTF-8 bytes in BYTEA (app-layer encryption still “later” per prior docs).
+
+=== COMMANDS RUN ===
+
+- cargo build — success (warnings fixed)
+- cargo test — all tests pass (api_types 4, api_keys_integration 8, health 3, migrations 1, openapi_contract 1); DATABASE_URL present in environment so DB tests including identities_byol_flow ran
+- cargo clippy --all-targets -- -D warnings — success
+- npm run build (web) — success
+
+=== OPENAPI operationId allowlist (final) ===
+
+bootstrapApiKey, createApiKey, createSession, deleteApiKey, getHealth, getHealthIdle, getIdentity, getIdentityAuthStatus, getReady, listApiKeys, listIdentityRepositories, listSessions, patchIdentity
+
+=== CLI SUBCOMMANDS ADDED ===
+
+remote-harness identity get <id>
+remote-harness identity auth-status <id>
+remote-harness identity repos <id> [--provider github|gitlab]
+remote-harness identity patch <id> [--agent-token] [--git-token] [--refresh-token] (also RH_AGENT_TOKEN, RH_GIT_TOKEN, RH_REFRESH_TOKEN env)
+
+=== IDENTITIES INTEGRATION TEST STEPS (identities_byol_flow_with_stubbed_git_client) ===
+
+1. Mutex API_KEY_DB_TEST_MUTEX
+2. migrate; DELETE api_keys; UPDATE identities reset default row oauth + tokens NULL
+3. AppState::with_git_client(..., Arc<StubGitRepoListClient>)
+4. POST bootstrap → plain_key
+5. GET /identities/default → has_git_token/has_agent_token false
+6. PATCH {"agent_token":"agent-secret","git_token":"git-secret"} → 204
+7. session_identity_tokens_sufficient(pool, "default", {}) → true
+8. GET /identities/default → both true
+9. GET auth-status → git healthy, agent_token_status Some("healthy")
+10. stub Ok(vec![one repo]) → GET repositories?provider=github → 200
+11. stub Err(Unauthorized) → 401
+12. stub Err(BadGateway) → 502
+13. GET /identities/does-not-exist → 404
+14. PATCH {} → 400
+15. cleanup DELETE api_keys
+
+=== FULL SOURCE: crates/server/migrations/20250320110000_identity_oauth_metadata.sql ===
+
+-- OAuth / token metadata for identities (BYOL + future OAuth task 08).
+-- Forward-only: append new migrations; do not edit this file after it has shipped.
+
+ALTER TABLE identities
+ADD COLUMN refresh_token_ciphertext BYTEA,
+ADD COLUMN token_expires_at TIMESTAMPTZ,
+ADD COLUMN git_provider TEXT,
+ADD COLUMN git_base_url TEXT;
+
+COMMENT ON COLUMN identities.git_provider IS 'manual | oauth_github | oauth_gitlab (API_OVERVIEW §4a / §4b)';
+
+=== REMAINING PENDING PLAN TASKS (numeric) ===
+
+08-server-oauth-git-pending.md, 09-…, 10-…, 11-…, 12-…, … through 27-… (not executed in this job).
+
+=== END CONTEXT DUMP ===

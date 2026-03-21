@@ -1,0 +1,131 @@
+================================================================================
+TASK RUNNER CONTEXT DUMP — plan 08-server-oauth-git (COMPLETE)
+Session: implementation of GitHub/GitLab OAuth vertical for Remote Harness.
+This log is a verbatim-style dump of task instructions, spec, decisions, file
+touches, and verification commands as requested (full assistant working context
+for this task, not an executive summary).
+================================================================================
+
+USER INSTRUCTIONS (TASK RUNNER)
+--------------------------------
+- Find next pending plan spec (numbered ascending); files use *-pending.md naming.
+- If no pending: output exactly `{ "event": "terminate", "reason": "NO MORE JOBS" }`.
+- Else: rename *.pending.md → *.processing.md, implement, test, build/lint,
+  migrations if any, rename → *.complete.md, dump context to logs/{task}.log
+  without summarizing (entire contents window).
+
+DISCOVERY
+---------
+- Glob `*.pending.md` matched 0 files; repo uses `08-server-oauth-git-pending.md`.
+- Next pending by number: **08-server-oauth-git**.
+
+PLAN SPEC (FULL TEXT) — plan/08-server-oauth-git-complete.md
+------------------------------------------------------------
+# 08 — Server: GitHub / GitLab OAuth (full vertical)
+
+**Status:** complete  
+**Dependencies:** 07
+
+## Objective
+Implement **complete OAuth** for Git credentials in **one task** to avoid scattered half-finished auth: CSRF cookie, PKCE S256, callbacks, token storage, refresh-before-use (API_OVERVIEW §4b).
+
+## Scope — In scope
+- GET /auth/github, /auth/github/callback, /auth/gitlab, /auth/gitlab/callback
+- HttpOnly SameSite=Lax cookie for state + PKCE verifier; validate on callback
+- Store git_token, refresh_token, token_expires_at, git_provider, git_base_url on identity
+- Proactive refresh when expired or within 5 minutes before use
+- 503 when OAuth not configured
+
+## Scope — Out of scope
+- Agent-vendor OAuth (not v1 per PRODUCT)
+
+## Acceptance criteria
+- Integration tests: CSRF failure, happy path with mocked token exchange (no secrets in repo)
+- Document required env vars in README or HOSTING pointer
+
+## Completed / Notes (appended at task end)
+- Implemented four OAuth routes with _rh_oauth cookie, PKCE S256, persistence
+- GET /identities/:id/repositories refreshes OAuth tokens when near expiry
+- PATCH /identities/:id resets OAuth metadata when git_token set/cleared manually
+- Integration tests: crates/server/tests/oauth_integration.rs (DATABASE_URL); wiremock 0.5
+- OpenAPI + README + HOSTING + CLI oauth subcommands + Web sign-in links
+
+AGENTS.MD COMPLIANCE
+--------------------
+- Backend OAuth exposed in CLI (`remote-harness oauth github|gitlab`) and Web (anchor links).
+- OpenAPI updated; operationId allowlist updated in openapi_contract.rs.
+- Spec/docs: README, HOSTING.md; plan README index row 08 → complete file.
+
+FILES CREATED
+-------------
+- crates/server/src/oauth.rs — full OAuth module (start/callback handlers, PKCE, token exchange/refresh, cookie helpers, unit tests)
+- crates/server/tests/oauth_integration.rs — DB + wiremock integration tests
+
+FILES MODIFIED
+--------------
+- crates/server/src/lib.rs — mod oauth; routes /auth/*; AppState.http_client; with_git_client_and_http; pub use OAuth config types
+- crates/server/src/config.rs — GithubOAuthSettings, GitlabOAuthSettings; redirect_after_auth; oauth_cookie_secure; github_oauth/gitlab_oauth Option<Arc<...>>; from_env parsers; test_without_db defaults
+- crates/server/src/identities.rs — IdentityRow pub(crate) + pub(crate) fields; list_repositories calls maybe_refresh_oauth_git_token; patch_identity updates git_provider/token_expires_at/git_base_url and resets on manual git_token
+- crates/server/Cargo.toml — url dependency; dev-deps url + wiremock 0.5 (0.6 failed on rustc 1.85 unstable let-chains in wiremock)
+- crates/server/openapi.yaml — tag oauth; paths /auth/github, /auth/github/callback, /auth/gitlab, /auth/gitlab/callback
+- crates/server/tests/openapi_contract.rs — operationIds: startGithubOauth, githubOauthCallback, startGitlabOauth, gitlabOauthCallback
+- crates/cli/src/main.rs — Command::Oauth, OauthCommand, run_oauth_url
+- crates/cli/Cargo.toml — url dependency
+- web/src/App.tsx — OAuth explanation + Sign in with GitHub / GitLab links using control plane base + identity_id
+- README.md — Git OAuth env table + pointer to HOSTING / GETTING_STARTED_WITH_DOCKER
+- docs/HOSTING.md — new §4b Git OAuth; former UI hosting § renumbered to 4c
+- plan/README.md — task 08 link → 08-server-oauth-git-complete.md
+
+IMPLEMENTATION DETAILS (oauth.rs)
+---------------------------------
+- Cookie name: _rh_oauth. Value: base64url(JSON { n: nonce, v: code_verifier }).
+- State query param: base64url(JSON { n: nonce, i: identity_id }).
+- CSRF: callback requires cookie.n == state.n.
+- GitHub authorize: scope `repo`. GitLab: read_repository write_repository.
+- GitHub token exchange/refresh: application/x-www-form-urlencoded + Accept: application/json
+- GitLab token exchange/refresh: JSON body to /oauth/token
+- Success redirect: REDIRECT_AFTER_AUTH + ?oauth_success=github|gitlab
+- Failure redirects: oauth_error=csrf|provider|token_exchange|missing_code|missing_state (+ optional truncated oauth_message)
+- maybe_refresh_oauth_git_token: only for git_provider oauth_github|oauth_gitlab; if token_expires_at within 5 min of now (or past), POST refresh; update DB and IdentityRow in memory
+- OAUTH_COOKIE_SECURE adds Secure flag to Set-Cookie
+- Incomplete env for one provider: from_env returns Err (fail fast) if partial triple (id/secret/uri) set
+
+CONFIG ENV VARS (also in README)
+---------------------------------
+- REDIRECT_AFTER_AUTH (required for OAuth start when provider configured)
+- GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, GITHUB_REDIRECT_URI (all or none)
+- GITLAB_CLIENT_ID, GITLAB_CLIENT_SECRET, GITLAB_REDIRECT_URI (all or none)
+- GITLAB_BASE_URL optional (default https://gitlab.com)
+- OAUTH_COOKIE_SECURE optional
+- GITHUB_OAUTH_AUTHORIZE_URL, GITHUB_OAUTH_ACCESS_TOKEN_URL, GITLAB_OAUTH_* optional overrides (tests / advanced)
+
+DATABASE / MIGRATIONS
+---------------------
+- No new migration: columns refresh_token_ciphertext, token_expires_at, git_provider, git_base_url already exist (20250320110000_identity_oauth_metadata.sql).
+
+TESTS RUN (RESULTS)
+-------------------
+- cargo test --workspace — PASS (oauth_integration requires DATABASE_URL; environment had it set)
+- cargo clippy --workspace --all-targets -- -D warnings — PASS (oauth_integration allows await_holding_lock like api_keys_integration)
+- ./scripts/ci-local.sh — OK (eslint, tsc, vite build, vitest none, rust fmt/clippy/test per script)
+- npm run build in web/ — OK
+
+WIREMOCK VERSION NOTE
+---------------------
+- wiremock 0.6 does not compile on toolchain 1.85 (unstable let_chains in dependency). Pinned wiremock = "0.5" in server dev-dependencies.
+
+CLI EXAMPLES
+------------
+- cargo run -p cli -- oauth github
+- cargo run -p cli -- oauth gitlab --identity-id my-id
+
+WEB UX
+------
+- Links navigate to ${VITE_CONTROL_PLANE_URL or default}/auth/github?identity_id=... (same tab; expected for OAuth).
+
+OPENAPI operationId ALLOWLIST (new)
+------------------------------------
+- startGithubOauth, githubOauthCallback, startGitlabOauth, gitlabOauthCallback
+
+END OF CONTEXT DUMP
+================================================================================

@@ -136,14 +136,13 @@ Add the callback URL in your GitHub OAuth app. After the user authorizes, the se
 
 ## 5. Agent CLI in the worker container
 
-The worker image **includes the Cursor Agent CLI** (installed at build time via the official install script). So when you run `docker compose up`, the worker can run tasks that use `agent_cli: "cursor"` without any extra setup.
+The **default** worker image (`Dockerfile.worker`) **bundles Cursor’s `agent`** (downloaded from Cursor’s official Linux package URL at build time). Compose passes **`CURSOR_AGENT_VERSION`** (default pinned in `docker-compose.yml`); rebuild the worker if that version is retired and the layer fails to download.
 
-- **No extra step needed** — create sessions and run workflows; the worker will find `/root/.local/bin/agent` and run it with the credentials you stored in Settings.
-- **Override with host binary (optional):** If you want the worker to use the agent binary from your host (e.g. a specific version), mount it and set the env var:
-  - **Linux host:** e.g. `-v /usr/local/bin/agent:/usr/local/bin/agent` and `CURSOR_AGENT_PATH: /usr/local/bin/agent` in the worker service.
-  - **macOS host:** The Mac `agent` binary is not runnable inside a Linux container. Use the in-image CLI (default) or run the worker natively on your Mac (not in Docker) so it uses your host’s agent.
+**Claude Code** is **not** in the image: add **`claude`** via a derived Dockerfile, bind-mount a **Linux** binary, or set **`CLAUDE_CLI_PATH`** / **`REMOTE_HARNESS_CLAUDE_BIN`**. The worker resolves binaries per `crates/worker/src/agent_cli/invoke.rs`.
 
-For Claude Code CLI instead of Cursor, set `CLAUDE_CLI_PATH` to the path of the `claude` binary inside the container (install it in your own image or mount it the same way).
+**Overrides:** **`CURSOR_AGENT_PATH`** / **`REMOTE_HARNESS_CURSOR_AGENT_BIN`** override the bundled Cursor binary. Do not mount a **macOS** `agent` into the Linux container.
+
+**Smoke / CI without a vendor CLI:** use **`docker-compose.smoke.yml`** or **`REMOTE_HARNESS_STUB_AGENT=1`** so tasks use the stub agent.
 
 ---
 

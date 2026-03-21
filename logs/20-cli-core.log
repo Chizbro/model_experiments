@@ -1,0 +1,1909 @@
+=== USER QUERY (verbatim) ===
+Find the next task spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the task spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the task spec
+- Implement and test the task, refer to other docs if you need to
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the task as complete by renaming to *.complete.md
+- Dump your context to `logs/{task}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+=== DISCOVERY ===
+Glob *.pending.md returned 0 files. Plan tasks use suffix *-pending.md (e.g. 20-cli-core-pending.md).
+Next ascending pending: plan/20-cli-core-pending.md
+Renamed to 20-cli-core-processing.md, then implemented, then replaced by 20-cli-core-complete.md (processing file deleted).
+
+=== TASK SPEC (plan/20) ===
+Objective: remote-harness clap binary with config load order, API client wrapper, stderr errors (HTTP status + error.code + error.message), no --json in v1.
+Scope: config show; env + ~/.config/remote-harness/config.yaml precedence; shared HTTP + SSE utilities for task 21.
+Acceptance: missing key non-zero + stderr; config precedence unit tests.
+
+=== COMMANDS RUN ===
+- mv plan/20-cli-core-pending.md -> processing -> deleted after complete
+- cargo test -p cli (iterative fixes)
+- cargo clippy -p cli --all-targets -- -D warnings
+- cargo build --workspace
+- cargo test --workspace
+
+=== MIGRATIONS ===
+None (no DB changes).
+
+=== DOCS TOUCHED ===
+- docs/GETTING_STARTED.md (config show tip)
+- plan/README.md (task 20 link -> complete)
+- plan/20-cli-core-complete.md (new)
+
+=== FULL FILE: crates/cli/src/lib.rs ===
+//! Shared CLI helpers: config resolution, HTTP error formatting, SSE parsing (task 20).
+
+pub mod config_file;
+pub mod http_util;
+pub mod resolved;
+pub mod sse;
+
+pub use config_file::{default_config_path, load_config_file, FileConfig};
+pub use http_util::format_http_api_error;
+pub use resolved::{resolve_api_key, resolve_control_plane_url, ConfigSource, ResolvedApiKey};
+pub use sse::{SseEvent, SseReader};
+
+=== FULL FILE: crates/cli/src/config_file.rs ===
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+
+/// Values read from `~/.config/remote-harness/config.yaml` (see docs/TECH_STACK.md §3).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct FileConfig {
+    #[serde(default)]
+    pub control_plane_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub wake_url: Option<String>,
+    #[serde(default)]
+    pub wake_script: Option<String>,
+}
+
+/// `~/.config/remote-harness/config.yaml` (under [`dirs::home_dir()`]).
+pub fn default_config_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("remote-harness")
+        .join("config.yaml")
+}
+
+/// Load YAML from `path` if the file exists; missing file → empty [`FileConfig`].
+pub fn load_config_file(path: &Path) -> Result<FileConfig, String> {
+    if !path.exists() {
+        return Ok(FileConfig::default());
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(FileConfig::default());
+    }
+    serde_yaml::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+=== FULL FILE: crates/cli/src/resolved.rs ===
+use crate::config_file::FileConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    CliFlag,
+    EnvRemoteHarnessUrl,
+    EnvControlPlaneUrl,
+    EnvRemoteHarnessApiKey,
+    EnvApiKey,
+    File,
+    Default,
+    Unset,
+}
+
+/// Resolved API key and its source (`Unset` when missing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedApiKey {
+    pub value: Option<String>,
+    pub source: ConfigSource,
+}
+
+/// Precedence: CLI flag → env (`REMOTE_HARNESS_URL`, then `CONTROL_PLANE_URL`) → file → default URL.
+pub fn resolve_control_plane_url(
+    cli: Option<&str>,
+    file: &FileConfig,
+) -> (String, ConfigSource) {
+    resolve_control_plane_url_with(
+        cli,
+        std::env::var("REMOTE_HARNESS_URL").ok().as_deref(),
+        std::env::var("CONTROL_PLANE_URL").ok().as_deref(),
+        file,
+    )
+}
+
+pub fn resolve_control_plane_url_with(
+    cli: Option<&str>,
+    env_remote_harness_url: Option<&str>,
+    env_control_plane_url: Option<&str>,
+    file: &FileConfig,
+) -> (String, ConfigSource) {
+    if let Some(s) = cli.map(str::trim).filter(|s| !s.is_empty()) {
+        return (s.to_string(), ConfigSource::CliFlag);
+    }
+    if let Some(s) = env_remote_harness_url.map(str::trim).filter(|s| !s.is_empty()) {
+        return (s.to_string(), ConfigSource::EnvRemoteHarnessUrl);
+    }
+    if let Some(s) = env_control_plane_url.map(str::trim).filter(|s| !s.is_empty()) {
+        return (s.to_string(), ConfigSource::EnvControlPlaneUrl);
+    }
+    if let Some(ref s) = file.control_plane_url {
+        let t = s.trim();
+        if !t.is_empty() {
+            return (t.to_string(), ConfigSource::File);
+        }
+    }
+    (
+        "http://127.0.0.1:3000".to_string(),
+        ConfigSource::Default,
+    )
+}
+
+/// Precedence: CLI flags (`--remote-harness-api-key`, `--api-key`) → env → file.
+pub fn resolve_api_key(
+    cli_remote_harness_api_key: Option<&str>,
+    cli_api_key: Option<&str>,
+    file: &FileConfig,
+) -> ResolvedApiKey {
+    resolve_api_key_with(
+        cli_remote_harness_api_key,
+        cli_api_key,
+        std::env::var("REMOTE_HARNESS_API_KEY").ok().as_deref(),
+        std::env::var("API_KEY").ok().as_deref(),
+        file,
+    )
+}
+
+pub fn resolve_api_key_with(
+    cli_remote_harness_api_key: Option<&str>,
+    cli_api_key: Option<&str>,
+    env_remote_harness_api_key: Option<&str>,
+    env_api_key: Option<&str>,
+    file: &FileConfig,
+) -> ResolvedApiKey {
+    if let Some(s) = cli_remote_harness_api_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ResolvedApiKey {
+            value: Some(s.to_string()),
+            source: ConfigSource::CliFlag,
+        };
+    }
+    if let Some(s) = cli_api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return ResolvedApiKey {
+            value: Some(s.to_string()),
+            source: ConfigSource::CliFlag,
+        };
+    }
+    if let Some(s) = env_remote_harness_api_key
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ResolvedApiKey {
+            value: Some(s.to_string()),
+            source: ConfigSource::EnvRemoteHarnessApiKey,
+        };
+    }
+    if let Some(s) = env_api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        return ResolvedApiKey {
+            value: Some(s.to_string()),
+            source: ConfigSource::EnvApiKey,
+        };
+    }
+    if let Some(ref s) = file.api_key {
+        let t = s.trim();
+        if !t.is_empty() {
+            return ResolvedApiKey {
+                value: Some(t.to_string()),
+                source: ConfigSource::File,
+            };
+        }
+    }
+    ResolvedApiKey {
+        value: None,
+        source: ConfigSource::Unset,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_cli_over_env_and_file() {
+        let file = FileConfig {
+            control_plane_url: Some("https://file.example".into()),
+            ..Default::default()
+        };
+        let (url, src) = resolve_control_plane_url_with(
+            Some("https://cli.example"),
+            Some("https://env-rh.example"),
+            Some("https://env-cp.example"),
+            &file,
+        );
+        assert_eq!(url, "https://cli.example");
+        assert_eq!(src, ConfigSource::CliFlag);
+    }
+
+    #[test]
+    fn url_remote_harness_url_before_control_plane_url() {
+        let file = FileConfig::default();
+        let (url, src) = resolve_control_plane_url_with(
+            None,
+            Some("https://rh.example"),
+            Some("https://cp.example"),
+            &file,
+        );
+        assert_eq!(url, "https://rh.example");
+        assert_eq!(src, ConfigSource::EnvRemoteHarnessUrl);
+    }
+
+    #[test]
+    fn url_file_when_env_empty() {
+        let file = FileConfig {
+            control_plane_url: Some("https://cfg.example".into()),
+            ..Default::default()
+        };
+        let (url, src) = resolve_control_plane_url_with(None, None, None, &file);
+        assert_eq!(url, "https://cfg.example");
+        assert_eq!(src, ConfigSource::File);
+    }
+
+    #[test]
+    fn url_default_when_nothing_set() {
+        let (url, src) = resolve_control_plane_url_with(None, None, None, &FileConfig::default());
+        assert_eq!(url, "http://127.0.0.1:3000");
+        assert_eq!(src, ConfigSource::Default);
+    }
+
+    #[test]
+    fn api_key_env_remote_harness_before_api_key() {
+        let file = FileConfig {
+            api_key: Some("file-key".into()),
+            ..Default::default()
+        };
+        let r = resolve_api_key_with(
+            None,
+            None,
+            Some("env-rh"),
+            Some("env-api"),
+            &file,
+        );
+        assert_eq!(r.value.as_deref(), Some("env-rh"));
+        assert_eq!(r.source, ConfigSource::EnvRemoteHarnessApiKey);
+    }
+
+    #[test]
+    fn api_key_file_when_env_missing() {
+        let file = FileConfig {
+            api_key: Some("k-from-file".into()),
+            ..Default::default()
+        };
+        let r = resolve_api_key_with(None, None, None, None, &file);
+        assert_eq!(r.value.as_deref(), Some("k-from-file"));
+        assert_eq!(r.source, ConfigSource::File);
+    }
+
+    #[test]
+    fn api_key_cli_primary_flag_wins_over_hidden() {
+        let file = FileConfig::default();
+        let r = resolve_api_key_with(Some("a"), Some("b"), None, None, &file);
+        assert_eq!(r.value.as_deref(), Some("a"));
+        assert_eq!(r.source, ConfigSource::CliFlag);
+    }
+}
+
+=== FULL FILE: crates/cli/src/http_util.rs ===
+use api_types::StandardErrorResponse;
+use reqwest::blocking::Response;
+
+/// Human-readable stderr line: HTTP status, `error.code`, `error.message` (see docs/CLIENT_EXPERIENCE.md §2.2).
+pub fn format_http_api_error(resp: Response, url: &str) -> String {
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if let Ok(err) = serde_json::from_str::<StandardErrorResponse>(&text) {
+        format!(
+            "HTTP {} {} — {}: {}",
+            status.as_u16(),
+            url,
+            err.error.code,
+            err.error.message
+        )
+    } else if text.is_empty() {
+        format!("HTTP {} {}", status.as_u16(), url)
+    } else {
+        format!("HTTP {} {} — {}", status.as_u16(), url, text)
+    }
+}
+
+=== FULL FILE: crates/cli/src/sse.rs ===
+//! Blocking SSE reader for shared use by `logs tail` / `attach` (plan task 21).
+
+use std::io::{BufRead, BufReader, Read};
+
+/// One SSE event after a dispatch (blank line separator).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event: Option<String>,
+    pub data: String,
+}
+
+/// Reads `text/event-stream` from a [`Read`] impl (e.g. [`reqwest::blocking::Response`]).
+pub struct SseReader<R: Read> {
+    inner: BufReader<R>,
+    line: String,
+}
+
+impl<R: Read> SseReader<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            inner: BufReader::new(reader),
+            line: String::new(),
+        }
+    }
+
+    /// Returns `Ok(None)` on EOF before the next event.
+    pub fn next_event(&mut self) -> std::io::Result<Option<SseEvent>> {
+        let mut event_name: Option<String> = None;
+        let mut data_parts: Vec<String> = Vec::new();
+
+        loop {
+            self.line.clear();
+            let n = self.inner.read_line(&mut self.line)?;
+            if n == 0 {
+                if event_name.is_none() && data_parts.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(SseEvent {
+                    event: event_name,
+                    data: join_data(&data_parts),
+                }));
+            }
+            let trimmed = self.line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if event_name.is_none() && data_parts.is_empty() {
+                    continue;
+                }
+                return Ok(Some(SseEvent {
+                    event: event_name,
+                    data: join_data(&data_parts),
+                }));
+            }
+            if trimmed.starts_with(':') {
+                continue;
+            }
+            if let Some(v) = trimmed.strip_prefix("event:") {
+                event_name = Some(v.trim().to_string());
+                continue;
+            }
+            if let Some(v) = trimmed.strip_prefix("data:") {
+                data_parts.push(
+                    v.strip_prefix(' ')
+                        .map(str::to_string)
+                        .unwrap_or_else(|| v.to_string()),
+                );
+                continue;
+            }
+            // id: / retry: ignored for v1 client helpers
+        }
+    }
+}
+
+fn join_data(parts: &[String]) -> String {
+    parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn parses_simple_event() {
+        let raw = "event: log\ndata: {\"x\":1}\n\n";
+        let mut r = SseReader::new(Cursor::new(raw.as_bytes()));
+        let ev = r.next_event().unwrap().unwrap();
+        assert_eq!(ev.event.as_deref(), Some("log"));
+        assert_eq!(ev.data, "{\"x\":1}");
+        assert!(r.next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn multiline_data_joins_with_newline() {
+        let raw = "data: hello\ndata: world\n\n";
+        let mut r = SseReader::new(Cursor::new(raw.as_bytes()));
+        let ev = r.next_event().unwrap().unwrap();
+        assert!(ev.event.is_none());
+        assert_eq!(ev.data, "hello\nworld");
+    }
+}
+
+=== FULL FILE: crates/cli/Cargo.toml ===
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote Harness CLI (commands land in plan tasks 20–21)"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "remote-harness"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3"
+
+=== FULL FILE: crates/cli/tests/missing_api_key.rs ===
+use std::path::PathBuf;
+use std::process::Command;
+
+fn remote_harness_bin() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    manifest
+        .join("../..")
+        .join("target")
+        .join(profile)
+        .join("remote-harness")
+}
+
+#[test]
+fn session_list_without_api_key_exits_nonzero_with_stderr_hint() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bin = remote_harness_bin();
+    let out = Command::new(&bin)
+        .args(["session", "list"])
+        .env("HOME", tmp.path())
+        .env_remove("REMOTE_HARNESS_API_KEY")
+        .env_remove("API_KEY")
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !out.status.success(),
+        "expected failure, stdout={}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("API key"),
+        "expected API key hint on stderr, got: {stderr:?}"
+    );
+}
+
+=== FULL FILE: crates/cli/src/main.rs ===
+use api_types::{
+    ApiKeyCreatedResponse, CreateApiKeyRequest, CreateSessionRequest, CreateSessionResponse,
+    HealthStatusResponse, IdentityAuthStatusResponse, IdentityCredentialsResponse,
+    IdentityRepositoriesResponse, IdleCheckResponse, LogEntry, Paginated, PaginatedApiKeySummaries,
+    PaginatedWorkerSummaries, PatchSessionRetainRequest, PullTaskRequest, RegisterWorkerRequest,
+    RegisterWorkerResponse, SendSessionInputRequest, SendSessionInputResponse,
+    SessionDetailResponse, SessionSummary, StandardErrorResponse, TaskCompleteRequest,
+    WorkerHeartbeatRequest, WorkerLogIngestItem, WorkerLogsAcceptedResponse, WorkerSummary,
+};
+use clap::{Parser, Subcommand};
+use cli::{
+    default_config_path, format_http_api_error, load_config_file, resolve_api_key,
+    resolve_control_plane_url, ConfigSource, FileConfig,
+};
+use serde_json::json;
+use std::path::Path;
+use std::process::ExitCode;
+
+/// Remote Harness CLI (full command surface in plan tasks 20–21).
+#[derive(Parser, Debug)]
+#[command(name = "remote-harness", version, about)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Control plane base URL (overrides env `REMOTE_HARNESS_URL` / `CONTROL_PLANE_URL`, then config file)
+    #[arg(long, global = true)]
+    control_plane_url: Option<String>,
+
+    /// API key (overrides env `REMOTE_HARNESS_API_KEY` / `API_KEY`, then ~/.config/remote-harness/config.yaml)
+    #[arg(long, global = true)]
+    remote_harness_api_key: Option<String>,
+
+    #[arg(long, global = true, hide = true)]
+    api_key: Option<String>,
+
+    /// Print shared crate version marker and exit
+    #[arg(long, default_value_t = false)]
+    version_marker: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Resolved URL, API key (masked), and value sources (CLI → env → config file)
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommand,
+    },
+    /// Call GET /health on the control plane
+    Health,
+    /// Call GET /ready on the control plane
+    Ready,
+    /// Call GET /health/idle on the control plane
+    Idle,
+    /// Create, list, revoke, or bootstrap control-plane API keys
+    ApiKey {
+        #[command(subcommand)]
+        action: ApiKeyCommand,
+    },
+    /// BYOL identity credentials (GET /identities, PATCH tokens, repo list)
+    Identity {
+        #[command(subcommand)]
+        action: IdentityCommand,
+    },
+    /// Print browser OAuth URLs for GitHub / GitLab (no API key; open in a browser)
+    Oauth {
+        #[command(subcommand)]
+        action: OauthCommand,
+    },
+    /// Worker registry: list, get, register, heartbeat, delete (see docs/API_OVERVIEW.md §5, §9)
+    Worker {
+        #[command(subcommand)]
+        action: WorkerCommand,
+    },
+    /// Sessions: create (chat, loop_n, loop_until_sentinel), list, get, retain, follow-up input (docs/API_OVERVIEW.md §4)
+    Session {
+        #[command(subcommand)]
+        action: SessionCommand,
+    },
+    /// Session log history, delete, and worker batch ingest (docs/API_OVERVIEW.md §6, §9)
+    Logs {
+        #[command(subcommand)]
+        action: LogsCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Print resolved settings and which source won for each value
+    Show,
+}
+
+#[derive(Subcommand, Debug)]
+enum OauthCommand {
+    /// GET /auth/github?identity_id=… — sign in with GitHub for git_token
+    Github {
+        #[arg(long, default_value = "default")]
+        identity_id: String,
+    },
+    /// GET /auth/gitlab?identity_id=… — sign in with GitLab for git_token
+    Gitlab {
+        #[arg(long, default_value = "default")]
+        identity_id: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiKeyCommand {
+    /// POST /api-keys (requires API key)
+    Create {
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// GET /api-keys (requires API key)
+    List {
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// DELETE /api-keys/:id (requires API key)
+    Delete { id: String },
+    /// POST /api-keys/bootstrap (no API key). Unauthenticated root access until keys exist.
+    Bootstrap {
+        #[arg(long)]
+        label: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkerCommand {
+    /// GET /workers
+    List {
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// GET /workers/:id
+    Get { id: String },
+    /// DELETE /workers/:id
+    Delete { id: String },
+    /// POST /workers/register
+    Register {
+        id: String,
+        #[arg(long)]
+        host: Option<String>,
+        /// Semver; defaults to compiled api-types version (match control plane major.minor)
+        #[arg(long)]
+        client_version: Option<String>,
+        /// JSON object for labels (default {})
+        #[arg(long)]
+        labels_json: Option<String>,
+    },
+    /// POST /workers/:id/heartbeat
+    Heartbeat {
+        id: String,
+        #[arg(long, default_value = "idle")]
+        status: String,
+        #[arg(long)]
+        current_job_id: Option<String>,
+    },
+    /// POST /workers/tasks/pull
+    Pull {
+        /// Worker id (must match a registered worker)
+        #[arg(long)]
+        worker_id: String,
+    },
+    /// POST /workers/tasks/:id/complete
+    Complete {
+        /// Task id (job UUID from pull response)
+        task_id: String,
+        #[arg(long, default_value = "success")]
+        status: String,
+        #[arg(long)]
+        worker_id: Option<String>,
+        #[arg(long)]
+        error_message: Option<String>,
+        /// For workflow loop_until_sentinel: worker detected params.sentinel in output (v1 case-sensitive)
+        #[arg(long)]
+        sentinel_reached: Option<bool>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SessionCommand {
+    /// POST /sessions
+    Create {
+        repo_url: String,
+        #[arg(long, default_value = "chat")]
+        workflow: String,
+        #[arg(long)]
+        git_ref: Option<String>,
+        #[arg(long, default_value = "default")]
+        identity_id: String,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        agent_cli: String,
+        #[arg(long)]
+        retain_forever: Option<bool>,
+        /// loop_n: repeat count (required when workflow is loop_n)
+        #[arg(long)]
+        loop_n: Option<u32>,
+        /// loop_until_sentinel: literal substring to match in agent output (required for that workflow)
+        #[arg(long)]
+        sentinel: Option<String>,
+    },
+    /// GET /sessions
+    List {
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// GET /sessions/:id
+    Get { id: String },
+    /// PATCH /sessions/:id
+    Patch {
+        id: String,
+        #[arg(long)]
+        retain_forever: bool,
+    },
+    /// PATCH /sessions/:id/jobs/:job_id
+    PatchJob {
+        session_id: String,
+        job_id: String,
+        #[arg(long)]
+        retain_forever: bool,
+    },
+    /// POST /sessions/:id/input
+    Input { id: String, message: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum LogsCommand {
+    /// GET /sessions/:id/logs (paginated history)
+    List {
+        session_id: String,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        job_id: Option<String>,
+        #[arg(long)]
+        level: Option<String>,
+        #[arg(long)]
+        last: Option<u32>,
+    },
+    /// DELETE /sessions/:id/logs (optional --job-id)
+    Delete {
+        session_id: String,
+        #[arg(long)]
+        job_id: Option<String>,
+    },
+    /// POST /workers/tasks/:id/logs — JSON array of entries (see API_OVERVIEW §9)
+    Send {
+        task_id: String,
+        /// JSON array, e.g. '[{"timestamp":"2025-01-01T00:00:00Z","level":"info","message":"hi","source":"worker"}]'
+        #[arg(long)]
+        json: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum IdentityCommand {
+    /// GET /identities/:id — has_git_token / has_agent_token flags only
+    Get { id: String },
+    /// GET /identities/:id/auth-status
+    AuthStatus { id: String },
+    /// GET /identities/:id/repositories (use --provider for manual PAT identities)
+    Repos {
+        id: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// PATCH /identities/:id — set tokens from flags or RH_* env vars (secrets not echoed back)
+    Patch {
+        id: String,
+        #[arg(long, env = "RH_AGENT_TOKEN")]
+        agent_token: Option<String>,
+        #[arg(long, env = "RH_GIT_TOKEN")]
+        git_token: Option<String>,
+        #[arg(long, env = "RH_REFRESH_TOKEN")]
+        refresh_token: Option<String>,
+    },
+}
+
+fn main() -> ExitCode {
+    let args = Args::parse();
+    if args.version_marker {
+        println!("api-types {}", api_types::CRATE_VERSION);
+        return ExitCode::SUCCESS;
+    }
+
+    let config_path = default_config_path();
+    let file_cfg = match load_config_file(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let base = resolve_control_plane_url(args.control_plane_url.as_deref(), &file_cfg).0;
+    let api_key_opt = resolve_api_key(
+        args.remote_harness_api_key.as_deref(),
+        args.api_key.as_deref(),
+        &file_cfg,
+    )
+    .value;
+
+    match args.command {
+        Some(Command::Config {
+            action: ConfigCommand::Show,
+        }) => {
+            run_config_show(&args, &file_cfg, &config_path);
+            ExitCode::SUCCESS
+        }
+        Some(Command::Health) => match run_health(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Ready) => match run_ready(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Idle) => match run_idle(&base) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::ApiKey { ref action }) => match run_api_key(&base, api_key_opt.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Identity { ref action }) => match run_identity(&base, api_key_opt.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Oauth { ref action }) => {
+            run_oauth_url(&base, action);
+            ExitCode::SUCCESS
+        }
+        Some(Command::Worker { ref action }) => match run_worker(&base, api_key_opt.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Session { ref action }) => match run_session(&base, api_key_opt.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Logs { ref action }) => match run_logs(&base, api_key_opt.as_deref(), action) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        None => {
+            println!(
+                "remote-harness CLI — see docs/GETTING_STARTED.md (api-types {})",
+                api_types::CRATE_VERSION
+            );
+            println!("Tip: cargo run -p cli -- config show");
+            println!("Tip: cargo run -p cli -- health   # GET /health");
+            println!("Tip: cargo run -p cli -- ready    # GET /ready");
+            println!("Tip: cargo run -p cli -- idle     # GET /health/idle");
+            println!("Tip: cargo run -p cli -- api-key bootstrap");
+            println!("Tip: cargo run -p cli -- identity get default");
+            println!("Tip: cargo run -p cli -- worker list");
+            println!("Tip: cargo run -p cli -- worker pull --worker-id my-worker");
+            println!(
+                "Tip: cargo run -p cli -- session create https://github.com/o/r.git --prompt \"Hi\" --agent-cli cursor"
+            );
+            println!("Tip: cargo run -p cli -- logs list <session_id> --last 50");
+            println!("Tip: cargo run -p cli -- oauth github   # print GitHub OAuth URL");
+            println!("Tip: cargo run -p cli -- --version-marker");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_oauth_url(base: &str, action: &OauthCommand) {
+    let base = base.trim_end_matches('/');
+    let (path, id) = match action {
+        OauthCommand::Github { identity_id } => ("/auth/github", identity_id.trim()),
+        OauthCommand::Gitlab { identity_id } => ("/auth/gitlab", identity_id.trim()),
+    };
+    let id = if id.is_empty() { "default" } else { id };
+    let q = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("identity_id", id)
+        .finish();
+    println!("{base}{path}?{q}");
+    eprintln!("Open this URL in a browser (control plane must have OAuth env configured). See README § Git OAuth.");
+}
+
+fn source_label(src: ConfigSource) -> &'static str {
+    match src {
+        ConfigSource::CliFlag => "CLI flag",
+        ConfigSource::EnvRemoteHarnessUrl => "env REMOTE_HARNESS_URL",
+        ConfigSource::EnvControlPlaneUrl => "env CONTROL_PLANE_URL",
+        ConfigSource::EnvRemoteHarnessApiKey => "env REMOTE_HARNESS_API_KEY",
+        ConfigSource::EnvApiKey => "env API_KEY",
+        ConfigSource::File => "config file",
+        ConfigSource::Default => "default",
+        ConfigSource::Unset => "(unset)",
+    }
+}
+
+fn mask_api_key(k: &str) -> String {
+    if k.len() <= 4 {
+        "****".to_string()
+    } else {
+        format!("****{}", &k[k.len() - 4..])
+    }
+}
+
+fn run_config_show(args: &Args, file_cfg: &FileConfig, config_path: &Path) {
+    let (url, url_src) = resolve_control_plane_url(args.control_plane_url.as_deref(), file_cfg);
+    let key_res = resolve_api_key(
+        args.remote_harness_api_key.as_deref(),
+        args.api_key.as_deref(),
+        file_cfg,
+    );
+    println!("config file path: {}", config_path.display());
+    println!(
+        "  exists: {}",
+        if config_path.exists() { "yes" } else { "no" }
+    );
+    println!();
+    println!("control_plane_url: {url}");
+    println!("  source: {}", source_label(url_src));
+    println!();
+    match &key_res.value {
+        Some(k) => {
+            println!("api_key: {}", mask_api_key(k));
+            println!("  source: {}", source_label(key_res.source));
+        }
+        None => {
+            println!("api_key: (unset)");
+            println!("  source: {}", source_label(key_res.source));
+        }
+    }
+}
+
+fn run_logs(base: &str, api_key: Option<&str>, action: &LogsCommand) -> Result<(), String> {
+    let key = api_key.ok_or_else(|| {
+        "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+            .to_string()
+    })?;
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        LogsCommand::List {
+            session_id,
+            limit,
+            cursor,
+            job_id,
+            level,
+            last,
+        } => {
+            let sid = session_id.trim();
+            let mut url = reqwest::Url::parse(&format!("{base}/sessions/{sid}/logs"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                if let Some(l) = limit {
+                    pairs.append_pair("limit", &l.to_string());
+                }
+                if let Some(ref c) = cursor {
+                    pairs.append_pair("cursor", c);
+                }
+                if let Some(ref j) = job_id {
+                    pairs.append_pair("job_id", j.trim());
+                }
+                if let Some(ref lv) = level {
+                    pairs.append_pair("level", lv.trim());
+                }
+                if let Some(n) = last {
+                    pairs.append_pair("last", &n.to_string());
+                }
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: Paginated<LogEntry> =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                for e in &body.items {
+                    println!(
+                        "{}  {}  {}  {:?}  {}",
+                        e.timestamp, e.level, e.source, e.job_id, e.message
+                    );
+                }
+                if let Some(c) = body.next_cursor {
+                    println!("next_cursor: {c}");
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url_str))
+        }
+        LogsCommand::Delete { session_id, job_id } => {
+            let sid = session_id.trim();
+            let mut url = reqwest::Url::parse(&format!("{base}/sessions/{sid}/logs"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            if let Some(ref j) = job_id {
+                url.query_pairs_mut().append_pair("job_id", j.trim());
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .delete(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("logs deleted");
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url_str))
+        }
+        LogsCommand::Send { task_id, json } => {
+            let batch: Vec<WorkerLogIngestItem> = serde_json::from_str(json.trim())
+                .map_err(|e| format!("--json must be a JSON array of log entries: {e}"))?;
+            let tid = task_id.trim();
+            let url = format!("{base}/workers/tasks/{tid}/logs");
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&batch)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::ACCEPTED {
+                let out: WorkerLogsAcceptedResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("accepted: {}", out.accepted);
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+    }
+}
+
+fn run_session(base: &str, api_key: Option<&str>, action: &SessionCommand) -> Result<(), String> {
+    let key = api_key.ok_or_else(|| {
+        "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+            .to_string()
+    })?;
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        SessionCommand::Create {
+            repo_url,
+            workflow,
+            git_ref,
+            identity_id,
+            prompt,
+            agent_cli,
+            retain_forever,
+            loop_n,
+            sentinel,
+        } => {
+            let ident = identity_id.trim();
+            let ident_opt = if ident.is_empty() || ident == "default" {
+                None
+            } else {
+                Some(ident.to_string())
+            };
+            let wf = workflow.trim();
+            let params = match wf {
+                "loop_n" => {
+                    let n = loop_n.ok_or_else(|| {
+                        "--loop-n is required when workflow is loop_n".to_string()
+                    })?;
+                    if n < 1 {
+                        return Err("--loop-n must be >= 1".to_string());
+                    }
+                    json!({
+                        "prompt": prompt.trim(),
+                        "agent_cli": agent_cli.trim(),
+                        "n": n,
+                    })
+                }
+                "loop_until_sentinel" => {
+                    let s = sentinel
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(|| {
+                            "--sentinel is required when workflow is loop_until_sentinel"
+                                .to_string()
+                        })?;
+                    json!({
+                        "prompt": prompt.trim(),
+                        "agent_cli": agent_cli.trim(),
+                        "sentinel": s,
+                    })
+                }
+                "chat" => {
+                    if loop_n.is_some() {
+                        return Err("do not pass --loop-n with workflow chat".to_string());
+                    }
+                    if sentinel.is_some() {
+                        return Err("do not pass --sentinel with workflow chat".to_string());
+                    }
+                    json!({
+                        "prompt": prompt.trim(),
+                        "agent_cli": agent_cli.trim(),
+                    })
+                }
+                _ => {
+                    return Err(format!(
+                        "unsupported workflow {wf:?} (use chat, loop_n, or loop_until_sentinel)"
+                    ));
+                }
+            };
+            let body = CreateSessionRequest {
+                repo_url: repo_url.trim().to_string(),
+                git_ref: git_ref
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                workflow: wf.to_string(),
+                params,
+                persona_id: None,
+                identity_id: ident_opt,
+                retain_forever: *retain_forever,
+            };
+            let url = format!("{base}/sessions");
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::CREATED {
+                let out: CreateSessionResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("session_id: {}", out.session_id);
+                println!("status: {}", out.status);
+                if let Some(u) = out.web_url {
+                    println!("web_url: {u}");
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        SessionCommand::List {
+            limit,
+            cursor,
+            status,
+        } => {
+            let mut url = reqwest::Url::parse(&format!("{base}/sessions"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                if let Some(l) = limit {
+                    pairs.append_pair("limit", &l.to_string());
+                }
+                if let Some(ref c) = cursor {
+                    pairs.append_pair("cursor", c);
+                }
+                if let Some(ref s) = status {
+                    pairs.append_pair("status", s.trim());
+                }
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: Paginated<SessionSummary> =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                for s in &body.items {
+                    println!(
+                        "{}  {}  {}  {}  {}",
+                        s.session_id, s.repo_url, s.git_ref, s.workflow, s.status
+                    );
+                    println!("    created_at: {}", s.created_at);
+                }
+                if let Some(c) = body.next_cursor {
+                    println!("next_cursor: {c}");
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url_str))
+        }
+        SessionCommand::Get { id } => {
+            let url = format!("{base}/sessions/{}", id.trim());
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: SessionDetailResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("session_id: {}", body.session_id);
+                println!("status: {}", body.status);
+                println!("workflow: {}", body.workflow);
+                println!("repo_url: {}", body.repo_url);
+                println!("ref: {}", body.git_ref);
+                println!(
+                    "params: {}",
+                    serde_json::to_string(&body.params).unwrap_or_default()
+                );
+                println!("created_at: {}", body.created_at);
+                println!("updated_at: {}", body.updated_at);
+                for j in &body.jobs {
+                    println!(
+                        "  job {}  status={}  created={}",
+                        j.job_id, j.status, j.created_at
+                    );
+                    if let Some(ref e) = j.error_message {
+                        println!("    error_message: {e}");
+                    }
+                    if let Some(ref p) = j.pull_request_url {
+                        println!("    pull_request_url: {p}");
+                    }
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        SessionCommand::Patch { id, retain_forever } => {
+            let url = format!("{base}/sessions/{}", id.trim());
+            let body = PatchSessionRetainRequest {
+                retain_forever: *retain_forever,
+            };
+            let resp = client
+                .patch(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("session {} retain_forever updated", id.trim());
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        SessionCommand::PatchJob {
+            session_id,
+            job_id,
+            retain_forever,
+        } => {
+            let url = format!(
+                "{base}/sessions/{}/jobs/{}",
+                session_id.trim(),
+                job_id.trim()
+            );
+            let body = PatchSessionRetainRequest {
+                retain_forever: *retain_forever,
+            };
+            let resp = client
+                .patch(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("job {} retain_forever updated", job_id.trim());
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        SessionCommand::Input { id, message } => {
+            let url = format!("{base}/sessions/{}/input", id.trim());
+            let body = SendSessionInputRequest {
+                message: message.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::ACCEPTED {
+                let out: SendSessionInputResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("accepted: {}", out.accepted);
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+    }
+}
+
+fn run_worker(base: &str, api_key: Option<&str>, action: &WorkerCommand) -> Result<(), String> {
+    let key = api_key.ok_or_else(|| {
+        "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+            .to_string()
+    })?;
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        WorkerCommand::List { limit, cursor } => {
+            let mut url = reqwest::Url::parse(&format!("{base}/workers"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                if let Some(l) = limit {
+                    pairs.append_pair("limit", &l.to_string());
+                }
+                if let Some(ref c) = cursor {
+                    pairs.append_pair("cursor", c);
+                }
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: PaginatedWorkerSummaries =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                for w in &body.items {
+                    let host = w.host.as_deref().unwrap_or("-");
+                    let seen = w.last_seen_at.as_deref().unwrap_or("-");
+                    println!(
+                        "{}  status={}  host={}  last_seen={}",
+                        w.worker_id, w.status, host, seen
+                    );
+                }
+                if let Some(c) = body.next_cursor {
+                    println!("next_cursor: {c}");
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url_str))
+        }
+        WorkerCommand::Get { id } => {
+            let url = format!("{base}/workers/{}", id.trim());
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: WorkerSummary =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("worker_id: {}", body.worker_id);
+                println!("status: {}", body.status);
+                println!("host: {:?}", body.host);
+                println!("last_seen_at: {:?}", body.last_seen_at);
+                println!(
+                    "labels: {}",
+                    serde_json::to_string(&body.labels).unwrap_or_default()
+                );
+                if let Some(ref c) = body.capabilities {
+                    println!("capabilities: {}", c.join(", "));
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        WorkerCommand::Delete { id } => {
+            let url = format!("{base}/workers/{}", id.trim());
+            let resp = client
+                .delete(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("deleted worker {}", id.trim());
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        WorkerCommand::Register {
+            id,
+            host,
+            client_version,
+            labels_json,
+        } => {
+            let labels: serde_json::Value = match labels_json.as_deref() {
+                None | Some("") => serde_json::json!({}),
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|e| format!("labels_json must be valid JSON object: {e}"))?,
+            };
+            if !labels.is_object() {
+                return Err("labels_json must be a JSON object".to_string());
+            }
+            let body = RegisterWorkerRequest {
+                id: id.trim().to_string(),
+                host: host
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                labels,
+                capabilities: vec![],
+                client_version: Some(
+                    client_version
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| api_types::CRATE_VERSION.to_string()),
+                ),
+            };
+            let url = format!("{base}/workers/register");
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::CREATED {
+                let out: RegisterWorkerResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("registered worker_id: {}", out.worker_id);
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        WorkerCommand::Heartbeat {
+            id,
+            status,
+            current_job_id,
+        } => {
+            let url = format!("{base}/workers/{}/heartbeat", id.trim());
+            let body = WorkerHeartbeatRequest {
+                status: status.clone(),
+                current_job_id: current_job_id.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                println!("heartbeat ok ({})", id.trim());
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        WorkerCommand::Pull { worker_id } => {
+            let url = format!("{base}/workers/tasks/pull");
+            let body = PullTaskRequest {
+                worker_id: Some(worker_id.trim().to_string()),
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::NO_CONTENT {
+                println!("no task (204)");
+                return Ok(());
+            }
+            if status == reqwest::StatusCode::OK {
+                let text = resp.text().map_err(|e| format!("read body: {e}"))?;
+                println!("{text}");
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        WorkerCommand::Complete {
+            task_id,
+            status,
+            worker_id,
+            error_message,
+            sentinel_reached,
+        } => {
+            let tid = task_id.trim();
+            let url = format!("{base}/workers/tasks/{tid}/complete");
+            let body = TaskCompleteRequest {
+                status: status.trim().to_string(),
+                worker_id: worker_id
+                    .as_ref()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                branch: None,
+                commit_ref: None,
+                mr_title: None,
+                mr_description: None,
+                error_message: error_message.clone(),
+                output: None,
+                sentinel_reached: *sentinel_reached,
+                assistant_reply: None,
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                println!("task complete ok");
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+    }
+}
+
+fn run_identity(base: &str, api_key: Option<&str>, action: &IdentityCommand) -> Result<(), String> {
+    let key = api_key.ok_or_else(|| {
+        "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+            .to_string()
+    })?;
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        IdentityCommand::Get { id } => {
+            let url = format!("{base}/identities/{}", id.trim());
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: IdentityCredentialsResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("has_git_token: {}", body.has_git_token);
+                println!("has_agent_token: {}", body.has_agent_token);
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        IdentityCommand::AuthStatus { id } => {
+            let url = format!("{base}/identities/{}/auth-status", id.trim());
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: IdentityAuthStatusResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("git_token_status: {}", body.git_token_status);
+                if let Some(ref p) = body.git_provider {
+                    println!("git_provider: {p}");
+                }
+                if let Some(ref t) = body.token_expires_at {
+                    println!("token_expires_at: {t}");
+                }
+                println!("message: {}", body.message);
+                if let Some(ref a) = body.agent_token_status {
+                    println!("agent_token_status: {a}");
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+        IdentityCommand::Repos { id, provider } => {
+            let mut url =
+                reqwest::Url::parse(&format!("{base}/identities/{}/repositories", id.trim()))
+                    .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            if let Some(ref p) = provider {
+                url.query_pairs_mut().append_pair("provider", p.trim());
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: IdentityRepositoriesResponse =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                println!("provider: {}", body.provider);
+                for r in &body.items {
+                    println!("{}  {}", r.full_name, r.clone_url);
+                }
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url_str))
+        }
+        IdentityCommand::Patch {
+            id,
+            agent_token,
+            git_token,
+            refresh_token,
+        } => {
+            let mut obj = serde_json::Map::new();
+            if let Some(t) = agent_token {
+                obj.insert(
+                    "agent_token".to_string(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            if let Some(t) = git_token {
+                obj.insert(
+                    "git_token".to_string(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            if let Some(t) = refresh_token {
+                obj.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(t.clone()),
+                );
+            }
+            if obj.is_empty() {
+                return Err(
+                    "Provide at least one of --agent-token, --git-token, --refresh-token (or RH_* env)"
+                        .to_string(),
+                );
+            }
+            let url = format!("{base}/identities/{}", id.trim());
+            let resp = client
+                .patch(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .json(&serde_json::Value::Object(obj))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("identity {} updated", id.trim());
+                return Ok(());
+            }
+            Err(format_http_api_error(resp, &url))
+        }
+    }
+}
+
+fn run_api_key(base: &str, api_key: Option<&str>, action: &ApiKeyCommand) -> Result<(), String> {
+    let client = reqwest::blocking::Client::new();
+    let base = base.trim_end_matches('/');
+
+    match action {
+        ApiKeyCommand::Bootstrap { label } => {
+            eprintln!(
+                "WARNING: POST /api-keys/bootstrap is unauthenticated root-equivalent until a key exists."
+            );
+            eprintln!(
+                "Do not expose the control plane to the internet until bootstrap returns 403. See docs/API_OVERVIEW.md — Bootstrap safety."
+            );
+            let url = format!("{base}/api-keys/bootstrap");
+            let body = CreateApiKeyRequest {
+                label: label.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            handle_api_key_created(resp, &url)
+        }
+        ApiKeyCommand::Create { label } => {
+            let key = api_key.ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+                    .to_string()
+            })?;
+            let url = format!("{base}/api-keys");
+            let body = CreateApiKeyRequest {
+                label: label.clone(),
+            };
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .json(&body)
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            handle_api_key_created(resp, &url)
+        }
+        ApiKeyCommand::List { limit, cursor } => {
+            let key = api_key.ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+                    .to_string()
+            })?;
+            let mut url = reqwest::Url::parse(&format!("{base}/api-keys"))
+                .map_err(|e| format!("invalid control plane URL: {e}"))?;
+            {
+                let mut pairs = url.query_pairs_mut();
+                if let Some(l) = limit {
+                    pairs.append_pair("limit", &l.to_string());
+                }
+                if let Some(ref c) = cursor {
+                    pairs.append_pair("cursor", c);
+                }
+            }
+            let url_str = url.to_string();
+            let resp = client
+                .get(url_str.as_str())
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::OK {
+                let body: PaginatedApiKeySummaries =
+                    resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+                for item in &body.items {
+                    let label = item.label.as_deref().unwrap_or("(no label)");
+                    println!("{}  {}  {}", item.id, label, item.created_at);
+                }
+                if let Some(c) = body.next_cursor {
+                    println!("next_cursor: {c}");
+                }
+                Ok(())
+            } else {
+                Err(format_http_api_error(resp, &url_str))
+            }
+        }
+        ApiKeyCommand::Delete { id } => {
+            let key = api_key.ok_or_else(|| {
+                "API key required: set REMOTE_HARNESS_API_KEY or API_KEY, pass --remote-harness-api-key, or set api_key in ~/.config/remote-harness/config.yaml"
+                    .to_string()
+            })?;
+            let url = format!("{base}/api-keys/{}", id.trim());
+            let resp = client
+                .delete(&url)
+                .header("Authorization", format!("Bearer {key}"))
+                .send()
+                .map_err(|e| format!("request failed: {e}"))?;
+            if resp.status() == reqwest::StatusCode::NO_CONTENT {
+                println!("revoked API key {}", id.trim());
+                Ok(())
+            } else {
+                Err(format_http_api_error(resp, &url))
+            }
+        }
+    }
+}
+
+fn handle_api_key_created(resp: reqwest::blocking::Response, url: &str) -> Result<(), String> {
+    if resp.status() == reqwest::StatusCode::CREATED {
+        let body: ApiKeyCreatedResponse =
+            resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        println!("id:         {}", body.id);
+        println!("label:      {:?}", body.label);
+        println!("created_at: {}", body.created_at);
+        println!();
+        println!("API key (store this; shown once):");
+        println!("{}", body.key);
+        return Ok(());
+    }
+    Err(format_http_api_error(resp, url))
+}
+
+fn run_health(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!(
+            "HTTP {} from {} — expected 200 OK",
+            status.as_u16(),
+            url
+        ));
+    }
+    let body: HealthStatusResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+    if body.status != "ok" {
+        return Err(format!(
+            "unexpected health payload: status={:?} (expected \"ok\")",
+            body.status
+        ));
+    }
+    println!("control plane healthy ({url})");
+    Ok(())
+}
+
+fn run_ready(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/ready");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::OK {
+        let body: HealthStatusResponse =
+            resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        if body.status != "ok" {
+            return Err(format!(
+                "unexpected ready payload: status={:?} (expected \"ok\")",
+                body.status
+            ));
+        }
+        println!("control plane ready ({url})");
+        return Ok(());
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let body: StandardErrorResponse = resp
+            .json()
+            .map_err(|e| format!("invalid JSON error body: {e}"))?;
+        return Err(format!(
+            "not ready (HTTP 503): {} — {}",
+            body.error.code, body.error.message
+        ));
+    }
+    Err(format!(
+        "HTTP {} from {} — expected 200 OK or 503",
+        status.as_u16(),
+        url
+    ))
+}
+
+fn run_idle(base: &str) -> Result<(), String> {
+    let base = base.trim_end_matches('/');
+    let url = format!("{base}/health/idle");
+    let resp = reqwest::blocking::get(&url).map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::OK {
+        let body: IdleCheckResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        if body.idle {
+            println!("control plane idle (OK to sleep) ({url})");
+            return Ok(());
+        }
+        let n = body
+            .pending_or_assigned_jobs
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return Err(format!("not idle: pending_or_assigned_jobs={n} ({url})"));
+    }
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        let body: IdleCheckResponse = resp.json().map_err(|e| format!("invalid JSON body: {e}"))?;
+        let n = body
+            .pending_or_assigned_jobs
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return Err(format!(
+            "not idle (HTTP 503): pending_or_assigned_jobs={n} ({url})"
+        ));
+    }
+    Err(format!(
+        "HTTP {} from {} — expected 200 or 503",
+        status.as_u16(),
+        url
+    ))
+}
+
+=== FULL FILE: plan/20-cli-core-complete.md ===
+# 20 — CLI: foundation, config precedence, human errors
+
+**Status:** complete  
+**Dependencies:** 02, 06
+
+## Objective
+
+`remote-harness` **clap** binary with config load order, API client wrapper, and **stderr** errors: HTTP status + `error.code` + `error.message` ([CLIENT_EXPERIENCE §2.2](../docs/CLIENT_EXPERIENCE.md#22-cli-mapping), [PROJECT_KICKOFF §6a — I](../docs/PROJECT_KICKOFF.md#6a-implementation-plan-concrete-checkpoints)—**no `--json` in v1**).
+
+## Scope
+
+**In scope**
+
+- `config show`; env + `~/.config/remote-harness/config.yaml` precedence ([TECH_STACK §3](../docs/TECH_STACK.md#3-cli--rust)).
+- Shared HTTP + SSE client utilities (SSE used in 21).
+
+**Out of scope**
+
+- Full command surface (task 21).
+
+## Spec references
+
+- [API_OVERVIEW — Spec delivery](../docs/API_OVERVIEW.md#spec-delivery-implementation-requirement)
+
+## Acceptance criteria
+
+- Tests: missing key → non-zero exit + stderr shape; config precedence unit tests.
+
+## Testing
+
+| When | What | Retest |
+|------|------|--------|
+| After implementation | `cargo test -p cli` | CI |
+
+---
+
+## Completed / Notes
+
+- Added `crates/cli` library (`lib.rs`): `config_file`, `resolved` (precedence + unit tests), `http_util::format_http_api_error`, `sse::SseReader` for task 21.
+- Global flags no longer use clap `env =` so precedence is strictly **CLI → env (`REMOTE_HARNESS_URL` / `CONTROL_PLANE_URL`, `REMOTE_HARNESS_API_KEY` / `API_KEY`) → YAML file → default URL**.
+- `remote-harness config show` prints path, resolved URL/API key (masked), and winning source.
+- Integration test `crates/cli/tests/missing_api_key.rs` for missing API key on `session list`.
+
+=== SNIPPET: docs/GETTING_STARTED.md (edited line context) ===
+124:Or `~/.config/remote-harness/config.yaml` with `control_plane_url` and `api_key`. Run `cargo run -p cli -- config show` to see resolved values and which source won (CLI → env → file).

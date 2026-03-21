@@ -1,0 +1,6 @@
+# Use with scripts/compose-smoke.sh when RH_SMOKE_BOOTSTRAP=1 (first phase only).
+# Clears server API_KEY so POST /api-keys/bootstrap is allowed; start worker only after bootstrap.
+services:
+  server:
+    environment:
+      API_KEY: ""

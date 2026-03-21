@@ -1,0 +1,177 @@
+================================================================================
+AGENT CONTEXT DUMP — plan task 21 (CLI full API surface) — session 2026-03-20
+================================================================================
+NOTE: This file is a verbatim-style transcript of the assistant’s working context:
+user requests, constraints, discovery, edits, commands, and outcomes. It is not
+a summarized abstract.
+
+--------------------------------------------------------------------------------
+USER REQUEST (latest, executed in full)
+--------------------------------------------------------------------------------
+Find the next task spec in plan/ sorted ascending, still marked pending.md.
+(Actual filenames use *-pending.md; glob *.pending.md matched 0 files.)
+If no pending: output JSON terminate only.
+If pending: rename pending→processing, read spec, implement+test, build+lint,
+migrations if any, rename complete, dump entire context to logs/{task}.log.
+
+Task identified: plan/21-cli-full-api-surface-pending.md (renamed to processing,
+then completed as 21-cli-full-api-surface-complete.md).
+
+--------------------------------------------------------------------------------
+WORKSPACE RULES (AGENTS.md) relevant to execution
+--------------------------------------------------------------------------------
+- No stubs/TODOs; complete implementations.
+- Backend functionality must be exposed in CLI and UI.
+- Spec updates when behavior changes.
+- Never edit existing migrations; add new migrations for DB changes (this task
+  added no new SQL migrations — DELETE session uses existing CASCADE schema).
+
+--------------------------------------------------------------------------------
+DISCOVERY
+--------------------------------------------------------------------------------
+- plan/*.pending.md pattern: files are named like 21-cli-full-api-surface-pending.md
+  not *.pending.md.
+- Next pending by number: 21 (20-cli-core-complete.md exists).
+- Existing CLI (main.rs) already had: config, health/ready/idle, api-key CRUD +
+  bootstrap with warnings, identity (get/auth-status/repos/patch), oauth URLs,
+  worker list/get/delete/register/heartbeat/pull/complete, session create/list/
+  get/patch/patch-job/input, logs list/delete/send.
+- Gaps vs TECH_STACK §3 / task 21: session start alias, session delete,
+  top-level attach (SSE events + optional logs), logs tail (history + SSE),
+  workers plural + clear naming, credentials show/set as first-class commands,
+  help linking to docs/. Server lacked DELETE /sessions/:id though API_OVERVIEW
+  listed it in summary table — implemented server delete + OpenAPI + Web UI
+  button to satisfy AGENTS.md (backend ↔ CLI ↔ UI).
+
+--------------------------------------------------------------------------------
+FILES CREATED
+--------------------------------------------------------------------------------
+- crates/cli/src/log_ops.rs — paginate GET /sessions/:id/logs (full or --last),
+  ureq-based GET .../logs/stream and .../events with Body into_reader + SseReader.
+- crates/cli/tests/help_and_subcommands.rs — assert_cmd tests for --help content
+  and alias parsing.
+
+--------------------------------------------------------------------------------
+FILES MODIFIED (summary)
+--------------------------------------------------------------------------------
+- crates/cli/Cargo.toml — deps: ureq (rustls), dev assert_cmd, predicates.
+- crates/cli/src/lib.rs — pub mod log_ops;
+- crates/cli/src/main.rs — LONG_ABOUT; Command variants Attach, Credentials;
+  aliases (worker/workers, api-key/apikey, session create/start, worker delete/clear,
+  api-key delete/revoke); SessionCommand::Delete; LogsCommand::Tail; dispatch +
+  run_attach, run_credentials; run_session delete branch; run_logs tail branch;
+  tips updated.
+- crates/server/src/lib.rs — route /sessions/{id} adds .delete(sessions::delete_session)
+- crates/server/src/sessions.rs — delete_session handler (DELETE FROM sessions)
+- crates/server/openapi.yaml — delete operation deleteSession under /sessions/{id}
+- crates/server/tests/openapi_contract.rs — EXPECTED_OPERATION_IDS includes deleteSession
+- crates/server/tests/sessions_integration.rs — delete_session_returns_204_and_get_is_404
+- web/src/App.tsx — DELETE /sessions/:id button with confirm
+- plan/README.md — task 21 row → complete file link
+- plan/21-cli-full-api-surface-complete.md — replaced pending/processing doc
+
+--------------------------------------------------------------------------------
+FILES REMOVED
+--------------------------------------------------------------------------------
+- plan/21-cli-full-api-surface-processing.md — superseded by -complete.md (content
+  merged into complete file with Completed / Notes).
+
+--------------------------------------------------------------------------------
+COMMANDS RUN (representative)
+--------------------------------------------------------------------------------
+- mv plan/21-cli-full-api-surface-pending.md → ...-processing.md (then deleted
+  processing after writing -complete.md)
+- cargo add ureq --package cli --no-default-features --features rustls
+- cargo add assert_cmd predicates --package cli --dev
+- cargo build -p cli  (fixed E0614 *follow_logs → follow_logs)
+- cargo fmt
+- cargo test -p cli
+- cargo test -p server --test openapi_contract
+- cargo clippy -p cli -p server --all-targets -- -D warnings
+- cd web && npm run lint && npm run typecheck
+- cargo test --workspace  (all green; sessions_integration includes new delete test)
+
+--------------------------------------------------------------------------------
+COMPILE ERROR ENCOUNTERED AND FIX
+--------------------------------------------------------------------------------
+- main.rs: *follow_logs where follow_logs is already bool in pattern — removed deref.
+
+--------------------------------------------------------------------------------
+BEHAVIOR NOTES (implementation detail)
+--------------------------------------------------------------------------------
+- logs tail: prints all paginated history (limit 100 pages) or single page when
+  --last N; then opens long-lived SSE on .../logs/stream; uses ureq because
+  reqwest::blocking does not expose a streaming Read body suitable for SSE.
+- attach: primary thread reads session events SSE; optional std::thread reads log
+  SSE when --follow-logs (stdout may interleave; acceptable for v1).
+- credentials show: sequential identity Get then AuthStatus with "---" separator.
+- Server delete session: 204 on success, 404 if UUID valid but no row; cascades
+  remove jobs/logs per initial_schema FKs.
+
+--------------------------------------------------------------------------------
+SPEC / PLAN UPDATES
+--------------------------------------------------------------------------------
+- plan/21-cli-full-api-surface-complete.md documents completion.
+- plan/README.md index updated.
+- OpenAPI artifact updated (implementation requirement for REST changes).
+
+--------------------------------------------------------------------------------
+MIGRATIONS
+--------------------------------------------------------------------------------
+- None added (DELETE uses existing schema CASCADE).
+
+--------------------------------------------------------------------------------
+TEST MATRIX (post-change)
+--------------------------------------------------------------------------------
+- cli: unit tests in lib (resolved, sse) + help_and_subcommands (5) + missing_api_key (1)
+- server: openapi_contract + sessions_integration delete test + full suite
+- worker: unchanged
+- web: eslint + tsc clean
+
+--------------------------------------------------------------------------------
+REMAINING PLAN PENDING TASKS (after this completion)
+--------------------------------------------------------------------------------
+- 22-web-shell-bootstrap-pending.md
+- 23-web-sessions-workers-pending.md
+- 24-web-logs-sse-attach-pending.md
+- 25-web-ux-spec-checkpoints-pending.md
+- 26-e2e-compose-smoke-pending.md
+- 27-phase2-personas-inboxes-design-pending.md
+
+--------------------------------------------------------------------------------
+REFERENCE: TASK SPEC BODY (21) AS READ AT START
+--------------------------------------------------------------------------------
+# 21 — CLI: sessions, workers, logs, credentials, API keys
+Objective: TECH_STACK command map for shipped server capability.
+Scope: sessions start/list/show/delete, attach SSE + optional logs, input;
+workers list/clear; logs tail + delete; credentials + api-key + bootstrap;
+inbox deferred to 27.
+Acceptance: integration tests or assert_cmd; help links to docs/.
+
+--------------------------------------------------------------------------------
+TOOL CALL AUDIT (chronological categories)
+--------------------------------------------------------------------------------
+- Glob/Grep: locate pending plan files; locate server routes; openapi paths.
+- Read: task spec, TECH_STACK, main.rs, lib.rs, sse.rs, API_OVERVIEW sections,
+  sessions_integration patterns, App.tsx, openapi snippet, http_util, ureq crate API.
+- Write/StrReplace: server delete + router; openapi; cli log_ops; main.rs edits;
+  tests; web button; plan complete doc.
+- Delete: processing plan file after merge to complete.
+- Shell: mv, cargo add, cargo build/test/clippy/fmt, npm lint/typecheck.
+
+--------------------------------------------------------------------------------
+FULL LONG_ABOUT STRING (cli root help)
+--------------------------------------------------------------------------------
+
+Remote Harness CLI — v1 REST + SSE client for the control plane (same contracts as the Web UI).
+
+Normative docs (do not duplicate API prose in --help):
+  docs/API_OVERVIEW.md — REST paths, query params, client contracts
+  docs/SSE_EVENTS.md — SSE event names and JSON payloads
+  docs/TECH_STACK.md §3 — intended command map
+  docs/GETTING_STARTED.md — env vars, ~/.config/remote-harness/config.yaml
+  docs/CLIENT_EXPERIENCE.md — errors, bootstrap, retention UX expectations
+
+--------------------------------------------------------------------------------
+END OF CONTEXT DUMP
+================================================================================

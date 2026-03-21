@@ -248,7 +248,7 @@ When you have agent loops, inboxes, and chat, agents need **separate personas**�
 2. Takes that persona’s prompt and **combines it with the task-specific information** (repo, ref, user message, loop prompt, inbox payload, etc.).
 3. Passes that combined context to the worker; the worker invokes the Claude Code or Cursor CLI with it so the agent runs with the right identity and task.
 
-So: the same worker and CLI can run many “agents”; what distinguishes them is the persona prompt plus the task. Personas are optional: if no persona is specified, the task runs with only the workflow params (e.g. a single user prompt). See [Product W6](PRODUCT.md) and [API_OVERVIEW](API_OVERVIEW.md) (Personas, persona_id in session/inbox).
+So: the same worker and CLI can run many “agents”; what distinguishes them is the persona prompt plus the task. Personas are optional: if no persona is specified, the task runs with only the workflow params (e.g. a single user prompt). See [Product W6](PRODUCT.md) and [API_OVERVIEW](API_OVERVIEW.md) (Personas, persona_id in session/inbox). **Resolution order and CRUD edge cases:** [PHASE2_DESIGN.md §2](PHASE2_DESIGN.md#2-personas).
 
 **Agent execution (BYOL):** The worker does not call model HTTP APIs for the main agent turn. It runs the **Claude Code** or **Cursor** CLI in the cloned repo, authenticated with the user’s **agent** token stored on the control plane (Web UI / CLI / API). Git identity OAuth applies to **GitHub/GitLab** only. See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol).
 
@@ -267,6 +267,8 @@ So: **one worker binary (or build) per platform** (Windows native, WSL, macOS, L
 **Operational requirement (slick multi-platform pools):** Run a **homogeneous worker pool** per deployment—same **OS family** (or WSL vs native Windows) and the same **`agent_cli` installed and on PATH**. The v1 engine does **not** enforce platform or CLI affinity; a mixed pool (e.g. Linux + macOS workers) can assign a task to a machine that **cannot** run the requested CLI. Prefer **separate control plane deployments** or a **single OS** in the pool until **label/capability dispatch** is available ([Product O4](PRODUCT.md)). See [Tech Stack §2](TECH_STACK.md#2-workers-rust) and [Product F2](PRODUCT.md).
 
 **Implementation (CLI/Web):** The **Workers** view **must** implement the warning banner and messaging in [CLIENT_EXPERIENCE §10](CLIENT_EXPERIENCE.md#10-worker-pool-heterogeneity-warnings) when the registry shows **incompatible or mixed** `platform` labels so users are not surprised by spawn/CLI errors.
+
+**Implementation (Rust worker):** `crates/worker/src/agent_cli/` provides `AgentCliRunner` (Unix vs Windows spawn options), `build_invocation` (`claude_code` \| `cursor` → argv + env + optional stdin; tokens only in env; **Cursor** always injects `-f` after the first argv token when missing—including when `REMOTE_HARNESS_CURSOR_AGENT_ARGS` overrides the default `run --print`; when `params.model` is set, **Cursor** also gets **`--model <name>`** on argv unless the env override already includes `--model`), `run_invocation` (stdout/stderr line streaming with redaction to log sinks + raw capture for `task_complete`), and WSL-aware `register_platform_label` (`wsl` \| `linux` \| `macos` \| `windows`). End-to-end **pull → clone → agent → commit/push → `POST` logs → `POST` complete** is implemented in `crates/worker/src/task_execution.rs` and driven from `crates/worker/src/lib.rs` (per-job work dir under `REMOTE_HARNESS_WORK_DIR`, heartbeats report **busy** with `current_job_id` while a job runs).
 
 ## 5. Session Attachment (CLI ↔ UI)
 
@@ -356,6 +358,8 @@ Logs must be findable even when something is broken (e.g. streaming to the CLI o
 
 So: **all logs go to disk** — every log line is written to local files on the component that produced it (control plane to files on the backend, each worker to files on that worker). The same logs (that reach the control plane) are also in the central store so the **CLI and Web UI** can show everything. Observability at all times from either client; if the stream or a client breaks, you always have logs on disk.
 
+**Implementation note (v1 control plane):** The **Postgres central store** is implemented: worker batch ingest (`POST /workers/tasks/:id/logs`), paginated history, delete, and scheduled retention purge (honoring `retain_forever`). **SSE** live tail (`GET /sessions/:id/logs/stream`) and session lifecycle events (`GET /sessions/:id/events`) use in-memory broadcast channels (see [`SSE_EVENTS.md`](SSE_EVENTS.md)). **Optional on-server file mirroring** of ingested lines is not implemented—the operator path for “files when the UI breaks” remains **worker-local files** and **host logs** for the server process.
+
 ## 7. Agent Inboxes & Cross-Agent Tasks
 
 For “agents monitoring an inbox” and “spawn tasks to another agent’s inbox”:
@@ -390,6 +394,8 @@ flowchart TB
 - A **continuous** workflow is a long-running worker that: (1) claims “inbox listener” for that agent, (2) **polls** the inbox via the API, (3) processes tasks and can call the API to **spawn_task(agent_id, payload)**.
 - Spawn inserts a task into the target agent’s inbox; that agent’s worker picks it up when it polls or receives an event.
 
+**Design detail (listener claim, promotion to `jobs`, cross-agent spawn authz):** [PHASE2_DESIGN.md §3](PHASE2_DESIGN.md#3-inboxes-and-cross-agent-tasks).
+
 ## 8. Three auth concerns
 
 The system has **three separate auth concerns**. Do not mix them up:
@@ -408,7 +414,7 @@ The system has **three separate auth concerns**. Do not mix them up:
 | Mode | Behavior |
 |------|----------|
 | **Main** | Worker clones, makes commits, pushes to `main` (or configured default branch). |
-| **Task order (worker)** | Clone and checkout the session **ref** first (fail fast if URL/token/ref is wrong). **Branch / MR metadata (before agent):** In **PR/MR** (and similar) modes the worker may generate a branch name and MR/commit messages via a **short model call** (implementation-specific: may use the same Cursor/Claude CLI or a small auxiliary call—must use credentials already on the task / host). Failures here are user-visible job failures with a clear message (see [§9a](ARCHITECTURE.md#9a-when-the-worker-attempts-commit-and-push)). Then create the feature branch at that HEAD if applicable, **run the agent CLI** (main work), then commit/push. |
+| **Task order (worker)** | Clone and checkout the session **ref** first (fail fast if URL/token/ref is wrong). Create a **placeholder** branch when required (`rh/job-<hex>` or `{branch_name_prefix}/job-<hex>` in **PR** mode), **run the main agent CLI**, then—if the working tree has changes—run a **second agent invocation** (same CLI + task credentials) that returns JSON: **branch slug** (3–5 words, path segment), **commit subject** (5–10 words), **commit body** (paragraphs or bullets). The worker renames the placeholder branch to `{prefix}/{slug}` when safe, commits with subject + body + correlation footer, and pushes. Set `REMOTE_HARNESS_SKIP_GIT_METADATA_AGENT=1` to skip the second call and use a deterministic fallback from task prompt + diff excerpt. Failures in rename/commit/push are user-visible (see [§9a](ARCHITECTURE.md#9a-when-the-worker-attempts-commit-and-push)). |
 | **PR/MR** | Worker creates a branch (e.g. from prompt or naming rule), commits, pushes branch, optionally creates PR/MR via API (GitHub/GitLab). |
 
 **Branch naming:** Default is derived from **session_id** (e.g. `harness/<short_session_id>`). Session create accepts optional **branch_name_prefix** in params; if set, branch = prefix + short session/task id. See [API_OVERVIEW](API_OVERVIEW.md).
@@ -417,6 +423,8 @@ The system has **three separate auth concerns**. Do not mix them up:
 
 The worker **attempts** commit and push only after the **main agent run** completes in a way the worker treats as successful for Git follow-up (e.g. the agent process ran and the worker did not abort before the commit step—exact condition is implementation-defined but **must** be documented in worker release notes). If that precondition is not met, **no commit** is produced.
 
+**Commit message:** After a successful **main** agent run, if there are local changes the worker runs a **metadata** agent step (unless skipped via env). The **subject** (first line, ≤72 characters) and **body** come from that step’s JSON when parseable; otherwise they are derived from the task prompt and a **diff excerpt** (deterministic fallback). A final line block records `workflow` and short `session_id` / `job_id` prefixes for correlation (`remote-harness: workflow=…`). **Branch names** on synthetic placeholder branches are replaced with `{branch_name_prefix}/{slug}` from the same metadata (with collision disambiguation); work on a user’s existing branch (non-placeholder) is committed there without renaming.
+
 **Typical reasons there is no commit or push:**
 
 | Cause | Result | What to check |
@@ -424,7 +432,8 @@ The worker **attempts** commit and push only after the **main agent run** comple
 | **Agent run failed early** (e.g. CLI missing, spawn error, timeout) | Job **failed**; often no `branch` / `commit_ref`. | `error_message`, worker logs: agent run / spawn errors. |
 | **Missing task credentials** | No clone; job **failed**. | Identity or params must supply `repo_url`, `git_token`, `agent_cli`, `agent_token`. |
 | **Clone or checkout failed** | Job **failed**; auth or ref issues. | `error_message`, [GIT_CLONE_SPEC.md](GIT_CLONE_SPEC.md). |
-| **Branch / MR “planning” step failed** (metadata generation) | Job **failed** before or without useful Git output. | `error_message` should name this phase; [CLIENT_EXPERIENCE §7.1](CLIENT_EXPERIENCE.md#71-git-planning-failures-branchmr-text). |
+| **Git metadata step** (second agent call) parse/invoke failure | Worker **falls back** to deterministic subject/body from task + diff; job continues unless rename/commit/push fails. | Worker logs warn on parse failure; set `REMOTE_HARNESS_SKIP_GIT_METADATA_AGENT=1` to force fallback only. |
+| **Branch rename** (placeholder → final slug) failed | Job **failed** after agent succeeded. | `error_message` names rename; worker logs. |
 | **Create branch failed** | Job **failed**. | Worker logs, `error_message`. |
 | **Commit or push failed** after agent ran | May have **no** `commit_ref` even if the agent produced output; job status depends on agent exit code and worker policy. | Logs for push/auth errors. |
 
@@ -451,6 +460,8 @@ The server creates a **Pull Request (GitHub)** or **Merge Request (GitLab)** onl
 | **Provider API error** | Token scopes, rate limits, or API failure—job may still **complete** while MR creation fails; surface for operators ([CLIENT_EXPERIENCE §8](CLIENT_EXPERIENCE.md#8-git-commit-push-and-prmr-outcomes)). |
 
 Operator checklist: [TROUBLESHOOTING §2b](TROUBLESHOOTING.md#2b-no-commit-push-or-merge-request).
+
+**Provider matrix, token scopes, optional `pull_request_error` on jobs:** [PHASE2_DESIGN.md §4](PHASE2_DESIGN.md#4-prmr-creation-o2).
 
 ### Git auth (GitHub / GitLab) — auth concern 2
 

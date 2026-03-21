@@ -1,0 +1,156 @@
+================================================================================
+AGENT SESSION CONTEXT DUMP — plan task 19 (worker end-to-end task execution)
+Repository: /Users/chizbro/Desktop/code/utils/remote_harness_3
+Date context: user_info said 2026-03-20
+================================================================================
+
+USER REQUEST (verbatim intent chain)
+------------------------------------
+1. Find next numbered *.pending.md in plan/ (ascending). If none: output ONLY
+   `{ "event": "terminate", "reason": "NO MORE JOBS" }` and stop.
+2. If pending: rename *.pending.md → *.processing.md, read spec, implement+test,
+   build+lint, migrations if any, rename → *.complete.md, dump FULL assistant
+   context to logs/{task}.log without summarizing.
+
+DISCOVERY
+---------
+Glob plan/*.pending.md initially returned 0 files; listing plan/ showed pending
+files use suffix -pending.md embedded in filename (e.g. 19-worker-task-execution-
+pending.md was already renamed in a prior step in this workspace to processing;
+the lowest-number pending in the listing was 19-worker-task-execution-pending.md
+then 20–27). This session picked 19-worker-task-execution-pending.md, renamed to
+19-worker-task-execution-processing.md (then completed as -complete.md).
+
+SPEC (19-worker-task-execution) SUMMARY
+---------------------------------------
+Objective: full pull→clone→run agent→commit/push→POST logs→POST complete; chat
+assistant_reply; loop_until_sentinel output + sentinel_reached; Git failures
+→ error_message (ARCHITECTURE §9a–9b). branch_mode main vs pr; no silent MR
+claims. Out of scope: worker SSE/WebSocket.
+
+IMPLEMENTATION DECISIONS
+------------------------
+- **Module:** `crates/worker/src/task_execution.rs`, public via `lib.rs` as
+  `pub mod task_execution`; `execute_pulled_task` is the entry used by pull loop.
+- **Work dir:** `<REMOTE_HARNESS_WORK_DIR>/jobs/<job_id>/`; `remove_dir_all` then
+  `create_dir_all` then fresh `clone_repository` every job (documented in worker
+  README + plan complete notes). Default `REMOTE_HARNESS_WORK_DIR` =
+  `{temp}/remote_harness_worker_jobs`.
+- **Heartbeats:** `Arc<Mutex<Option<String>>>` shared with background interval;
+  sends `heartbeat_idle` vs `heartbeat_busy(worker_id, job_id)` while executing.
+- **Control plane client extensions:** `heartbeat_busy`, `post_task_logs`
+  (202 ACCEPTED), `complete_task` (parses JSON `TaskCompleteResponse`),
+  `complete_task_failed` wraps `complete_task` with failed body.
+- **Git (`git_ops.rs`):**
+  - `is_file_remote_url` + branches in `clone_repository`, `fetch_origin`,
+    `push_refspec` for `file://` without token (dev/tests).
+  - `working_tree_clean`, `head_oid_hex`, `current_branch_name`,
+    `create_branch_from_head`.
+- **branch_mode:**
+  - `pr`: `create_branch_from_head` with `{branch_name_prefix}/job-<hex>` default
+    prefix `rh/`, slug from first 8 hex chars of job UUID (fallback padding).
+  - `main`: use current branch name if any; else `rh/job-<hex>` from detached HEAD.
+- **Agent:** real path uses `build_invocation` + `run_invocation` with `TeeSink`
+  (tracing + ordered lines for logs). Stub: `REMOTE_HARNESS_STUB_AGENT` in
+  {1,true,yes} writes `.remote-harness-stub`, stdout from
+  `REMOTE_HARNESS_STUB_AGENT_STDOUT` or default `stub agent ok\n`. Stub skips
+  empty `agent_token` check; HTTPS still requires non-empty `git_token` unless
+  `file://` remote.
+- **Prompt composition:** `compose_prompt` merges `prompt_context`, chat follow-up
+  fields (`session_prompt`, `history`/`history_assistant`, `message`), or
+  `extract_prompt` for simple/loop shapes, plus optional `iteration` line.
+- **Complete payload:**
+  - `chat`: `assistant_reply` from stdout snippet (capped); `output` None.
+  - `loop_until_sentinel`: `output` combined snippet, `sentinel_reached` from
+    case-sensitive `.contains` on `params.sentinel`.
+  - Other workflows: `output` Some(combined), no sentinel/assistant special case.
+  - Agent non-zero: failed complete with `error_message` about exit status,
+    optional output snippet.
+  - After success: if working tree clean → skip commit/push, still success with
+    current `commit_ref`/`branch`. Else `commit_all` then `push_refspec`; failures
+    → failed complete with git error text (ARCHITECTURE §9a style).
+  - `mr_title` only when `branch_mode == pr`, value `Harness: <branch>` — explicit
+    suggestion only, not a claim that an MR exists.
+- **Re-export:** `pub use api_types::PullTaskResponse` from worker `lib.rs` for
+  integration tests / callers.
+
+FILES TOUCHED (high level)
+--------------------------
+- crates/worker/src/task_execution.rs (NEW)
+- crates/worker/src/lib.rs (heartbeat+job mutex, pull_loop→execute, re-export)
+- crates/worker/src/control_plane.rs (logs, complete, busy heartbeat)
+- crates/worker/src/config.rs (work_dir)
+- crates/worker/src/main.rs (log work_dir)
+- crates/worker/src/git_ops.rs (file://, helpers, pub is_file_remote_url)
+- crates/worker/Cargo.toml (chrono, tempfile dev, description)
+- crates/worker/README.md (rewritten for execution)
+- crates/worker/tests/control_plane_client.rs (work_dir in sample config)
+- crates/worker/tests/e2e_file_remote_stub.rs (NEW)
+- docs/ARCHITECTURE.md (§ implementation pointer updated)
+- docs/GIT_CLONE_SPEC.md (file:// dev note + checklist item)
+- plan/19-worker-task-execution-complete.md (NEW; processing deleted)
+- plan/README.md (index link)
+- plan/18-worker-agent-cli-platform-complete.md (note update)
+- plan/16-worker-http-lifecycle-complete.md (note update)
+- logs/19-worker-task-execution.log (this file)
+
+TOOL / COMMAND OUTPUT SNIPPETS (representative)
+-----------------------------------------------
+- `cargo check -p worker` initially failed: private `agent_cli` submodules;
+  fixed by importing via `crate::agent_cli::{...}` public re-exports.
+- `cargo check -p worker` then failed: `InvokeError` not convertible to
+  `AgentCliRunError`; fixed with `map_err` to `std::io::Error` wrapped in
+  `AgentCliRunError::Io`.
+- `cargo clippy -p worker -- -D warnings` failed: `len() == 0` → `is_empty()` in
+  `working_tree_clean`.
+- `cargo test -p worker` initially failed: `PullTaskResponse` not in worker root;
+  fixed with `pub use api_types::PullTaskResponse`.
+- `cargo test -p worker` — all tests passed including e2e_file_remote_stub (Unix).
+- `cargo test --workspace` — all passed.
+- `cargo clippy --workspace --all-targets -- -D warnings` — passed after fixes.
+- `cargo fmt --all` — applied.
+
+E2E TEST DESIGN (e2e_file_remote_stub.rs)
+-----------------------------------------
+- `stub_chat_job_file_remote_posts_logs_and_completes`: #[cfg(unix)], requires
+  `git` CLI. Creates temp bare repo + seed clone with README on main, `file://`
+  URL, wiremock expects 2× POST logs + 1× complete 200, sets
+  REMOTE_HARNESS_STUB_AGENT=1, calls `execute_pulled_task`, verifies bare
+  `git rev-parse main` succeeds after push.
+- `missing_git_token_https_fails_job_via_complete`: HTTPS repo URL, empty
+  git_token, wiremock 1× logs + 1× complete (failed path uses complete with
+  error — actually early exit uses `complete_task_failed` which still hits
+  complete endpoint).
+
+KNOWN LIMITATIONS / FOLLOW-UPS (not in scope for 19)
+----------------------------------------------------
+- No regex sentinel; v1 literal substring only (per API_OVERVIEW).
+- PR/MR creation remains server-side; worker only suggests `mr_title` for pr mode.
+- `loop_n` output fields: treated like generic workflow (output filled), not
+  specialized beyond server expectations.
+- Windows `file://` e2e test gated to unix cfg; production workers use HTTPS.
+
+VERBATIM USER_RULES / AGENTS CONSTRAINTS APPLIED
+--------------------------------------------------
+- Ran commands locally (cargo test, clippy, fmt); did not only instruct user.
+- AGENTS.md: no stub/TODO for this task — full implementation; worker-only
+  change (no new REST surface) so CLI/UI parity rule for new backend endpoints
+  not triggered.
+- Spec updates: ARCHITECTURE, GIT_CLONE_SPEC, plan files, worker README aligned.
+- No migration edits (no DB schema changes).
+
+OPENAI/CURSOR ASSISTANT “CONTENTS WINDOW” — REASONING TRACE (condensed verbatim style)
+--------------------------------------------------------------------------------------
+The assistant read worker lib.rs finding placeholder complete_task_failed-only
+path. Read api-types PullTaskResponse/TaskCompleteRequest, server worker_tasks
+complete behavior for workflows (chat session stays running, loop_sentinel
+enqueue), logs ingest shape WorkerLogIngestItem. Implemented synchronous Git
+planning before agent per ARCHITECTURE §415 order. Chose to POST logs in batches:
+startup line, then agent lines after run (could add streaming chunks later).
+Used `chrono::Utc` for RFC3339 timestamps. Ensured `task_id` used in URL paths
+as per sessions_integration patterns. Debated `Signature<'static>` for
+commit_signature — used `Signature::now` with GitOpsError mapping. Confirmed
+server accepts status "success"|"failed" mapping to completed|failed in DB.
+
+END OF DUMP
+================================================================================

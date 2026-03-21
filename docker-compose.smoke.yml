@@ -1,0 +1,22 @@
+# Overlay for scripts/compose-smoke.sh: stub agent + bind-mounted bare Git repo.
+# Set RH_E2E_REPO_BARE_PATH to an absolute path to a bare repo (created by the smoke script).
+#
+# Named volume for job worktrees: checkout after `file://` clone can hang when the entire clone
+# lives on a macOS bind mount (VirtioFS); keeping objects on a Linux volume avoids that.
+volumes:
+  rh_smoke_worker_jobs:
+
+services:
+  worker:
+    # Bind mounts are often host-owned; root avoids push failures vs the image `nobody` user.
+    user: "0:0"
+    environment:
+      REMOTE_HARNESS_STUB_AGENT: "1"
+      # Avoid commit+push: libgit2 → bind-mounted bare can hang on Docker Desktop; tests keep the default.
+      REMOTE_HARNESS_STUB_NO_TOUCH_FILE: "1"
+      REMOTE_HARNESS_WORK_DIR: /var/lib/remote-harness-worker/jobs
+    volumes:
+      - rh_smoke_worker_jobs:/var/lib/remote-harness-worker/jobs
+      - type: bind
+        source: ${RH_E2E_REPO_BARE_PATH:?RH_E2E_REPO_BARE_PATH must be set to an absolute path to a bare .git directory}
+        target: /e2e/repo.git

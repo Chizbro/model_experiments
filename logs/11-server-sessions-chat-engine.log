@@ -1,0 +1,141 @@
+FULL CONTEXT DUMP — Task 11 (Server: sessions API and chat workflow engine)
+================================================================================
+This log is the full working context for the completed plan task, not a summary.
+
+USER INSTRUCTIONS (verbatim intent)
+-----------------------------------
+- Find next pending task in plan/ (numbered ascending). Pattern on disk: *-pending.md (not *.pending.md).
+- If none: output exactly `{ "event": "terminate", "reason": "NO MORE JOBS" }` and stop.
+- If pending: rename *-pending.md → *-processing.md, implement, test, build/lint, migrations if any, rename → *-complete.md, dump full context to logs/{task}.log.
+
+TASK SELECTED
+-------------
+- Next pending: `plan/11-server-sessions-chat-engine-pending.md`
+- Renamed to processing, then completed as `plan/11-server-sessions-chat-engine-complete.md`
+- `plan/README.md` row 11 updated to point to `-complete.md`
+
+AGENTS.MD CONSTRAINTS APPLIED
+-----------------------------
+- No stubs; complete implementation.
+- Backend exposed in CLI and Web (sessions subcommand + App.tsx section).
+- Spec alignment: OpenAPI + README env doc for WEB_UI_BASE_URL; openapi tag text; plan file notes.
+
+SCOPE FROM TASK SPEC
+--------------------
+In scope:
+- POST/GET/PATCH sessions, PATCH session job retain_forever, POST input
+- Chat-only workflow for this release (loop/inbox rejected with 400)
+- Initial job + follow-up jobs; 409 when input invalid
+- Identity + params token merge already in worker pull — verified merge_credentials in worker_tasks.rs
+- GET session returns jobs with error_message, pull_request_url
+
+Out of scope (explicit):
+- Task 12 history cap — follow-up payload sets history_truncated: false always
+- Task 13 loops
+
+IMPLEMENTATION OVERVIEW
+-----------------------
+1) **api-types**
+   - New `crates/api-types/src/sessions.rs`: CreateSessionRequest/Response, SessionSummary, SessionJobSummary, SessionDetailResponse, PatchSessionRetainRequest, SendSessionInputRequest/Response.
+   - `chrono` added to api-types/Cargo.toml with serde feature for DateTime fields in summaries.
+   - Exported from `crates/api-types/src/lib.rs`.
+
+2) **server config**
+   - `ServerConfig.web_ui_base_url: Option<String>` from env `WEB_UI_BASE_URL` (trim, strip trailing slashes on use).
+   - `test_without_db()` sets None.
+
+3) **server sessions module**
+   - `crates/server/src/sessions.rs`
+   - POST /sessions: validates chat, prompt+agent_cli, repo_url, identity exists, session_identity_tokens_sufficient; inserts session pending + first job pending with task_input `{"prompt": ...}`; returns 201 + optional web_url.
+   - GET /sessions: cursor pagination (base64 RFC3339|uuid), newest first, optional status filter.
+   - GET /sessions/:id: detail + jobs ordered by created_at ASC with error_message, pull_request_url.
+   - PATCH /sessions/:id and PATCH /sessions/:id/jobs/:job_id: retain_forever only.
+   - POST /sessions/:id/input: requires workflow chat, session status running, no pending/assigned jobs; builds follow-up task_input with session_prompt, message, history (prior follow-up messages from completed jobs’ task_input.message), history_assistant (from completed jobs’ assistant_reply), history_truncated false; all inside transaction with FOR UPDATE on session.
+
+4) **worker_tasks integration**
+   - `build_task_input`: if job has non-empty JSON object task_input, return as-is; else chat fallback `{"prompt"}` from params.
+   - `pull_task`: when claiming a NEW pending job (not idempotent re-pull), `UPDATE sessions SET status='running' WHERE id=? AND status='pending'`.
+   - `complete_task`: SELECT joins sessions for workflow; after job UPDATE, `UPDATE sessions SET status=?` where failed→failed, chat+success→running, else completed.
+
+5) **Router**
+   - `crates/server/src/lib.rs`: mod sessions; routes for /sessions, /sessions/{id}, /sessions/{id}/input, /sessions/{id}/jobs/{job_id}; `patch` import.
+   - Removed `keys::sessions_not_implemented` and deleted that function from keys.rs; cleaned unused imports.
+
+6) **OpenAPI**
+   - Removed 501 from list/create sessions; added 503 database not configured.
+   - New paths: getSession, patchSession, sendSessionInput, patchSessionJob.
+   - New schemas: SessionDetail, SessionJobDetail, PatchSessionRetainRequest, SendSessionInputRequest/Response.
+   - `crates/server/tests/openapi_contract.rs` allowlist updated.
+
+7) **Tests**
+   - `crates/server/tests/sessions_integration.rs`: bootstrap key, seed default identity tokens as UTF-8 bytes "ag"/"gt" via decode(hex), create chat session, register worker, heartbeat, pull (assert task_input + credentials), GET session (running, assigned), complete with assistant_reply, GET session (completed job), POST input, pull again assert follow-up task_input JSON equals expected including history_assistant.
+   - Uses same mutex pattern as workers tests; requires DATABASE_URL.
+
+8) **CLI**
+   - `crates/cli/src/main.rs`: Command::Session with SessionCommand: create, list, get, patch, patch-job, input.
+   - create maps identity_id default "default" to omitted JSON field (None).
+
+9) **Web**
+   - `web/src/App.tsx`: state for session fields; section “Sessions (chat)” with POST create, GET list, GET detail, POST input; note about API key in Identities section; workers blurb updated.
+
+10) **Docs**
+    - `README.md`: WEB_UI_BASE_URL table row under Git OAuth env table.
+
+FILES TOUCHED (list)
+--------------------
+- crates/api-types/Cargo.toml
+- crates/api-types/src/lib.rs
+- crates/api-types/src/sessions.rs (new)
+- crates/server/src/config.rs
+- crates/server/src/lib.rs
+- crates/server/src/keys.rs
+- crates/server/src/sessions.rs (new)
+- crates/server/src/worker_tasks.rs
+- crates/server/openapi.yaml
+- crates/server/tests/openapi_contract.rs
+- crates/server/tests/sessions_integration.rs (new)
+- crates/cli/src/main.rs
+- web/src/App.tsx
+- README.md
+- plan/11-server-sessions-chat-engine-complete.md (new)
+- plan/README.md
+- plan/11-server-sessions-chat-engine-pending.md (removed via complete replacement)
+- plan/11-server-sessions-chat-engine-processing.md (deleted after complete file written)
+- crates/server/openapi.yaml (tags)
+
+NO NEW SQL MIGRATIONS
+-----------------------
+Existing schema already had sessions, jobs.task_input, jobs.error_message, jobs.pull_request_url, jobs.assistant_reply, retain_forever columns.
+
+VERIFICATION COMMANDS RUN
+------------------------
+- `cargo test` — all tests passed (sessions integration ran where DATABASE_URL set in environment).
+- `cargo clippy --workspace --all-targets -- -D warnings` — clean after keys import fix.
+- `npm run build` in web/ — success.
+
+EDGE CASES / BEHAVIOR NOTES
+---------------------------
+- Chat session after successful job complete stays **running** so POST /input is allowed; failed job sets session **failed**.
+- POST /input returns 409 if not running, not chat, or any job pending/assigned.
+- Non-chat workflows on POST /sessions return 400 “Only workflow \"chat\" is supported in this release”.
+- First pull moves session pending→running only when a job transitions from pending→assigned in that transaction branch.
+
+CREDENTIALS MERGE (unchanged logic reminder)
+-------------------------------------------
+worker_tasks `merge_credentials`: params agent_token/git_token override identity ciphertext when non-empty strings.
+
+IDENTITIES TEST HELPER PATTERN
+------------------------------
+sessions_integration seeds tokens with SQL UPDATE using decode('6167','hex') and decode('6774','hex') for predictable UTF-8 secrets matching worker pull merge.
+
+OPENAPI OPERATION IDS (final set excerpt)
+-----------------------------------------
+Added: getSession, patchSession, patchSessionJob, sendSessionInput
+(sorted in allowlist with existing ids)
+
+REMAINING PLAN QUEUE (reference)
+--------------------------------
+Task 12+ still -pending.md files unchanged: chat history cap, loops, logs, SSE, worker tasks, CLI full surface, etc.
+
+END OF CONTEXT DUMP
+===================
