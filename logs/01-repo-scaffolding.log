@@ -1,0 +1,191 @@
+== CONTEXT DUMP: 01-repo-scaffolding ==
+Date: 2026-03-21
+Feature: 01 - Repo Scaffolding & Build Setup
+Status: COMPLETE
+
+== CONVERSATION CONTEXT ==
+
+User requested: Find the next pending feature spec in plan/, implement it, verify builds, mark complete, dump context.
+
+== INITIAL STATE ==
+- Branch: experiment/opus_4_6
+- Repo contained: AGENTS.md, docs/, plan/, prompts/, run_agent_loop.sh
+- No existing Cargo workspace or web/ directory
+- plan/ contained 29 pending feature specs numbered 01-29
+
+== FEATURE SPEC (01-repo-scaffolding-pending.md) ==
+# 01 - Repo Scaffolding & Build Setup
+
+## Goal
+Create the Cargo workspace, all crate skeletons, Web UI project, and basic build/run infrastructure so every subsequent task has a compilable home.
+
+## What to build
+- **Cargo.toml** (workspace root) with members: `crates/server`, `crates/worker`, `crates/cli`, `crates/api-types`
+- **crates/api-types/** — empty lib crate with `serde`, `serde_json`, `chrono`, `uuid` deps
+- **crates/server/** — binary crate with `axum`, `tokio`, `sqlx` (postgres), `tracing`, `tower`, `serde` deps; `main.rs` that prints "server starting"
+- **crates/worker/** — binary crate with `tokio`, `reqwest`, `git2`, `tracing`, `serde` deps; `main.rs` that prints "worker starting"
+- **crates/cli/** — binary crate with `clap`, `reqwest`, `tokio`, `serde` deps; `main.rs` with clap skeleton
+- **web/** — `npm create vite@latest` with React + TypeScript template; add Tailwind CSS + shadcn/ui setup; verify `npm run dev` and `npm run build` work
+- **rust-toolchain.toml** — pin stable Rust version
+- **.gitignore** — Rust target/, node_modules/, .env, etc.
+- **README.md** — minimal "what this is, how to build" pointing to docs/
+
+## Dependencies
+None — this is the first task.
+
+## Design decisions
+- Use SQLx with compile-time checking disabled initially (runtime mode) until migrations exist
+- Web UI: Vite + React (no Next.js) per spec requirement for client-only SPA
+- All crates share the workspace `Cargo.lock`
+
+## Test criteria
+- [x] `cargo build --workspace` succeeds with no errors
+- [x] `cargo test --workspace` succeeds (no tests yet, but compiles)
+- [x] `cd web && npm run build` succeeds
+- [x] Each binary runs and exits cleanly (`cargo run -p server`, `cargo run -p worker`, `cargo run -p cli -- --help`)
+
+== DOCS READ ==
+
+TECH_STACK.md was read - describes:
+- Control Plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+- Workers: Rust (tokio, reqwest, git2), Claude Code/Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE for tail/attach
+- Web UI: React + TypeScript, Vite, TanStack Query, Tailwind + shadcn/ui, SSE
+- Logging: JSON, dual-write, SSE for tail
+- Auth: API key, TLS
+- Repo layout: Rust monorepo with crates/ and web/
+
+design-system.md: File does not exist in plan/
+
+== IMPLEMENTATION STEPS ==
+
+1. Created workspace root Cargo.toml with 4 members
+2. Created rust-toolchain.toml pinning stable
+3. Created crates/api-types/Cargo.toml with serde, serde_json, chrono, uuid deps
+4. Created crates/api-types/src/lib.rs re-exporting chrono and uuid
+5. Created crates/server/Cargo.toml with axum, tokio, sqlx, tracing, tower, serde deps
+6. Created crates/server/src/main.rs with tokio main, tracing init, "server starting"
+7. Created crates/worker/Cargo.toml with tokio, reqwest, git2, tracing, serde, anyhow, thiserror deps
+8. Created crates/worker/src/main.rs with tokio main, tracing init, "worker starting"
+9. Created crates/cli/Cargo.toml with clap, reqwest, tokio, serde deps; binary named "remote-harness"
+10. Created crates/cli/src/main.rs with clap Parser, Subcommand for Config/Session/Workers/Logs
+11. Created .gitignore for Rust target/, node_modules/, .env, IDE, OS files
+12. Created README.md with build instructions
+13. Ran `cargo build --workspace` — SUCCESS
+14. Ran `cargo test --workspace` — SUCCESS (0 tests, all compile)
+15. Ran `npm create vite@latest web -- --template react-ts`
+16. Ran `npm install` in web/
+17. Installed tailwindcss and @tailwindcss/vite
+18. Configured vite.config.ts with tailwindcss plugin and @ path alias
+19. Configured tsconfig.app.json and tsconfig.json with baseUrl and paths for @/* alias
+20. Ran `npx shadcn@latest init -d -y` — SUCCESS after alias config
+   - shadcn created: src/components/ui/button.tsx, src/lib/utils.ts
+   - Updated src/index.css with full theme setup
+   - Installed additional deps (tw-animate-css, class-variance-authority, clsx, lucide-react, tailwind-merge, etc.)
+21. Updated App.tsx to simple Tailwind-styled placeholder
+22. Ran `npm run build` in web/ — SUCCESS
+23. Verified `cargo run -p server` — prints "server starting"
+24. Verified `cargo run -p worker` — prints "worker starting"
+25. Verified `cargo run -p cli -- --help` — shows commands: config, session, workers, logs, help
+
+== FILES CREATED/MODIFIED ==
+
+New files:
+- Cargo.toml (workspace root)
+- rust-toolchain.toml
+- .gitignore
+- README.md
+- crates/api-types/Cargo.toml
+- crates/api-types/src/lib.rs
+- crates/server/Cargo.toml
+- crates/server/src/main.rs
+- crates/worker/Cargo.toml
+- crates/worker/src/main.rs
+- crates/cli/Cargo.toml
+- crates/cli/src/main.rs
+- web/ (entire Vite + React + TS project via scaffolding)
+- web/src/components/ui/button.tsx (shadcn)
+- web/src/lib/utils.ts (shadcn)
+- web/components.json (shadcn config)
+
+Modified files:
+- web/vite.config.ts (added tailwindcss plugin and @ alias)
+- web/tsconfig.json (added baseUrl and paths)
+- web/tsconfig.app.json (added baseUrl and paths)
+- web/src/index.css (shadcn theme setup replaced Vite defaults)
+- web/src/App.tsx (replaced Vite boilerplate with simple Tailwind page)
+- plan/01-repo-scaffolding-pending.md -> plan/01-repo-scaffolding-complete.md
+
+== KEY DEPENDENCY VERSIONS (from Cargo.lock / package.json) ==
+
+Rust:
+- axum 0.8
+- tokio 1
+- sqlx 0.8 (postgres, chrono, uuid features)
+- tracing 0.1
+- tower 0.5
+- tower-http 0.6 (cors, trace features)
+- reqwest 0.12 (json feature)
+- git2 0.19
+- clap 4 (derive feature)
+- serde 1 (derive feature)
+- chrono 0.4 (serde feature)
+- uuid 1 (v4, serde features)
+- anyhow 1
+- thiserror 2
+
+Web:
+- react 19.2.4
+- vite 8.0.1
+- typescript ~5.9.3
+- tailwindcss 4.2.2
+- shadcn/ui (latest, initialized with default theme)
+
+== VERIFICATION RESULTS ==
+
+1. `cargo build --workspace` — PASS (Finished dev profile)
+2. `cargo test --workspace` — PASS (0 passed, 0 failed across all crates)
+3. `cd web && npm run build` — PASS (no errors)
+4. `cargo run -p server` — PASS (prints "server starting")
+5. `cargo run -p worker` — PASS (prints "worker starting")
+6. `cargo run -p cli -- --help` — PASS (shows CLI help with subcommands)
+
+== REMAINING PENDING SPECS ==
+
+02-api-types-design-pending.md
+03-database-schema-pending.md
+04-server-foundation-pending.md
+05-api-key-auth-pending.md
+06-identity-credentials-pending.md
+07-git-oauth-flows-pending.md
+08-worker-registration-heartbeat-pending.md
+09-session-job-state-machine-pending.md
+10-task-dispatch-completion-pending.md
+11-log-ingestion-storage-pending.md
+12-log-sse-streaming-pending.md
+13-worker-foundation-pending.md
+14-worker-git-operations-pending.md
+15-worker-agent-cli-execution-pending.md
+16-worker-task-lifecycle-logging-pending.md
+17-chat-workflow-pending.md
+18-loop-workflows-pending.md
+19-pr-mr-creation-pending.md
+20-cli-foundation-pending.md
+21-cli-commands-pending.md
+22-web-ui-foundation-pending.md
+23-web-ui-settings-auth-pending.md
+24-web-ui-dashboard-sessions-pending.md
+25-web-ui-workers-logs-pending.md
+26-personas-pending.md
+27-docker-deployment-pending.md
+28-ci-pipeline-pending.md
+29-e2e-integration-tests-pending.md
+
+== NOTES ==
+
+- design-system.md does not exist in plan/ — was referenced in the task prompt but not found
+- SQLx compile-time checking disabled (runtime mode) as spec says — no migrations exist yet
+- Web UI is pure client-side SPA (no SSR) per TECH_STACK.md requirements
+- shadcn/ui initialized with default neutral theme; button component pre-installed
+- CLI binary is named "remote-harness" per spec
+- All crates depend on api-types for shared types

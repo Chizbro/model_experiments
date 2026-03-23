@@ -1,0 +1,1310 @@
+== CONTEXT DUMP: 20-cli-foundation ==
+== Task: CLI Foundation & Config ==
+== Date: 2026-03-22 ==
+
+=== TASK DESCRIPTION ===
+Build the CLI binary with clap command structure, configuration loading, and API client.
+The CLI shares types with the server via the api-types crate.
+
+=== WHAT WAS BUILT ===
+
+1. Configuration system (crates/cli/src/config.rs)
+   - CliConfig struct with control_plane_url, api_key, wake_url, wake_script
+   - ConfigFile struct for YAML deserialization
+   - Precedence: CLI flags > env vars > config file (~/.config/remote-harness/config.yaml)
+   - Env vars: REMOTE_HARNESS_URL, CONTROL_PLANE_URL, REMOTE_HARNESS_API_KEY, API_KEY, WAKE_URL, WAKE_SCRIPT
+   - require_url() and require_api_key() methods for validation
+   - display() method for `config show` output with masked API key
+
+2. API Client (crates/cli/src/api_client.rs)
+   - Generic HTTP methods: get, post, patch, delete with auth header
+   - Connection error handling with wake URL/script suggestion
+   - Error response parsing (ApiError JSON -> human-readable stderr)
+   - Endpoint methods for: sessions, logs, workers, credentials, API keys, inbox, wake, health
+
+3. Full clap command structure (crates/cli/src/main.rs)
+   - Global --url and --api-key flags
+   - Commands: config show, session (start/list/show/delete), attach, logs (tail/delete),
+     workers (list/clear), credentials (show/set), api-key (create/list/revoke),
+     inbox (send/list), wake
+   - All errors go to stderr with exit code 1
+   - Workflow type parsing (chat, loop_n, loop_until_sentinel, inbox)
+
+4. Updated Cargo.toml with new dependencies: serde_yaml, dirs, anyhow, tempfile (dev)
+
+=== FILES MODIFIED/CREATED ===
+
+--- crates/cli/Cargo.toml ---
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "remote-harness"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+dirs = "6"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+--- crates/cli/src/main.rs ---
+mod api_client;
+mod config;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+
+use api_types::*;
+use api_client::ApiClient;
+use config::CliConfig;
+
+#[derive(Parser)]
+#[command(name = "remote-harness", about = "Remote Harness CLI — manage sessions, workers, and logs")]
+struct Cli {
+    /// Control plane URL (overrides env and config file)
+    #[arg(long, global = true)]
+    url: Option<String>,
+
+    /// API key (overrides env and config file)
+    #[arg(long, global = true)]
+    api_key: Option<String>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Show resolved configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Manage sessions
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+    /// Attach to a running session (stream events)
+    Attach {
+        /// Session ID to attach to
+        session_id: String,
+    },
+    /// Manage logs
+    Logs {
+        #[command(subcommand)]
+        action: LogsAction,
+    },
+    /// Manage workers
+    Workers {
+        #[command(subcommand)]
+        action: WorkersAction,
+    },
+    /// Manage identity credentials (BYOL tokens)
+    Credentials {
+        #[command(subcommand)]
+        action: CredentialsAction,
+    },
+    /// Manage API keys
+    ApiKey {
+        #[command(subcommand)]
+        action: ApiKeyAction,
+    },
+    /// Manage inbox messages
+    Inbox {
+        #[command(subcommand)]
+        action: InboxAction,
+    },
+    /// Wake up the control plane
+    Wake,
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Show resolved config and precedence
+    Show,
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Start a new session
+    Start {
+        /// Repository URL
+        #[arg(long)]
+        repo: String,
+        /// Workflow type (chat, loop_n, loop_until_sentinel, inbox)
+        #[arg(long, default_value = "chat")]
+        workflow: String,
+        /// Session parameters as JSON
+        #[arg(long)]
+        params: Option<String>,
+        /// Persona ID
+        #[arg(long)]
+        persona_id: Option<String>,
+        /// Identity ID
+        #[arg(long)]
+        identity_id: Option<String>,
+    },
+    /// List sessions
+    List {
+        /// Filter by status (pending, running, completed, failed)
+        #[arg(long)]
+        status: Option<String>,
+        /// Maximum number of results
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Show session details
+    Show {
+        /// Session ID
+        id: String,
+    },
+    /// Delete a session
+    Delete {
+        /// Session ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum LogsAction {
+    /// Tail logs (fetch history then stream via SSE)
+    Tail {
+        /// Session ID
+        #[arg(long)]
+        session_id: String,
+        /// Job ID filter
+        #[arg(long)]
+        job_id: Option<String>,
+        /// Log level filter (debug, info, warn, error)
+        #[arg(long)]
+        level: Option<String>,
+        /// Number of recent log entries to fetch
+        #[arg(long)]
+        last: Option<u32>,
+    },
+    /// Delete logs
+    Delete {
+        /// Session ID
+        #[arg(long)]
+        session_id: String,
+        /// Job ID filter (omit to delete all session logs)
+        #[arg(long)]
+        job_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkersAction {
+    /// List all workers
+    List,
+    /// Deregister a worker
+    Clear {
+        /// Worker ID
+        worker_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialsAction {
+    /// Show identity credentials status
+    Show {
+        /// Identity ID
+        #[arg(long)]
+        identity_id: String,
+    },
+    /// Set identity credentials
+    Set {
+        /// Identity ID
+        #[arg(long)]
+        identity_id: String,
+        /// Agent token (e.g. Claude Code API key)
+        #[arg(long)]
+        agent_token: Option<String>,
+        /// Git token (GitHub/GitLab PAT)
+        #[arg(long)]
+        git_token: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiKeyAction {
+    /// Create a new API key
+    Create {
+        /// Label for the key
+        #[arg(long)]
+        label: String,
+    },
+    /// List API keys
+    List,
+    /// Revoke an API key
+    Revoke {
+        /// API key ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InboxAction {
+    /// Send a message to an agent's inbox
+    Send {
+        /// Agent ID
+        agent_id: String,
+        /// Payload as JSON
+        #[arg(long)]
+        payload: Option<String>,
+        /// Prompt text
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Persona ID
+        #[arg(long)]
+        persona_id: Option<String>,
+    },
+    /// List inbox sessions for an agent
+    List {
+        /// Agent ID
+        agent_id: String,
+        /// Maximum number of results
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+
+    if let Err(e) = run(cli).await {
+        eprintln!("{e:#}");
+        std::process::exit(1);
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Commands::Config { action } => match action {
+            ConfigAction::Show => {
+                let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+                config.display();
+            }
+        },
+
+        Commands::Session { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                SessionAction::Start {
+                    repo,
+                    workflow,
+                    params,
+                    persona_id,
+                    identity_id,
+                } => {
+                    let workflow_type = parse_workflow(&workflow)?;
+                    let session_params = match params {
+                        Some(json) => Some(serde_json::from_str::<SessionParams>(&json)?),
+                        None => None,
+                    };
+                    let req = CreateSessionRequest {
+                        repo_url: repo,
+                        ref_: None,
+                        workflow: workflow_type,
+                        params: session_params,
+                        persona_id: persona_id.map(PersonaId::from_string),
+                        identity_id: identity_id.map(IdentityId::from_string),
+                        retain_forever: None,
+                    };
+                    let session = client.create_session(&req).await?;
+                    println!("Session created: {}", session.session_id);
+                    println!("Status: {:?}", session.status);
+                }
+                SessionAction::List { status, limit } => {
+                    let resp = client.list_sessions(status.as_deref(), limit).await?;
+                    if resp.items.is_empty() {
+                        println!("No sessions found.");
+                    } else {
+                        for s in &resp.items {
+                            println!(
+                                "{}\t{:?}\t{}\t{}",
+                                s.session_id, s.status, s.repo_url, s.created_at
+                            );
+                        }
+                        if let Some(cursor) = &resp.next_cursor {
+                            println!("\n(more results available, cursor: {cursor})");
+                        }
+                    }
+                }
+                SessionAction::Show { id } => {
+                    let session = client.get_session(&id).await?;
+                    println!("Session:  {}", session.session_id);
+                    println!("Repo:     {}", session.repo_url);
+                    println!("Workflow: {:?}", session.workflow);
+                    println!("Status:   {:?}", session.status);
+                    println!("Created:  {}", session.created_at);
+                    if let Some(updated) = session.updated_at {
+                        println!("Updated:  {updated}");
+                    }
+                    if !session.jobs.is_empty() {
+                        println!("\nJobs:");
+                        for j in &session.jobs {
+                            print!("  {} {:?} {}", j.job_id, j.status, j.created_at);
+                            if let Some(pr) = &j.pull_request_url {
+                                print!(" PR: {pr}");
+                            }
+                            println!();
+                        }
+                    }
+                }
+                SessionAction::Delete { id } => {
+                    client.delete_session(&id).await?;
+                    println!("Session {id} deleted.");
+                }
+            }
+        }
+
+        Commands::Attach { session_id } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let _client = ApiClient::from_config(&config)?;
+            // SSE streaming will be implemented in a later task (CLI commands spec)
+            println!("Attaching to session {session_id}...");
+            println!("(SSE streaming not yet implemented — see task 21)");
+        }
+
+        Commands::Logs { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                LogsAction::Tail {
+                    session_id,
+                    job_id,
+                    level,
+                    last,
+                } => {
+                    let entries = client
+                        .get_logs(&session_id, job_id.as_deref(), level.as_deref(), last)
+                        .await?;
+                    for entry in &entries {
+                        println!(
+                            "{} [{}] {} {}",
+                            entry.timestamp,
+                            format_log_level(&entry.level),
+                            entry.source,
+                            entry.message
+                        );
+                    }
+                    if entries.is_empty() {
+                        println!("No log entries found.");
+                    }
+                    // SSE tail streaming will be implemented in task 21
+                    println!("(Live SSE tail not yet implemented — see task 21)");
+                }
+                LogsAction::Delete {
+                    session_id,
+                    job_id,
+                } => {
+                    client.delete_logs(&session_id, job_id.as_deref()).await?;
+                    println!("Logs deleted for session {session_id}.");
+                }
+            }
+        }
+
+        Commands::Workers { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                WorkersAction::List => {
+                    let workers = client.list_workers().await?;
+                    if workers.is_empty() {
+                        println!("No workers registered.");
+                    } else {
+                        for w in &workers {
+                            println!(
+                                "{}\t{}\t{:?}\t{}",
+                                w.worker_id,
+                                w.host,
+                                w.status,
+                                w.last_seen_at
+                                    .map(|t| t.to_string())
+                                    .unwrap_or_else(|| "never".to_string())
+                            );
+                        }
+                    }
+                }
+                WorkersAction::Clear { worker_id } => {
+                    client.clear_worker(&worker_id).await?;
+                    println!("Worker {worker_id} deregistered.");
+                }
+            }
+        }
+
+        Commands::Credentials { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                CredentialsAction::Show { identity_id } => {
+                    let status = client.get_credentials(&identity_id).await?;
+                    println!("Identity: {identity_id}");
+                    println!("  Git token:   {}", if status.has_git_token { "set" } else { "not set" });
+                    println!("  Agent token: {}", if status.has_agent_token { "set" } else { "not set" });
+                }
+                CredentialsAction::Set {
+                    identity_id,
+                    agent_token,
+                    git_token,
+                } => {
+                    let req = UpdateIdentityRequest {
+                        agent_token,
+                        git_token,
+                        refresh_token: None,
+                    };
+                    client.set_credentials(&identity_id, &req).await?;
+                    println!("Credentials updated for identity {identity_id}.");
+                }
+            }
+        }
+
+        Commands::ApiKey { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                ApiKeyAction::Create { label } => {
+                    let req = CreateApiKeyRequest { label };
+                    let resp = client.create_api_key(&req).await?;
+                    println!("API key created:");
+                    println!("  ID:    {}", resp.id);
+                    println!("  Key:   {}", resp.key);
+                    println!("  Label: {}", resp.label);
+                    println!("\nSave this key now — it will not be shown again.");
+                }
+                ApiKeyAction::List => {
+                    let resp = client.list_api_keys().await?;
+                    if resp.items.is_empty() {
+                        println!("No API keys found.");
+                    } else {
+                        for k in &resp.items {
+                            println!("{}\t{}\t{}", k.id, k.label, k.created_at);
+                        }
+                    }
+                }
+                ApiKeyAction::Revoke { id } => {
+                    client.revoke_api_key(&id).await?;
+                    println!("API key {id} revoked.");
+                }
+            }
+        }
+
+        Commands::Inbox { action } => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref())?;
+            let client = ApiClient::from_config(&config)?;
+            match action {
+                InboxAction::Send {
+                    agent_id,
+                    payload: _,
+                    prompt,
+                    persona_id,
+                } => {
+                    let params = SessionParams {
+                        prompt,
+                        n: None,
+                        sentinel: None,
+                        agent_cli: None,
+                        model: None,
+                        branch_mode: None,
+                        branch_name_prefix: None,
+                    };
+                    let req = CreateSessionRequest {
+                        repo_url: String::new(),
+                        ref_: None,
+                        workflow: WorkflowType::Inbox,
+                        params: Some(params),
+                        persona_id: persona_id.map(PersonaId::from_string),
+                        identity_id: None,
+                        retain_forever: None,
+                    };
+                    let session = client.send_inbox(&agent_id, &req).await?;
+                    println!("Inbox message sent. Session: {}", session.session_id);
+                }
+                InboxAction::List { agent_id, limit } => {
+                    let resp = client.list_inbox(&agent_id, limit).await?;
+                    if resp.items.is_empty() {
+                        println!("No inbox sessions found.");
+                    } else {
+                        for s in &resp.items {
+                            println!(
+                                "{}\t{:?}\t{}",
+                                s.session_id, s.status, s.created_at
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Wake => {
+            let config = CliConfig::resolve(cli.url.as_deref(), cli.api_key.as_deref());
+            // Wake doesn't strictly need full config, but uses wake_url/wake_script
+            match config {
+                Ok(config) => {
+                    if config.wake_url.is_some() || config.wake_script.is_some() {
+                        let client = reqwest::Client::new();
+                        if let Some(url) = &config.wake_url {
+                            let resp = client.get(url.as_str()).send().await;
+                            match resp {
+                                Ok(r) if r.status().is_success() => {
+                                    println!("Wake request sent successfully to {url}");
+                                }
+                                Ok(r) => {
+                                    eprintln!("Wake request returned status: {}", r.status());
+                                    std::process::exit(1);
+                                }
+                                Err(e) => {
+                                    eprintln!("Wake request failed: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else if let Some(script) = &config.wake_script {
+                            let status = std::process::Command::new("sh")
+                                .arg("-c")
+                                .arg(script)
+                                .status()?;
+                            if !status.success() {
+                                eprintln!("Wake script exited with status: {status}");
+                                std::process::exit(1);
+                            }
+                            println!("Wake script completed successfully.");
+                        }
+                    } else {
+                        eprintln!("No wake_url or wake_script configured.");
+                        std::process::exit(1);
+                    }
+                }
+                Err(_) => {
+                    eprintln!("No wake_url or wake_script configured.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_workflow(s: &str) -> Result<WorkflowType> {
+    match s {
+        "chat" => Ok(WorkflowType::Chat),
+        "loop_n" => Ok(WorkflowType::LoopN),
+        "loop_until_sentinel" => Ok(WorkflowType::LoopUntilSentinel),
+        "inbox" => Ok(WorkflowType::Inbox),
+        _ => anyhow::bail!(
+            "Unknown workflow type: {s}. Must be one of: chat, loop_n, loop_until_sentinel, inbox"
+        ),
+    }
+}
+
+fn format_log_level(level: &api_types::LogLevel) -> &'static str {
+    match level {
+        api_types::LogLevel::Debug => "DEBUG",
+        api_types::LogLevel::Info => "INFO",
+        api_types::LogLevel::Warn => "WARN",
+        api_types::LogLevel::Error => "ERROR",
+    }
+}
+
+--- crates/cli/src/config.rs ---
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Configuration for the CLI, resolved from flags > env > config file.
+#[derive(Debug, Clone, Default)]
+pub struct CliConfig {
+    pub control_plane_url: Option<String>,
+    pub api_key: Option<String>,
+    pub wake_url: Option<String>,
+    pub wake_script: Option<String>,
+}
+
+/// On-disk YAML configuration file shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConfigFile {
+    pub control_plane_url: Option<String>,
+    pub api_key: Option<String>,
+    pub wake_url: Option<String>,
+    pub wake_script: Option<String>,
+}
+
+impl CliConfig {
+    /// Resolve config with precedence: flags > env > config file.
+    pub fn resolve(
+        flag_url: Option<&str>,
+        flag_key: Option<&str>,
+    ) -> Result<Self> {
+        let file_config = Self::load_config_file().unwrap_or_default();
+
+        let control_plane_url = flag_url
+            .map(String::from)
+            .or_else(|| std::env::var("REMOTE_HARNESS_URL").ok())
+            .or_else(|| std::env::var("CONTROL_PLANE_URL").ok())
+            .or(file_config.control_plane_url);
+
+        let api_key = flag_key
+            .map(String::from)
+            .or_else(|| std::env::var("REMOTE_HARNESS_API_KEY").ok())
+            .or_else(|| std::env::var("API_KEY").ok())
+            .or(file_config.api_key);
+
+        let wake_url = std::env::var("WAKE_URL")
+            .ok()
+            .or(file_config.wake_url);
+
+        let wake_script = std::env::var("WAKE_SCRIPT")
+            .ok()
+            .or(file_config.wake_script);
+
+        Ok(Self {
+            control_plane_url,
+            api_key,
+            wake_url,
+            wake_script,
+        })
+    }
+
+    /// The default config file path: ~/.config/remote-harness/config.yaml
+    pub fn default_config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("remote-harness").join("config.yaml"))
+    }
+
+    fn load_config_file() -> Result<ConfigFile> {
+        let path = Self::default_config_path()
+            .context("Could not determine config directory")?;
+        if !path.exists() {
+            return Ok(ConfigFile::default());
+        }
+        let contents = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+        let config: ConfigFile = serde_yaml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+        Ok(config)
+    }
+
+    /// Returns the control_plane_url or an error message.
+    pub fn require_url(&self) -> Result<&str> {
+        self.control_plane_url
+            .as_deref()
+            .context("Control plane URL not configured. Set REMOTE_HARNESS_URL, use --url, or add control_plane_url to config file.")
+    }
+
+    /// Returns the api_key or an error message.
+    pub fn require_api_key(&self) -> Result<&str> {
+        self.api_key
+            .as_deref()
+            .context("API key not configured. Set REMOTE_HARNESS_API_KEY, use --api-key, or add api_key to config file.")
+    }
+
+    /// Display resolved config and source precedence.
+    pub fn display(&self) {
+        println!("Resolved configuration:");
+        println!();
+        println!(
+            "  control_plane_url: {}",
+            self.control_plane_url.as_deref().unwrap_or("<not set>")
+        );
+        println!(
+            "  api_key:           {}",
+            self.api_key
+                .as_ref()
+                .map(|k| {
+                    if k.len() > 8 {
+                        format!("{}...{}", &k[..4], &k[k.len() - 4..])
+                    } else {
+                        "****".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "<not set>".to_string())
+        );
+        println!(
+            "  wake_url:          {}",
+            self.wake_url.as_deref().unwrap_or("<not set>")
+        );
+        println!(
+            "  wake_script:       {}",
+            self.wake_script.as_deref().unwrap_or("<not set>")
+        );
+        println!();
+        println!("Precedence: CLI flags > environment variables > config file");
+        if let Some(path) = Self::default_config_path() {
+            println!("Config file: {}", path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_from_flags() {
+        // Flags take highest precedence
+        let config = CliConfig::resolve(
+            Some("http://flag-url"),
+            Some("flag-key"),
+        )
+        .unwrap();
+        assert_eq!(config.control_plane_url.as_deref(), Some("http://flag-url"));
+        assert_eq!(config.api_key.as_deref(), Some("flag-key"));
+    }
+
+    #[test]
+    fn test_resolve_from_env() {
+        // Temporarily set env vars
+        std::env::set_var("REMOTE_HARNESS_URL", "http://env-url");
+        std::env::set_var("REMOTE_HARNESS_API_KEY", "env-key");
+        let config = CliConfig::resolve(None, None).unwrap();
+        assert_eq!(config.control_plane_url.as_deref(), Some("http://env-url"));
+        assert_eq!(config.api_key.as_deref(), Some("env-key"));
+        std::env::remove_var("REMOTE_HARNESS_URL");
+        std::env::remove_var("REMOTE_HARNESS_API_KEY");
+    }
+
+    #[test]
+    fn test_flags_override_env() {
+        std::env::set_var("REMOTE_HARNESS_URL", "http://env-url");
+        let config = CliConfig::resolve(Some("http://flag-url"), None).unwrap();
+        assert_eq!(config.control_plane_url.as_deref(), Some("http://flag-url"));
+        std::env::remove_var("REMOTE_HARNESS_URL");
+    }
+
+    #[test]
+    fn test_config_file_parse() {
+        let yaml = r#"
+control_plane_url: "http://file-url"
+api_key: "file-key"
+wake_url: "http://wake"
+"#;
+        let config: ConfigFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.control_plane_url.as_deref(), Some("http://file-url"));
+        assert_eq!(config.api_key.as_deref(), Some("file-key"));
+        assert_eq!(config.wake_url.as_deref(), Some("http://wake"));
+        assert!(config.wake_script.is_none());
+    }
+
+    #[test]
+    fn test_require_url_missing() {
+        let config = CliConfig::default();
+        assert!(config.require_url().is_err());
+    }
+
+    #[test]
+    fn test_require_api_key_missing() {
+        let config = CliConfig::default();
+        assert!(config.require_api_key().is_err());
+    }
+
+    #[test]
+    fn test_require_url_present() {
+        let config = CliConfig {
+            control_plane_url: Some("http://localhost:3000".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(config.require_url().unwrap(), "http://localhost:3000");
+    }
+}
+
+--- crates/cli/src/api_client.rs ---
+#![allow(dead_code)]
+
+use anyhow::{Context, Result};
+use reqwest::Client;
+use serde::de::DeserializeOwned;
+
+use api_types::*;
+
+use crate::config::CliConfig;
+
+/// API client for communicating with the Remote Harness control plane.
+#[derive(Clone)]
+pub struct ApiClient {
+    client: Client,
+    base_url: String,
+    api_key: String,
+    wake_url: Option<String>,
+    wake_script: Option<String>,
+}
+
+impl ApiClient {
+    /// Create a new ApiClient from resolved config.
+    pub fn from_config(config: &CliConfig) -> Result<Self> {
+        let base_url = config.require_url()?.trim_end_matches('/').to_string();
+        let api_key = config.require_api_key()?.to_string();
+
+        Ok(Self {
+            client: Client::new(),
+            base_url,
+            api_key,
+            wake_url: config.wake_url.clone(),
+            wake_script: config.wake_script.clone(),
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    /// Handle connection errors with wake suggestion.
+    fn handle_connection_error(&self, err: &reqwest::Error) -> String {
+        if err.is_connect() || err.is_timeout() {
+            let mut msg = format!("Control plane unreachable: {err}");
+            if let Some(url) = &self.wake_url {
+                msg.push_str(&format!(
+                    "\nWake URL configured: {url}\nRun `remote-harness wake` to wake the control plane."
+                ));
+            }
+            if let Some(script) = &self.wake_script {
+                msg.push_str(&format!(
+                    "\nWake script configured: {script}\nRun `remote-harness wake` to wake the control plane."
+                ));
+            }
+            msg
+        } else {
+            format!("Request failed: {err}")
+        }
+    }
+
+    /// Parse error response body into human-readable message.
+    async fn parse_error_response(&self, resp: reqwest::Response) -> String {
+        let status = resp.status();
+        match resp.json::<ApiError>().await {
+            Ok(api_err) => format!(
+                "Error {}: [{}] {}",
+                status.as_u16(),
+                api_err.code,
+                api_err.message
+            ),
+            Err(_) => format!("Error {}: {}", status.as_u16(), status.canonical_reason().unwrap_or("Unknown")),
+        }
+    }
+
+    /// Make an authenticated GET request and deserialize the response.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let resp = self
+            .client
+            .get(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(self.handle_connection_error(&e)))?;
+
+        if !resp.status().is_success() {
+            let msg = self.parse_error_response(resp).await;
+            anyhow::bail!(msg);
+        }
+        resp.json::<T>()
+            .await
+            .context("Failed to parse response body")
+    }
+
+    /// Make an authenticated POST request with JSON body.
+    async fn post<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let resp = self
+            .client
+            .post(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(self.handle_connection_error(&e)))?;
+
+        if !resp.status().is_success() {
+            let msg = self.parse_error_response(resp).await;
+            anyhow::bail!(msg);
+        }
+        resp.json::<T>()
+            .await
+            .context("Failed to parse response body")
+    }
+
+    /// Make an authenticated PATCH request with JSON body.
+    async fn patch<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
+        let resp = self
+            .client
+            .patch(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(self.handle_connection_error(&e)))?;
+
+        if !resp.status().is_success() {
+            let msg = self.parse_error_response(resp).await;
+            anyhow::bail!(msg);
+        }
+        resp.json::<T>()
+            .await
+            .context("Failed to parse response body")
+    }
+
+    /// Make an authenticated DELETE request.
+    async fn delete(&self, path: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(self.url(path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(self.handle_connection_error(&e)))?;
+
+        if !resp.status().is_success() {
+            let msg = self.parse_error_response(resp).await;
+            anyhow::bail!(msg);
+        }
+        Ok(())
+    }
+
+    // --- Session endpoints ---
+
+    pub async fn create_session(&self, req: &CreateSessionRequest) -> Result<SessionDetail> {
+        self.post("/sessions", req).await
+    }
+
+    pub async fn list_sessions(
+        &self,
+        status: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<PaginatedResponse<SessionSummary>> {
+        let mut path = "/sessions".to_string();
+        let mut params = Vec::new();
+        if let Some(s) = status {
+            params.push(format!("status={s}"));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        if !params.is_empty() {
+            path.push('?');
+            path.push_str(&params.join("&"));
+        }
+        self.get(&path).await
+    }
+
+    pub async fn get_session(&self, id: &str) -> Result<SessionDetail> {
+        self.get(&format!("/sessions/{id}")).await
+    }
+
+    pub async fn delete_session(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/sessions/{id}")).await
+    }
+
+    pub async fn send_input(&self, session_id: &str, req: &SendInputRequest) -> Result<serde_json::Value> {
+        self.post(&format!("/sessions/{session_id}/input"), req).await
+    }
+
+    // --- Log endpoints ---
+
+    pub async fn get_logs(
+        &self,
+        session_id: &str,
+        job_id: Option<&str>,
+        level: Option<&str>,
+        last: Option<u32>,
+    ) -> Result<Vec<LogEntry>> {
+        let mut path = format!("/sessions/{session_id}/logs");
+        let mut params = Vec::new();
+        if let Some(j) = job_id {
+            params.push(format!("job_id={j}"));
+        }
+        if let Some(l) = level {
+            params.push(format!("level={l}"));
+        }
+        if let Some(n) = last {
+            params.push(format!("last={n}"));
+        }
+        if !params.is_empty() {
+            path.push('?');
+            path.push_str(&params.join("&"));
+        }
+        self.get(&path).await
+    }
+
+    pub async fn delete_logs(&self, session_id: &str, job_id: Option<&str>) -> Result<()> {
+        let mut path = format!("/sessions/{session_id}/logs");
+        if let Some(j) = job_id {
+            path.push_str(&format!("?job_id={j}"));
+        }
+        self.delete(&path).await
+    }
+
+    // --- Worker endpoints ---
+
+    pub async fn list_workers(&self) -> Result<Vec<WorkerSummary>> {
+        self.get("/workers").await
+    }
+
+    pub async fn clear_worker(&self, worker_id: &str) -> Result<()> {
+        self.delete(&format!("/workers/{worker_id}")).await
+    }
+
+    // --- Identity / Credentials endpoints ---
+
+    pub async fn get_credentials(&self, identity_id: &str) -> Result<IdentityStatus> {
+        self.get(&format!("/identities/{identity_id}")).await
+    }
+
+    pub async fn set_credentials(
+        &self,
+        identity_id: &str,
+        req: &UpdateIdentityRequest,
+    ) -> Result<serde_json::Value> {
+        self.patch(&format!("/identities/{identity_id}"), req).await
+    }
+
+    // --- API Key endpoints ---
+
+    pub async fn create_api_key(&self, req: &CreateApiKeyRequest) -> Result<CreateApiKeyResponse> {
+        self.post("/api-keys", req).await
+    }
+
+    pub async fn list_api_keys(&self) -> Result<PaginatedResponse<ApiKeySummary>> {
+        self.get("/api-keys").await
+    }
+
+    pub async fn revoke_api_key(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/api-keys/{id}")).await
+    }
+
+    // --- Inbox endpoints ---
+
+    pub async fn send_inbox(
+        &self,
+        _agent_id: &str,
+        req: &CreateSessionRequest,
+    ) -> Result<SessionDetail> {
+        self.post("/sessions", req).await
+    }
+
+    pub async fn list_inbox(
+        &self,
+        _agent_id: &str,
+        limit: Option<u32>,
+    ) -> Result<PaginatedResponse<SessionSummary>> {
+        let mut path = "/sessions?workflow=inbox".to_string();
+        if let Some(l) = limit {
+            path.push_str(&format!("&limit={l}"));
+        }
+        self.get(&path).await
+    }
+
+    // --- Wake endpoint ---
+
+    pub async fn wake(&self) -> Result<()> {
+        if let Some(url) = &self.wake_url {
+            let resp = self
+                .client
+                .get(url.as_str())
+                .send()
+                .await
+                .context("Failed to reach wake URL")?;
+            if resp.status().is_success() {
+                println!("Wake request sent successfully to {url}");
+            } else {
+                eprintln!("Wake request returned status: {}", resp.status());
+            }
+            return Ok(());
+        }
+        if let Some(script) = &self.wake_script {
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .status()
+                .context("Failed to run wake script")?;
+            if status.success() {
+                println!("Wake script completed successfully");
+            } else {
+                eprintln!("Wake script exited with status: {status}");
+            }
+            return Ok(());
+        }
+        anyhow::bail!("No wake_url or wake_script configured");
+    }
+
+    // --- Health ---
+
+    pub async fn health(&self) -> Result<HealthResponse> {
+        let resp = self
+            .client
+            .get(self.url("/health"))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!(self.handle_connection_error(&e)))?;
+        if !resp.status().is_success() {
+            let msg = self.parse_error_response(resp).await;
+            anyhow::bail!(msg);
+        }
+        resp.json().await.context("Failed to parse health response")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_client_from_config() {
+        let config = CliConfig {
+            control_plane_url: Some("http://localhost:3000".to_string()),
+            api_key: Some("test-key".to_string()),
+            wake_url: None,
+            wake_script: None,
+        };
+        let client = ApiClient::from_config(&config).unwrap();
+        assert_eq!(client.base_url, "http://localhost:3000");
+        assert_eq!(client.api_key, "test-key");
+    }
+
+    #[test]
+    fn test_api_client_from_config_missing_url() {
+        let config = CliConfig {
+            control_plane_url: None,
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        assert!(ApiClient::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_api_client_from_config_missing_key() {
+        let config = CliConfig {
+            control_plane_url: Some("http://localhost:3000".to_string()),
+            api_key: None,
+            ..Default::default()
+        };
+        assert!(ApiClient::from_config(&config).is_err());
+    }
+
+    #[test]
+    fn test_url_trailing_slash_trimmed() {
+        let config = CliConfig {
+            control_plane_url: Some("http://localhost:3000/".to_string()),
+            api_key: Some("key".to_string()),
+            ..Default::default()
+        };
+        let client = ApiClient::from_config(&config).unwrap();
+        assert_eq!(client.url("/sessions"), "http://localhost:3000/sessions");
+    }
+}
+
+=== EXISTING CODEBASE CONTEXT (read during implementation) ===
+
+== api-types crate ==
+Modules: api_keys, common, error, health, identity, ids, logs, personas, sessions, workers
+Key types used by CLI:
+- SessionId, JobId, WorkerId, PersonaId, IdentityId, ApiKeyId (from ids.rs)
+- CreateSessionRequest, SessionDetail, SessionSummary, SessionParams, WorkflowType, SessionStatus, SendInputRequest (from sessions.rs)
+- WorkerSummary, WorkerConnectionStatus (from workers.rs)
+- LogEntry, LogLevel (from logs.rs)
+- IdentityStatus, UpdateIdentityRequest (from identity.rs)
+- CreateApiKeyRequest, CreateApiKeyResponse, ApiKeySummary (from api_keys.rs)
+- HealthResponse (from health.rs)
+- PaginatedResponse (from common.rs)
+- ApiError (from error.rs)
+- AgentCli, BranchMode (from common.rs)
+
+== Server API Routes (from server crate exploration) ==
+Public (no auth):
+  GET /health, GET /ready, GET /health/idle
+  POST /api-keys/bootstrap
+  GET /auth/github, /auth/github/callback, /auth/gitlab, /auth/gitlab/callback
+
+Authenticated:
+  POST /api-keys, GET /api-keys, DELETE /api-keys/{id}
+  GET /identities/{id}, PATCH /identities/{id}, GET /identities/{id}/auth-status, GET /identities/{id}/repositories
+  POST /workers/register, GET /workers, GET /workers/{id}, DELETE /workers/{id}, POST /workers/{id}/heartbeat
+  POST /workers/tasks/pull, POST /workers/tasks/{id}/complete, POST /workers/tasks/{id}/logs
+  POST /sessions, GET /sessions, GET /sessions/{id}, PATCH /sessions/{id}, DELETE /sessions/{id}
+  POST /sessions/{id}/input, PATCH /sessions/{session_id}/jobs/{job_id}
+  GET /sessions/{id}/logs, DELETE /sessions/{id}/logs, GET /sessions/{id}/logs/stream
+  GET /sessions/{id}/events
+
+== Workspace Cargo.toml ==
+Members: api-types, server, worker, cli
+
+=== TECH_STACK.md SUMMARY ===
+- CLI is Rust with clap, shares api-types crate
+- Config: env vars + config file (~/.config/remote-harness/config.yaml)
+- Real-time: SSE for logs tail and attach (deferred to task 21)
+- Auth: API key in Authorization: Bearer header
+
+=== BUILD OUTPUT ===
+cargo build -p cli: SUCCESS (0 warnings)
+cargo test -p cli: 11 tests passed, 0 failed
+
+=== CLI HELP OUTPUT ===
+Remote Harness CLI — manage sessions, workers, and logs
+
+Usage: remote-harness [OPTIONS] <COMMAND>
+
+Commands:
+  config       Show resolved configuration
+  session      Manage sessions
+  attach       Attach to a running session (stream events)
+  logs         Manage logs
+  workers      Manage workers
+  credentials  Manage identity credentials (BYOL tokens)
+  api-key      Manage API keys
+  inbox        Manage inbox messages
+  wake         Wake up the control plane
+  help         Print this message or the help of the given subcommand(s)
+
+Options:
+      --url <URL>          Control plane URL (overrides env and config file)
+      --api-key <API_KEY>  API key (overrides env and config file)
+  -h, --help               Print help
+
+=== CONFIG SHOW OUTPUT ===
+Resolved configuration:
+
+  control_plane_url: <not set>
+  api_key:           <not set>
+  wake_url:          <not set>
+  wake_script:       <not set>
+
+Precedence: CLI flags > environment variables > config file
+Config file: /Users/chizbro/Library/Application Support/remote-harness/config.yaml
+
+=== TEST CRITERIA VERIFICATION ===
+[x] `remote-harness --help` shows all commands
+[x] `remote-harness config show` displays resolved config
+[x] Config loads from env vars (test_resolve_from_env)
+[x] Config loads from YAML file (test_config_file_parse)
+[x] Flag > env > config file precedence works (test_flags_override_env, test_resolve_from_flags)
+[x] API client sends auth header correctly (Authorization: Bearer in get/post/patch/delete)
+[x] Connection failure shows clear error message (handle_connection_error with wake suggestion)
+[x] Error responses formatted as human-readable stderr (parse_error_response)
+[x] `cargo build -p cli` produces working binary
+[x] `cargo test -p cli` passes (11/11)
+
+=== DEFERRED TO TASK 21 (CLI Commands) ===
+- SSE streaming for `attach` command
+- SSE streaming for `logs tail` (live tail after initial fetch)
+- Payload handling for inbox send
+
+=== SPEC STATUS ===
+plan/20-cli-foundation-complete.md

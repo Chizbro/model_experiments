@@ -1,0 +1,253 @@
+CONTEXT DUMP: Feature 15 - Worker Agent CLI Execution
+======================================================
+Date: 2026-03-21
+Feature Spec: plan/15-worker-agent-cli-execution-complete.md
+
+## CONVERSATION CONTEXT
+
+### Initial Task
+Find the next feature spec in @plan/ that is still marked 'pending.md', sorted ascending by number.
+Found: 15-worker-agent-cli-execution-pending.md
+
+### Feature Spec Content (plan/15-worker-agent-cli-execution-complete.md)
+```
+# 15 - Worker Agent CLI Execution
+
+## Goal
+Implement the subprocess execution of Claude Code and Cursor CLIs. The worker spawns the agent CLI in the cloned repo, passes the prompt, captures output, and streams it back. Platform-specific handling is critical here.
+
+## What to build
+
+### Agent executor module (`crates/worker/src/agent_executor.rs`)
+
+**CLI discovery**
+- `find_agent_cli(agent_cli: AgentCli) -> Result<PathBuf>`
+- Search PATH for:
+  - Claude Code: `claude` binary
+  - Cursor: `cursor` binary
+- Return clear error if not found: "Claude Code CLI not found on PATH"
+
+**CLI invocation**
+- `run_agent(config: AgentRunConfig) -> Result<AgentOutput>`
+- `AgentRunConfig`: agent_cli, agent_token, prompt, prompt_context (persona), work_dir, model (optional)
+- Set environment for the subprocess:
+  - Claude Code: `ANTHROPIC_API_KEY` = agent_token (or however Claude Code expects it)
+  - Cursor: appropriate env var for Cursor authentication
+- Build command:
+  - Claude Code: `claude -p "{prompt}" --output-format stream-json` (non-interactive, piped mode)
+  - Cursor: equivalent Cursor CLI invocation
+- If persona prompt_context provided, prepend to the prompt or pass as system context
+- Set working directory to cloned repo
+
+**Output streaming**
+- Capture stdout and stderr from the subprocess
+- Parse streaming JSON output (Claude Code `stream-json` format)
+- Extract assistant reply text from the output
+- Buffer log entries and periodically send to control plane (via API client)
+- Detect sentinel substring in output (for loop_until_sentinel)
+
+**Platform-specific handling (`crates/worker/src/platform/`)**
+- `mod.rs` with trait `PlatformHandler`
+- `macos.rs` — Unix process spawning, stdout/stderr capture
+- `linux.rs` — same as macOS with minor differences
+- `windows.rs` — Windows process creation, quoting differences, console handling
+- `wsl.rs` — WSL-specific: may need to invoke CLI through `wsl` command
+
+### Agent output types
+- `AgentOutput { exit_code, stdout, stderr, assistant_reply, sentinel_found }`
+- `assistant_reply`: extracted text of the agent's response (no thinking/tool calls)
+
+## Dependencies
+- Task 13 (worker foundation — needs binary and config)
+- Task 14 (git operations — agent runs in cloned repo)
+
+## Design decisions
+- Start with macOS/Linux support; Windows/WSL as separate platform modules
+- Use `tokio::process::Command` for async subprocess
+- Stream output line-by-line for real-time logging
+- Kill subprocess on graceful shutdown (SIGTERM then SIGKILL after timeout)
+
+## Test criteria
+- [ ] Claude Code CLI discovered on PATH when installed
+- [ ] Clear error when CLI not found
+- [ ] Agent subprocess starts in correct working directory
+- [ ] Environment variables set correctly for agent authentication
+- [ ] Stdout captured and parsed from stream-json format
+- [ ] Assistant reply text extracted (no thinking/tool calls)
+- [ ] Sentinel substring detection works (case-sensitive by default)
+- [ ] Non-zero exit code captured and reported
+- [ ] Subprocess killed on shutdown signal
+- [ ] Platform detection selects correct handler
+- [ ] Unit tests for output parsing logic
+- [ ] Unit tests for sentinel detection
+- [ ] `cargo test -p worker` passes
+```
+
+### TECH_STACK.md (read at start)
+Full content of docs/TECH_STACK.md was read - describes Rust monorepo with:
+- Control Plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+- Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE
+- Web UI: React + TypeScript, Vite, TanStack Query, SSE
+- Workers communicate via REST polling, logs batched via HTTPS POST
+- Agent runtime: Claude Code or Cursor CLI subprocess with user's token
+
+### Exploration Results (Agent)
+Comprehensive exploration of the worker crate revealed:
+
+**Worker Crate Files:**
+- `Cargo.toml` - Package dependencies
+- `src/main.rs` (321 lines) - Main entry point with heartbeat_loop, poll_loop, stub executor
+- `src/config.rs` (268 lines) - WorkerConfig, detect_platform(), config file loading
+- `src/api_client.rs` (261 lines) - ControlPlaneClient with register, heartbeat, pull_task, send_logs, complete_task
+- `src/git_ops.rs` (489 lines) - Clone, branch, commit, push operations
+
+**API Types:**
+- `AgentCli` enum: ClaudeCode, Cursor (in common.rs)
+- `TaskInput` enum: ChatFirst, ChatFollowup, Loop, Inbox
+- `PullTaskResponse`: task_id, session_id, job_id, repo_url, ref_, workflow, params, input, git_token, agent_token, agent_cli, model, branch_mode, prompt_context
+- `TaskCompleteRequest`: status, worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply
+- `WorkerLogEntry`: timestamp, level, message, source
+- `SessionParams`: prompt, n, sentinel, agent_cli, model, branch_mode, branch_name_prefix
+
+**Key design:** Worker registers, heartbeats every 30s, polls every 5s. Previously had a stub executor that immediately completed tasks.
+
+### Files Read During Implementation
+
+#### crates/worker/src/main.rs (before modification)
+- Lines 1-321: Full main.rs with mod declarations, WorkerState struct, main(), register(), heartbeat_loop(), poll_loop() with stub executor, shutdown_signal(), tests
+
+#### crates/worker/src/api_client.rs
+- Lines 1-261: ControlPlaneClient with all methods, ApiClientError enum, with_retry helper
+
+#### crates/worker/src/config.rs
+- Lines 1-268: WorkerConfig, FileConfig, load(), env_or(), parse_labels_from_env(), detect_platform(), generate_worker_id()
+
+#### crates/api-types/src/common.rs
+- Lines 1-75: PaginatedResponse, BranchMode, AgentCli enums with serde
+
+#### crates/api-types/src/workers.rs
+- Lines 1-265: WorkerStatus, WorkerConnectionStatus, RegisterWorkerRequest/Response, HeartbeatRequest/Response, WorkerSummary, WorkerDetail, TaskInput, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus
+
+#### crates/api-types/src/logs.rs
+- Lines 1-97: LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest
+
+#### crates/api-types/src/lib.rs
+- Lines 1-32: Module declarations and re-exports
+
+#### crates/worker/src/git_ops.rs (partial read lines 80-180)
+- clone_repo signature: (repo_url: &str, ref_: Option<&str>, git_token: &str, work_dir: &Path) -> Result<Repository>
+- checkout_or_create_branch, commit_changes functions
+
+#### crates/worker/Cargo.toml (before modification)
+- Dependencies: api-types, tokio, reqwest, git2, tracing, serde, serde_json, serde_yaml, anyhow, thiserror, chrono, hostname, rand, dirs, urlencoding, tempfile
+
+### Implementation
+
+#### Files Created:
+
+1. **crates/worker/src/agent_executor.rs** (409 lines)
+   - `AgentRunConfig` struct: agent_cli, agent_token, prompt, prompt_context, work_dir, model, sentinel
+   - `AgentOutput` struct: exit_code, stdout, stderr, assistant_reply, sentinel_found (with Default derive)
+   - `find_agent_cli(agent_cli: &AgentCli) -> Result<PathBuf>` - uses `which` crate to search PATH
+   - `run_agent(config, client, task_id, platform) -> Result<AgentOutput>` - main execution function:
+     - Finds CLI binary on PATH
+     - Builds full prompt (prepends persona context if provided)
+     - Builds command via platform handler
+     - Sets auth env vars via platform handler
+     - Spawns subprocess with piped stdout/stderr, null stdin
+     - Reads stdout and stderr concurrently via tokio::spawn
+     - Waits for subprocess exit
+     - Sends completion log entry to control plane
+   - `process_stdout(stdout, sentinel, client, task_id)` - async stdout processing:
+     - Line-by-line reading via BufReader
+     - Parses stream-json format for assistant reply text
+     - Detects sentinel substring
+     - Buffers log entries, flushes to control plane every 2 seconds
+   - `process_stderr(stderr)` - async stderr collection
+   - `parse_stream_json_line(line: &str) -> Option<String>` - parses Claude Code stream-json:
+     - "assistant" type: extracts text from message.content blocks
+     - "content_block_delta" type: extracts text_delta text
+     - "result" type with subtype "text": extracts result text
+   - `detect_sentinel(text, sentinel)` - case-sensitive substring check
+   - 12 unit tests covering: CLI discovery error, all stream-json parsing variants, sentinel detection, AgentOutput default, AgentRunConfig with persona
+
+2. **crates/worker/src/platform/mod.rs** (131 lines)
+   - `PlatformHandler` trait: build_command(), set_env(), platform_name()
+   - `current_platform() -> Box<dyn PlatformHandler>` - uses detect_platform() from config
+   - `claude_code_args(prompt, model)` - builds `-p {prompt} --output-format stream-json [--model ...]`
+   - `cursor_args(prompt, model)` - builds `--prompt {prompt} [--model ...]`
+   - `set_agent_env(cmd, agent_cli, agent_token)` - sets ANTHROPIC_API_KEY or CURSOR_API_KEY, CI=1
+   - 5 unit tests
+
+3. **crates/worker/src/platform/macos.rs** (77 lines)
+   - `MacOsHandler` implementing PlatformHandler
+   - Uses `pre_exec` to call `libc::setpgid(0, 0)` for process group management
+   - 2 unit tests
+
+4. **crates/worker/src/platform/linux.rs** (67 lines)
+   - `LinuxHandler` implementing PlatformHandler
+   - Same as macOS with pre_exec/setpgid
+   - 2 unit tests
+
+5. **crates/worker/src/platform/windows.rs** (62 lines)
+   - `WindowsHandler` implementing PlatformHandler
+   - Uses CREATE_NEW_PROCESS_GROUP flag on Windows (cfg-gated)
+   - 2 unit tests
+
+6. **crates/worker/src/platform/wsl.rs** (64 lines)
+   - `WslHandler` implementing PlatformHandler
+   - Assumes CLI installed within WSL environment
+   - Uses pre_exec/setpgid like Linux
+   - 2 unit tests
+
+#### Files Modified:
+
+7. **crates/worker/Cargo.toml**
+   - Added: `which = "7"`, `libc = "0.2"`
+
+8. **crates/worker/src/main.rs** (478 lines, was 321)
+   - Added module declarations: `mod agent_executor;`, `pub mod platform;`
+   - Added imports: `AgentCli`, `TaskInput`
+   - Replaced stub executor in poll_loop with call to `execute_task()`
+   - Added `execute_task(state, task) -> TaskCompleteRequest` function (165 lines):
+     - Extracts prompt from TaskInput variant
+     - Determines AgentCli (default ClaudeCode)
+     - Validates agent_token presence
+     - Creates work directory via git_ops::create_work_dir
+     - Clones repo via git_ops::clone_repo
+     - Extracts sentinel from session params
+     - Builds AgentRunConfig
+     - Gets platform handler
+     - Runs agent via agent_executor::run_agent
+     - Cleans up work directory
+     - Maps AgentOutput to TaskCompleteRequest (completed/failed based on exit code)
+
+### Build Results
+- `cargo build -p worker` - SUCCESS (3 pre-existing warnings: detect_sentinel unused, ApiClientError::Other unused, log_dir unused)
+- `cargo build --workspace` - SUCCESS
+- `cargo test -p worker` - 57 tests passed, 0 failed
+
+### Test Coverage
+The 57 tests include:
+- agent_executor tests: CLI discovery error, stream-json parsing (assistant message, content_block_delta, result, non-text type, empty line, invalid JSON, no text blocks), sentinel detection (found, not found, case sensitive, empty), AgentOutput default, AgentRunConfig with persona
+- platform tests: current_platform handler, claude_code_args with/without model, cursor_args with/without model, platform name for each handler, build_command for each handler
+- Pre-existing tests: config, api_client, git_ops, main module tests
+
+### Design Decisions Made
+1. Used `which` crate for portable PATH searching instead of manual PATH traversal
+2. Used `libc::setpgid(0, 0)` via `pre_exec` for Unix platforms to enable process group cleanup
+3. Used `CREATE_NEW_PROCESS_GROUP` for Windows platform
+4. Stream-json parsing handles 3 message types: assistant, content_block_delta, result
+5. Log buffer flushes every 2 seconds to balance between real-time streaming and API call overhead
+6. Sentinel detection is case-sensitive (per spec)
+7. Persona context is prepended to prompt with double newline separator
+8. git_token defaults to empty string when None (clone_repo takes &str not Option)
+9. Output truncated in TaskCompleteRequest: stdout to 10000 chars, stderr to 1000 chars
+10. CI=1 env var set to disable interactive prompts in agent CLIs
+
+### Final State
+- Feature spec renamed: 15-worker-agent-cli-execution-pending.md → 15-worker-agent-cli-execution-complete.md
+- All files created/modified successfully
+- Workspace builds clean
+- All 57 tests pass

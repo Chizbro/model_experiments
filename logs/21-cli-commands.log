@@ -1,0 +1,627 @@
+=== CONTEXT DUMP FOR FEATURE 21: CLI Commands ===
+Date: 2026-03-22
+
+=== SYSTEM PROMPT (summarized - tool definitions) ===
+Standard Claude Code agent system prompt with tools: Agent, Bash, Glob, Grep, Read, Edit, Write, Skill, ToolSearch, TodoWrite, and deferred tools including WebFetch, WebSearch, Playwright MCP tools, etc.
+
+=== USER MESSAGE ===
+Find the next feature spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+
+If there are no more pending tasks: your very first output must be exactly this single line (no other text, no markdown, no explanation before or after):
+`{ "event": "terminate", "reason": "NO MORE JOBS" }`
+Then stop. Do not run any tools or do any other work when there are no more jobs.
+
+If there is a pending spec:
+- Mark the feature spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the @docs/TECH_STACK.md and @plan/design-system.md
+- Read the feature spec
+- Implement and test the feature
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the feature as complete by renaming to *.complete.md
+- Dump your context to `logs/{feature}.log`. DO NOT SUMMARIZE YOUR CONTEXT I WANT THE ENTIRE CONTENTX OF YOUR CONTENTS WINDOW
+
+=== SYSTEM REMINDERS (from prior tool calls) ===
+- Bash tool result: ls of plan/ directory showing all spec files
+- Read tool result: docs/TECH_STACK.md full contents (171 lines)
+- Available skills: update-config, keybindings-help, simplify, loop, claude-api
+- Current date: 2026-03-22
+
+=== PLAN FILES LISTING ===
+08-worker-registration-heartbeat-complete.md
+24-web-ui-dashboard-sessions-pending.md
+10-task-dispatch-completion-complete.md
+14-worker-git-operations-complete.md
+27-docker-deployment-pending.md
+25-web-ui-workers-logs-pending.md
+07-git-oauth-flows-complete.md
+02-api-types-design-complete.md
+11-log-ingestion-storage-complete.md
+15-worker-agent-cli-execution-complete.md
+12-log-sse-streaming-complete.md
+06-identity-credentials-complete.md
+28-ci-pipeline-pending.md
+26-personas-pending.md
+13-worker-foundation-complete.md
+23-web-ui-settings-auth-pending.md
+03-database-schema-complete.md
+22-web-ui-foundation-pending.md
+21-cli-commands-pending.md
+29-e2e-integration-tests-pending.md
+19-pr-mr-creation-complete.md
+04-server-foundation-complete.md
+20-cli-foundation-complete.md
+18-loop-workflows-complete.md
+17-chat-workflow-complete.md
+16-worker-task-lifecycle-logging-complete.md
+01-repo-scaffolding-complete.md
+09-session-job-state-machine-complete.md
+05-api-key-auth-complete.md
+
+=== TECH_STACK.md CONTENTS ===
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). | — |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI ([API_OVERVIEW](API_OVERVIEW.md)). v1: SSE only. | Long-polling (fallback only) |
+
+**CLI surface (conceptual):** Commands map to operations in [API_OVERVIEW.md](API_OVERVIEW.md); do not restate parameters or status codes here ([API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+- `remote-harness config show` — show resolved config and precedence
+- `remote-harness session start [--repo URL] [--workflow type] [--params ...]`
+- `remote-harness session list` / `remote-harness session show <id>` / `remote-harness session delete <id>`
+- `remote-harness attach <session_id>`
+- `remote-harness logs tail [--session-id id] [--job-id id]` — loads full history then SSE stream; same client contract as Web ([API_OVERVIEW §6](API_OVERVIEW.md#6-rest--logs))
+- `remote-harness logs delete [--session-id id] [--job-id id]` — maps to **`DELETE /sessions/:id/logs`**; omit `--job-id` to delete all logs for the session in the central store ([API_OVERVIEW §6 — Delete session logs](API_OVERVIEW.md#delete-session-logs))
+- `remote-harness workers list` / `remote-harness workers clear <worker_id>`
+- `remote-harness credentials show` / `remote-harness credentials set` — identity tokens (BYOL)
+- `remote-harness inbox send <agent_id>` (with `--payload` or `--prompt`; optional `--persona-id`) / `remote-harness inbox list <agent_id>` (optional `--limit`, `--cursor`)
+- `remote-harness session start --workflow inbox --agent-id <id>` (and optional `--repo`, `--agent-cli`, `--model`, `--branch-mode`)
+
+---
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+**Key views:** Dashboard (sessions list, workers), Session detail (log tail, attach, inputs; delete session, delete logs, retain_forever), Worker list, Inbox / agent list, **Settings** — control plane URL and API key (e.g. for Tailscale URL when opening the UI from anywhere); BYOL credentials (identity tokens) and GitHub/GitLab OAuth sign-in for storing git_token on an identity. Same API as the CLI ([AGENTS.md](../AGENTS.md), [API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+**Client-only API access:** When the UI is hosted publicly (e.g. on an always-on host) while the control plane is only reachable via Tailscale (or a private network), the browser must talk to the control plane directly. The UI must **not** use server-side code in the framework to proxy or fetch from the control plane (no Next.js server components, Nuxt server routes, etc. that call the API). Use a **client-side only** pattern: SPA with browser-based **REST + SSE** to the control plane URL. See [Hosting §4b](HOSTING.md#4b-ui-hosting-public-url-client-only-api-access).
+
+**UI security (API keys):** The v1 UI stores the control plane API key in **browser storage** (e.g. localStorage) for simplicity. Treat the UI as a **high-trust** surface: no untrusted third-party scripts, strong **Content-Security-Policy** where deployed, and HTTPS in production. A future iteration may move to **httpOnly** cookies or short-lived tokens. **Normative operator and UX expectations:** [HOSTING §14 — Web UI threat model](HOSTING.md#14-web-ui-threat-model-api-key-in-browser) and [CLIENT_EXPERIENCE §11](CLIENT_EXPERIENCE.md#11-web-ui-and-api-key-operator-expectations).
+
+---
+
+## 5. Logging (Unified)
+
+| Layer | Recommendation | Rationale |
+|-------|----------------|-----------|
+| **Format** | **Structured JSON** (e.g. `{"time":"...","level":"info","session_id":"...","job_id":"...","message":"..."}`) | Easy to parse, filter, index. |
+| **Transport from workers** | **HTTPS POST** to control plane log endpoint | Workers send log entries to the control plane; control plane aggregates and stores. No queue. |
+| **Tail API** | **SSE** (Server-Sent Events) with filters (`session_id`, `job_id`, `level`) | Same for CLI and Web. v1: SSE only; no WebSocket for log tail. |
+| **Persistence** | **Dual-write; all logs go to disk.** (1) **Local files:** Every log line is written to disk on the component that produced it (control plane → files on backend; each worker → files on that worker). (2) **Central store (PostgreSQL)** on the control plane: control plane writes its own logs and ingested worker logs to the DB so the CLI and Web UI can both show all logs from all places. If streaming or either client breaks, logs are still in files on backend or worker. See [Architecture §6](ARCHITECTURE.md#6-logging-architecture). | Retention and "retain forever" / manual delete apply to the central store. |
+
+---
+
+## 6. Security & Auth (control plane only)
+
+This section is about **auth to the Remote Harness control plane** (who can use the API, which workers are trusted). Auth to Git and to the agent CLI (BYOL) are separate; see [Architecture §8](ARCHITECTURE.md#8-three-auth-concerns).
+
+| Area | Recommendation |
+|------|----------------|
+| **Control plane API** | API key in header (`Authorization: Bearer <key>` or `X-API-Key`) for CLI and Web. |
+| **Workers** | API key (machine token) in env or config; sent with every request to the control plane. |
+| **TLS** | All connections to the control plane over HTTPS (TLS). |
+| **Secrets** | Git credentials in control plane or env; workers receive per-job. Agent execution uses user's Claude Code / Cursor token (BYOL), stored and refreshed by control plane. |
+
+**v1: API key only.** No OIDC or mTLS in v1.
+
+### Control plane auth: configuration (API key)
+
+Configuration must be clear and consistent across components.
+
+| Component | Where the API key is set | How it's used |
+|-----------|---------------------------|----------------|
+| **Server** | Server stores issued API keys (e.g. in DB or config). Keys are created via CLI or Web UI (e.g. `remote-harness api-key create` or Settings in UI). Server validates the key on every request. | Validates `Authorization` or `X-API-Key` header. |
+| **CLI** | **Env:** `REMOTE_HARNESS_API_KEY` (or `API_KEY`). **Config file:** `~/.config/remote-harness/config.yaml` with `api_key: <key>`. **Precedence:** CLI flag > env > config file. Document in CLI help and README. | Sent on every request to the control plane URL. |
+| **Web UI** | User enters the API key once (e.g. Login or Set API key in UI). Stored in browser **localStorage** (control plane URL and API key); logout clears them. | Sent in `Authorization: Bearer <key>` or `X-API-Key` on every API call. |
+| **Worker** | **Env:** `REMOTE_HARNESS_API_KEY` or `API_KEY`. **Config file:** e.g. `config.yaml` or `~/.config/remote-harness-worker/config.yaml` with `control_plane_url` and `api_key`. **Precedence:** env > config file (no flags for worker). Document in worker README. | Sent on every request (register, heartbeat, pull task, send logs). |
+
+**Current implementation:** Server accepts keys from env (`API_KEY`, `API_KEYS`), config file, and **issued keys** stored in the DB (created via `remote-harness api-key create` or Web UI Settings → Create API key). Issued keys are stored as SHA-256 hashes; the plain key is shown only once at creation. Worker reads config from a **YAML** file; default path when `REMOTE_HARNESS_CONFIG` is unset is `~/.config/remote-harness-worker/config.yaml` (env overrides file).
+
+**Control plane URL** (for CLI and worker): env `REMOTE_HARNESS_URL` or `CONTROL_PLANE_URL`, or config file `control_plane_url`. Same precedence as api_key (CLI: flag > env > config; worker: env > config). Document alongside `api_key` so both are in one place.
+
+---
+
+## 7. Repo Layout (Rust Monorepo)
+
+Control plane, workers, and CLI are all **Rust** in one workspace; shared types and API contracts live in a common crate.
+
+```
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI with user token)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+│   ├── src/
+│   └── package.json
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TECH_STACK.md
+│   └── PRODUCT.md
+├── Cargo.toml               # Workspace root
+├── Cargo.lock
+├── Dockerfile               # Build and run control plane / services with Docker
+├── docker-compose.yml       # Compose for server, DB, and optional worker/UI
+└── README.md
+```
+
+Each binary is built with `cargo build -p server`, `cargo build -p worker`, `cargo build -p cli`. The `api-types` crate keeps REST JSON payloads in sync between server, worker, and CLI. For containerized build and run, use the repo root **Dockerfile** and **docker-compose.yml**; see [GETTING_STARTED.md §1](GETTING_STARTED.md#1-docker-compose-recommended).
+
+---
+
+## 8. Summary Table
+
+| Component | Stack |
+|-----------|-----------------|
+| Control plane | **Rust** (axum, tokio, sqlx), REST + **SSE**, PostgreSQL (task queue in DB) |
+| Workers | **Rust** (tokio, reqwest, git2); agent via **Claude Code or Cursor CLI** (BYOL—user's token) |
+| CLI | **Rust** (clap), SSE for tail and attach, shares `api-types` with server |
+| Web UI | React + TypeScript, Vite, TanStack Query, SSE for log/session stream |
+| Logging | JSON; dual-write (local files + central DB); SSE for tail; retention and manual delete on central store |
+| Auth | API key (CLI, Web, workers); TLS for all connections |
+
+---
+
+*Previous: [Architecture](ARCHITECTURE.md) | Next: [Product & Features](PRODUCT.md) | [Client experience](CLIENT_EXPERIENCE.md)*
+
+=== FEATURE SPEC 21 CONTENTS ===
+# 21 - CLI Commands (Sessions, Logs, Workers, Credentials)
+
+## Goal
+Implement all CLI commands that map to the control plane API. Each command should provide a good terminal UX with clear output and error messages.
+
+## What to build
+
+### Session commands (`crates/cli/src/commands/session.rs`)
+
+**session start**
+- Collect params from flags: --repo, --workflow, --prompt, --n, --sentinel, --agent-cli, --model, --branch-mode, --persona-id, --identity-id, --retain-forever
+- POST /sessions
+- Print: `Session created: {session_id}\nStatus: pending\nWeb UI: {web_url}`
+
+**session list**
+- GET /sessions with optional --status filter
+- Print table: session_id | workflow | status | repo | created_at
+
+**session show**
+- GET /sessions/:id
+- Print session detail + jobs table (job_id | status | error | PR URL)
+
+**session delete**
+- DELETE /sessions/:id
+- Confirm before delete (unless --force)
+- Print: `Session {id} deleted`
+
+### Attach command (`crates/cli/src/commands/attach.rs`)
+- GET /sessions/:id to verify session exists and get status
+- Open SSE to GET /sessions/:id/logs/stream
+- Also open SSE to GET /sessions/:id/events
+- Print log entries as they arrive (formatted: `[timestamp] [level] message`)
+- Print session events (e.g. "Job started", "Session completed")
+- For chat sessions: accept user input from stdin, POST /sessions/:id/input
+- Exit when session reaches terminal state
+
+### Logs commands (`crates/cli/src/commands/logs.rs`)
+
+**logs tail**
+- First: GET /sessions/:id/logs (paginate until all loaded, or use --last N)
+- Then: open SSE to /sessions/:id/logs/stream
+- Print formatted log entries
+- Support --job-id and --level filters
+
+**logs delete**
+- DELETE /sessions/:id/logs?job_id=X
+- Confirm before delete (unless --force)
+
+### Worker commands (`crates/cli/src/commands/workers.rs`)
+
+**workers list**
+- GET /workers
+- Print table: worker_id | host | platform | status | last_seen
+
+**workers clear**
+- DELETE /workers/:id
+- Print: `Worker {id} removed`
+
+### Credential commands (`crates/cli/src/commands/credentials.rs`)
+
+**credentials show**
+- GET /identities/:id (default "default")
+- GET /identities/:id/auth-status
+- Print: token status, expiry info
+
+**credentials set**
+- PATCH /identities/:id with provided tokens
+- Print: `Credentials updated`
+
+### API key commands (`crates/cli/src/commands/api_keys.rs`)
+
+**api-key create**
+- POST /api-keys with --label
+- Print: `API key created: {key}\nSave this key — it will not be shown again.`
+
+**api-key list**
+- GET /api-keys
+- Print table: id | label | created_at
+
+**api-key revoke**
+- DELETE /api-keys/:id
+- Print: `API key {id} revoked`
+
+## Dependencies
+- Task 20 (CLI foundation — clap structure, API client)
+- All server endpoints must exist (Tasks 05-12)
+
+## Test criteria
+- [ ] `session start` creates a session and prints session_id
+- [ ] `session list` displays sessions in table format
+- [ ] `session show` displays detail with jobs
+- [ ] `attach` connects to SSE and streams logs
+- [ ] `attach` for chat sessions accepts stdin input
+- [ ] `logs tail` loads history then streams
+- [ ] `logs tail --last 10` shows only last 10 entries
+- [ ] `workers list` shows workers with status
+- [ ] `credentials set` updates identity tokens
+- [ ] `credentials show` displays token status (never actual tokens)
+- [ ] `api-key create` returns and displays the key
+- [ ] All error cases show human-readable error messages on stderr
+- [ ] All commands exit with code 0 on success, 1 on failure
+- [ ] `cargo test -p cli` passes
+
+=== design-system.md ===
+File does not exist.
+
+=== AGENT EXPLORATION RESULTS ===
+
+== CLI Crate Exploration ==
+
+Directory Structure:
+crates/cli/
+├── Cargo.toml
+└── src/
+    ├── main.rs (CLI entry point with commands)
+    ├── config.rs (configuration resolution)
+    └── api_client.rs (HTTP API client)
+
+CLI Cargo.toml dependencies:
+- api-types (local workspace)
+- clap 4.x with derive
+- reqwest 0.12 with json feature
+- tokio 1.x with full features
+- serde 1.x with derive
+- serde_json 1
+- serde_yaml 0.9
+- dirs 6
+- anyhow 1
+
+Dev dependencies:
+- tempfile 3
+
+== API Types Exploration ==
+crates/api-types/
+└── src/
+    ├── lib.rs (module re-exports)
+    ├── health.rs (HealthResponse, IdleResponse)
+    ├── error.rs (ApiError)
+    ├── sessions.rs (WorkflowType, SessionStatus, SessionParams, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest)
+    ├── personas.rs (CreatePersonaRequest, PersonaDetail, PersonaSummary)
+    ├── identity.rs (IdentityStatus, AuthStatus, UpdateIdentityRequest, RepositoryInfo, RepositoryListResponse, ResolvedCredentials)
+    ├── workers.rs (WorkerStatus, WorkerConnectionStatus, RegisterWorkerRequest, RegisterWorkerResponse, HeartbeatRequest, HeartbeatResponse, WorkerSummary, WorkerDetail, TaskInput, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus)
+    ├── ids.rs (SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId, ApiKeyId)
+    ├── api_keys.rs (CreateApiKeyRequest, CreateApiKeyResponse, ApiKeySummary)
+    ├── logs.rs (LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest)
+    └── common.rs (PaginatedResponse<T>, BranchMode, AgentCli)
+
+== Server API Routes Exploration ==
+
+Public Routes (no auth):
+- POST /api-keys/bootstrap
+- GET /auth/github
+- GET /auth/github/callback
+- GET /auth/gitlab
+- GET /auth/gitlab/callback
+- GET /health
+- GET /ready
+- GET /health/idle
+
+Authenticated Routes:
+- POST /api-keys
+- GET /api-keys
+- DELETE /api-keys/{id}
+- GET /identities/{id}
+- PATCH /identities/{id}
+- GET /identities/{id}/auth-status
+- GET /identities/{id}/repositories
+- POST /sessions
+- GET /sessions
+- GET /sessions/{id}
+- PATCH /sessions/{id}
+- DELETE /sessions/{id}
+- POST /sessions/{id}/input
+- GET /sessions/{id}/events (SSE)
+- PATCH /sessions/{session_id}/jobs/{job_id}
+- POST /workers/tasks/{id}/logs
+- GET /sessions/{id}/logs
+- DELETE /sessions/{id}/logs
+- GET /sessions/{id}/logs/stream (SSE)
+- POST /workers/register
+- GET /workers
+- GET /workers/{id}
+- POST /workers/{id}/heartbeat
+- DELETE /workers/{id}
+- POST /workers/tasks/pull
+- POST /workers/tasks/{id}/complete
+
+SSE Details:
+- Log stream: event type "log", data is LogEntry JSON
+- Session events: event type "session_event", events: started, job_started, job_completed, job_failed, completed, failed
+- Both have 15-second keepalive heartbeat
+
+=== FILES READ ===
+
+== crates/cli/src/main.rs (BEFORE changes) ==
+(562 lines - full CLI with clap structure, all command handlers implemented but Attach and Logs tail had placeholder SSE comments)
+
+Key observations:
+- All commands already had basic implementations from Task 20
+- Attach: printed "SSE streaming not yet implemented — see task 21"
+- Logs tail: fetched history but printed "Live SSE tail not yet implemented — see task 21"
+- Session start: used --params JSON flag instead of individual flags
+- Delete commands: no --force flag, no confirmation prompt
+- Workers list: returned Vec<WorkerSummary> not PaginatedResponse
+- Credentials show: no auth-status call
+
+== crates/cli/src/api_client.rs (BEFORE changes) ==
+(391 lines - HTTP API client with get/post/patch/delete methods and all endpoint methods)
+
+Key observations:
+- list_workers returned Vec<WorkerSummary> instead of PaginatedResponse<WorkerSummary>
+- set_credentials returned serde_json::Value via patch (but server returns 204 no content)
+- No get_auth_status method
+- No SSE streaming support
+
+== crates/cli/src/config.rs ==
+(199 lines - config resolution with flags > env > config file precedence)
+
+== crates/cli/Cargo.toml (BEFORE changes) ==
+No stream feature for reqwest, no futures-util, no chrono
+
+== crates/api-types/src/identity.rs ==
+(92 lines - IdentityStatus, AuthStatus, UpdateIdentityRequest, RepositoryInfo, RepositoryListResponse, ResolvedCredentials)
+
+== crates/api-types/src/sessions.rs ==
+(216 lines - WorkflowType, SessionStatus, SessionParams, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest)
+
+== crates/api-types/src/workers.rs ==
+(80+ lines - WorkerStatus, WorkerConnectionStatus, RegisterWorkerRequest, WorkerSummary, WorkerDetail, TaskInput...)
+
+== crates/api-types/src/common.rs ==
+(76 lines - PaginatedResponse<T>, BranchMode, AgentCli)
+
+== crates/api-types/src/logs.rs ==
+(98 lines - LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest)
+
+=== CHANGES MADE ===
+
+== 1. crates/cli/Cargo.toml ==
+Added dependencies:
+- reqwest: added "stream" feature (for bytes_stream())
+- chrono = { version = "0.4", features = ["serde"] }
+- futures-util = "0.3"
+
+== 2. crates/cli/src/api_client.rs ==
+Changes:
+a) list_workers: changed return type from Vec<WorkerSummary> to PaginatedResponse<WorkerSummary>
+b) Added get_auth_status method: GET /identities/{id}/auth-status -> AuthStatus
+c) Replaced patch<B, T> (returns JSON) with patch_no_content<B> (returns ()) since PATCH /identities returns 204
+d) Updated set_credentials to return Result<()> instead of Result<serde_json::Value>
+
+== 3. crates/cli/src/main.rs ==
+Major changes:
+
+a) Session start flags: Replaced single --params JSON flag with individual typed flags:
+   --prompt, --n, --sentinel, --agent-cli, --model, --branch-mode, --retain-forever
+   Added parse_agent_cli() and parse_branch_mode() helper functions.
+   SessionParams is built from individual flags (only created if any flag is set).
+
+b) Session list: Now prints formatted table with headers (SESSION_ID, WORKFLOW, STATUS, REPO, CREATED)
+
+c) Session show: Enhanced output with:
+   - retain_forever display
+   - Session parameters detail (prompt, n, sentinel, agent_cli, model, branch_mode)
+   - Jobs table with headers (JOB_ID, STATUS, CREATED, PR URL)
+   - Error messages for failed jobs
+
+d) Session delete: Added --force flag. Without --force, prompts "Delete session {id}? [y/N]"
+
+e) Attach command: Full SSE implementation:
+   - Verifies session exists and checks status (exits early for terminal states)
+   - Spawns two concurrent SSE streams via tokio::spawn:
+     1. Log stream: GET /sessions/:id/logs/stream -> prints "[HH:MM:SS] [LEVEL] message"
+     2. Event stream: GET /sessions/:id/events -> prints "[event] Session {id}: {event}"
+   - For chat sessions (WorkflowType::Chat): spawns stdin reader that sends input via POST /sessions/:id/input
+   - Uses tokio::select! to run all streams concurrently
+
+f) Logs tail: Two-phase implementation:
+   - Phase 1: Fetch historical logs via GET /sessions/:id/logs (with job_id, level, last filters)
+   - Phase 2: Open SSE stream to /sessions/:id/logs/stream with same filters
+   - Deduplication: tracks last timestamp from history, skips SSE entries with timestamp <= last_ts
+   - Also handles "session_event" SSE events for terminal state notification
+
+g) Logs delete: Added --force flag with confirmation prompt
+
+h) Workers list: Updated to use PaginatedResponse, prints table with headers (WORKER_ID, HOST, PLATFORM, STATUS, LAST_SEEN)
+
+i) Credentials show: Enhanced with auth-status call:
+   - Shows IdentityStatus (has_git_token, has_agent_token)
+   - Calls get_auth_status and displays: git_token_status, provider, expires_at, message
+   - Silently ignores auth-status errors (endpoint may not be available)
+   - Default identity_id changed to "default"
+
+j) Credentials set: Default identity_id changed to "default"
+
+k) API key list: Prints formatted table with headers (ID, LABEL, CREATED)
+
+l) Added helper functions:
+   - print_log_entry(): formatted log output
+   - truncate_str(): truncates strings with "..." for table display
+   - confirm_action(): reads y/N from stdin
+   - parse_agent_cli(): parses "claude_code"/"claude-code"/"cursor"
+   - parse_branch_mode(): parses "main"/"pr"
+
+m) Added SSE streaming infrastructure:
+   - SessionEvent struct for deserializing session events
+   - stream_sse() async function: generic SSE client that:
+     - Connects with Authorization header and Accept: text/event-stream
+     - Parses SSE protocol (event:, data:, comments, empty line dispatching)
+     - Calls handler callback for each complete event
+     - Uses futures_util::StreamExt for bytes_stream()
+
+=== BUILD/TEST RESULTS ===
+
+1. Initial build failed: reqwest missing "stream" feature for bytes_stream()
+   Fix: Added "stream" to reqwest features in Cargo.toml
+
+2. After fix: cargo build -p cli succeeded
+
+3. cargo clippy -p cli: 7 warnings (print_literal, needless_borrow)
+   Fix: cargo clippy --fix --allow-dirty
+
+4. After clippy fix: cargo clippy -p cli clean (no warnings)
+
+5. cargo test -p cli: 11 passed, 0 failed
+   Tests: test_api_client_from_config, test_api_client_from_config_missing_url, test_api_client_from_config_missing_key, test_url_trailing_slash_trimmed, test_resolve_from_flags, test_resolve_from_env, test_flags_override_env, test_config_file_parse, test_require_url_missing, test_require_api_key_missing, test_require_url_present
+
+6. Full workspace build: succeeded (only pre-existing warning in worker crate about unused detect_sentinel function)
+
+=== FINAL FILE CONTENTS ===
+
+== crates/cli/Cargo.toml (AFTER) ==
+[package]
+name = "cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "remote-harness"
+path = "src/main.rs"
+
+[dependencies]
+api-types = { path = "../api-types" }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+dirs = "6"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+== crates/cli/src/main.rs (AFTER - key sections) ==
+[Full file was written - 959 lines total after clippy fixes]
+
+Key structures:
+- Cli struct with --url, --api-key global args
+- Commands enum: Config, Session, Attach, Logs, Workers, Credentials, ApiKey, Inbox, Wake
+- SessionAction::Start with individual typed flags (repo, workflow, prompt, n, sentinel, agent_cli, model, branch_mode, persona_id, identity_id, retain_forever)
+- SessionAction::Delete with --force flag
+- LogsAction::Delete with --force flag
+- CredentialsAction::Show with default identity_id "default"
+- CredentialsAction::Set with default identity_id "default"
+
+Key functions:
+- run(): main dispatch, handles all commands
+- stream_sse(): generic SSE client using reqwest streaming + futures_util
+- confirm_action(): stdin y/N prompt
+- parse_workflow(), parse_agent_cli(), parse_branch_mode(): string -> enum parsers
+- format_log_level(), print_log_entry(), truncate_str(): display helpers
+
+== crates/cli/src/api_client.rs (AFTER - changed methods) ==
+- list_workers() -> Result<PaginatedResponse<WorkerSummary>>
+- get_auth_status() -> Result<AuthStatus>  (NEW)
+- set_credentials() -> Result<()>  (was Result<serde_json::Value>)
+- patch_no_content() (replaced generic patch<B,T>)
+
+=== TODO LIST FINAL STATE ===
+1. [completed] Add missing CLI flags
+2. [completed] Add SSE streaming dependencies and implement SSE client
+3. [completed] Implement attach command with SSE log/event streaming and chat stdin input
+4. [completed] Implement logs tail with history fetch then SSE streaming
+5. [completed] Add confirmation prompts for delete commands
+6. [completed] Add auth-status to credentials show command
+7. [completed] Build, lint, and test
+8. [in_progress] Mark feature spec complete and dump context
+
+=== SPEC STATUS ===
+Renamed: plan/21-cli-commands-pending.md -> plan/21-cli-commands-processing.md -> plan/21-cli-commands-complete.md

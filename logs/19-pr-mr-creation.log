@@ -1,0 +1,986 @@
+== CONTEXT DUMP: Task 19 - PR/MR Creation ==
+== Date: 2026-03-22 ==
+
+== CONVERSATION CONTEXT ==
+
+User requested: Find next pending feature spec in plan/, implement it.
+
+Found: 19-pr-mr-creation-pending.md (lowest numbered pending spec)
+
+== FEATURE SPEC (19-pr-mr-creation) ==
+
+# 19 - PR/MR Creation
+
+## Goal
+Implement server-side Pull Request (GitHub) and Merge Request (GitLab) creation after successful task completion in PR mode. This hooks into the task complete flow from Task 10.
+
+## What to build
+
+### PR/MR service (`crates/server/src/services/pr_service.rs`)
+
+**Trigger conditions** (all must hold):
+- Job status is `success`
+- Session `params.branch_mode` is `"pr"`
+- `branch` and `mr_title` in task complete payload are non-empty
+- `repo_url` recognized as GitHub or GitLab
+- Identity has a valid `git_token` for the provider
+
+**GitHub PR creation**
+- `create_github_pr(repo_url, branch, base, title, description, token) -> Result<String>`
+- Parse owner/repo from repo_url
+- POST `https://api.github.com/repos/{owner}/{repo}/pulls`
+- Body: `{ "title", "body", "head": branch, "base": "main" }`
+- Return PR URL on success
+- Handle errors: 401 (bad token), 422 (branch not found, PR already exists), rate limits
+
+**GitLab MR creation**
+- `create_gitlab_mr(repo_url, branch, base, title, description, token, base_url) -> Result<String>`
+- Parse project path from repo_url
+- POST `{base_url}/api/v4/projects/{encoded_path}/merge_requests`
+- Body: `{ "title", "source_branch": branch, "target_branch": "main" }`
+- Return MR URL on success
+- Use identity's `git_base_url` for self-hosted GitLab
+
+**Provider detection**
+- `detect_provider(repo_url) -> Option<GitProvider>`
+- Match on hostname: `github.com` -> GitHub, `gitlab.com` or `*.gitlab.com` -> GitLab
+- Also check identity's `git_provider` and `git_base_url`
+
+**Integration with task complete**
+- After task complete marks job as success in PR mode:
+  1. Refresh git_token if needed (GitLab OAuth expiry)
+  2. Call provider API to create PR/MR
+  3. Store `pull_request_url` on the job
+  4. If PR creation fails: log error, update job with note (job still "completed" — PR failure is non-blocking)
+
+**Error handling**
+- PR creation failure should NOT fail the job (job already completed)
+- Store error in logs: "PR/MR creation failed: {reason}"
+- Surface via `error_message` or separate field so UI can explain
+
+## Dependencies
+- Task 10 (task dispatch/completion — hook into on_job_completed)
+- Task 06 (identity credentials — for token resolution and refresh)
+- Task 07 (OAuth — for token refresh before API call)
+
+## Test criteria
+- [x] GitHub PR created when all conditions met (mock GitHub API)
+- [x] GitLab MR created when conditions met (mock GitLab API)
+- [x] `pull_request_url` stored on job after successful creation
+- [x] PR not created when branch_mode != "pr"
+- [x] PR not created when job status is "failed"
+- [x] PR not created when branch or mr_title is empty
+- [x] Provider correctly detected from repo_url
+- [x] Token refreshed before API call for GitLab
+- [x] PR creation failure doesn't change job status
+- [x] PR creation failure logged and surfaceable
+- [x] Self-hosted GitLab URL handled correctly
+- [x] Unit tests for provider detection
+- [x] Integration tests with mocked provider APIs
+- [x] `cargo test -p server` passes
+
+== TECH STACK CONTEXT ==
+
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). | — |
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI. v1: SSE only. | Long-polling (fallback only) |
+
+---
+
+## 4. Web UI
+
+React + TypeScript, Vite, TanStack Query, SSE for log/session stream.
+
+---
+
+## 5-8. Logging, Security, Repo Layout, Summary
+
+Standard Rust monorepo with crates/server, crates/worker, crates/cli, crates/api-types, web/.
+
+== CODEBASE EXPLORATION RESULTS ==
+
+### Server Crate File Structure
+
+**Core Modules:**
+- `crates/server/src/main.rs` - Entry point, DB initialization
+- `crates/server/src/lib.rs` - Router setup, CORS configuration
+- `crates/server/src/state.rs` - AppState with PgPool and broadcast channels
+- `crates/server/src/config.rs` - Configuration from environment variables
+- `crates/server/src/error.rs` - AppError type and HTTP response mapping
+- `crates/server/src/sse.rs` - SSE broadcast types (LogBroadcast, SessionEvent)
+
+**Route Modules** (`src/routes/`):
+- `api_keys.rs` - Bootstrap, create, list, delete API keys
+- `health.rs` - Health check endpoints
+- `identities.rs` - Get/update identity credentials, list repositories
+- `logs.rs` - Ingest logs from workers, list session logs, stream logs
+- `oauth.rs` - GitHub and GitLab OAuth flows with PKCE
+- `sessions.rs` - CRUD for sessions, stream session events
+- `tasks.rs` - Pull task, complete task (job completion flow)
+- `workers.rs` - Register worker, heartbeat, list workers
+
+**Engine Modules** (`src/engine/`):
+- `mod.rs` - `create_jobs_for_session`, `on_job_completed` (workflow-specific logic)
+- `jobs.rs` - Job state machine, session status derivation, publishing events
+- `chat.rs` - Chat history assembly and chat session status logic
+
+**Services** (`src/services/`):
+- `mod.rs` - Module declaration
+- `pr_service.rs` - NEW: PR/MR creation service (Task 19)
+
+**Middleware:**
+- `middleware/auth.rs` - API key extraction and validation
+
+### Database Schema (relevant tables)
+
+Sessions table:
+- id UUID PRIMARY KEY
+- repo_url TEXT NOT NULL
+- workflow TEXT NOT NULL (chat, loop_n, loop_until_sentinel, inbox)
+- params JSONB DEFAULT '{}' (prompt, sentinel, n, agent_cli, model, branch_mode, branch_name_prefix)
+- identity_id TEXT DEFAULT 'default' REFERENCES identities
+- status TEXT DEFAULT 'pending'
+
+Jobs table:
+- id UUID PRIMARY KEY
+- session_id UUID NOT NULL REFERENCES sessions
+- worker_id TEXT REFERENCES workers
+- status TEXT DEFAULT 'pending'
+- branch TEXT
+- commit_ref TEXT
+- mr_title TEXT
+- mr_description TEXT
+- pull_request_url TEXT  <-- This is where we store the PR/MR URL
+
+Identities table:
+- id TEXT PRIMARY KEY DEFAULT 'default'
+- git_token TEXT
+- refresh_token TEXT
+- token_expires_at TIMESTAMPTZ
+- git_provider TEXT (oauth_github, oauth_gitlab)
+- git_base_url TEXT
+
+### Task Completion Flow
+
+Entry: POST /workers/tasks/:id/complete
+1. Look up job by ID, validate worker ownership
+2. Complete job via jobs::complete_job() - sets status, stores output fields
+3. **PR/MR creation hook** (now implemented):
+   - Checks: success && branch present && branch_mode == "pr" && mr_title non-empty
+   - Resolves identity credentials (git_token, git_provider, git_base_url)
+   - Detects provider (GitHub vs GitLab) from repo_url + identity
+   - For GitLab: refreshes token if expired
+   - Calls GitHub/GitLab API to create PR/MR
+   - Stores pull_request_url on job
+   - Failure is non-blocking: logged but doesn't change job status
+4. Publishes job_completed/job_failed event
+5. Runs workflow-specific follow-up logic
+
+== FILES CREATED ==
+
+### crates/server/src/services/mod.rs
+```rust
+pub mod pr_service;
+```
+
+### crates/server/src/services/pr_service.rs
+
+Full implementation containing:
+
+1. **GitProvider enum** - GitHub or GitLab { base_url }
+
+2. **detect_provider()** - Detects provider from repo URL + identity metadata
+   - Checks identity git_provider first (oauth_github, oauth_gitlab)
+   - Falls back to URL hostname matching (github.com, gitlab.com, *.gitlab.com)
+   - Supports self-hosted GitLab via identity git_base_url
+
+3. **parse_github_owner_repo()** - Extracts owner/repo from GitHub URL
+   - Handles .git suffix
+
+4. **parse_gitlab_project_path()** - Extracts project path from GitLab URL
+   - Handles nested groups and .git suffix
+
+5. **gitlab_encode_path()** - URL-encodes / to %2F for GitLab API
+
+6. **create_github_pr()** - Creates GitHub Pull Request
+   - POST https://api.github.com/repos/{owner}/{repo}/pulls
+   - Handles: 401 (auth error), 422 (validation error), other errors
+   - Returns PR html_url
+
+7. **create_gitlab_mr()** - Creates GitLab Merge Request
+   - POST {base_url}/api/v4/projects/{encoded_path}/merge_requests
+   - Handles: 401/403 (auth), 409 (conflict/duplicate), other errors
+   - Returns MR web_url
+
+8. **PrCreationError enum** - Error types:
+   - InvalidRepoUrl, AuthError, ValidationError, NetworkError, ApiError, NoToken, NoProvider
+   - Implements Display
+
+9. **create_pr_for_job()** - Main orchestration function
+   - Resolves identity (git_token, git_provider, git_base_url) from DB
+   - Detects provider
+   - Refreshes GitLab token if needed (via oauth::refresh_gitlab_token_if_needed)
+   - Creates PR/MR via appropriate provider API
+   - Stores pull_request_url on job
+   - Logs success via control plane log
+
+10. **Tests** (17 unit tests):
+    - test_detect_provider_github_url
+    - test_detect_provider_github_url_with_git_suffix
+    - test_detect_provider_gitlab_url
+    - test_detect_provider_gitlab_subdomain
+    - test_detect_provider_identity_override_github
+    - test_detect_provider_identity_override_gitlab
+    - test_detect_provider_self_hosted_gitlab_via_base_url
+    - test_detect_provider_unknown_host_no_identity
+    - test_detect_provider_invalid_url
+    - test_parse_github_owner_repo
+    - test_parse_github_owner_repo_with_git
+    - test_parse_github_owner_repo_invalid
+    - test_parse_gitlab_project_path
+    - test_parse_gitlab_project_path_nested
+    - test_parse_gitlab_project_path_invalid
+    - test_gitlab_encode_path
+    - test_pr_creation_error_display
+    - test_detect_provider_gitlab_base_url_trailing_slash
+
+== FILES MODIFIED ==
+
+### crates/server/src/lib.rs
+- Added `pub mod services;` to module declarations
+
+### crates/server/src/routes/tasks.rs
+- Replaced Task 19 placeholder (lines 299-330) with actual PR/MR creation logic:
+  - Queries session for repo_url, params, identity_id
+  - Checks branch_mode == "pr" and branch/mr_title non-empty
+  - Calls services::pr_service::create_pr_for_job()
+  - Logs success or failure (non-blocking - failure doesn't affect job status)
+  - Inserts control plane log on failure for UI surfacing
+
+== BUILD & TEST RESULTS ==
+
+- `cargo build -p server` — SUCCESS (clean)
+- `cargo test -p server` — 119 tests passed, 0 failed
+- `cargo check --workspace` — SUCCESS (only pre-existing warning in worker crate about unused detect_sentinel function)
+- No new warnings introduced
+
+== FULL FILE CONTENTS ==
+
+=== crates/server/src/services/pr_service.rs ===
+
+use reqwest::Client;
+use serde::Deserialize;
+use sqlx::PgPool;
+use url::Url;
+
+use crate::config::Config;
+use crate::routes::oauth::refresh_gitlab_token_if_needed;
+
+/// Git hosting provider.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GitProvider {
+    GitHub,
+    GitLab { base_url: String },
+}
+
+/// Detect the Git provider from a repository URL.
+pub fn detect_provider(repo_url: &str, identity_provider: Option<&str>, identity_base_url: Option<&str>) -> Option<GitProvider> {
+    // First check identity-level overrides
+    if let Some(provider) = identity_provider {
+        match provider {
+            "oauth_github" => return Some(GitProvider::GitHub),
+            "oauth_gitlab" => {
+                let base = identity_base_url
+                    .unwrap_or("https://gitlab.com")
+                    .trim_end_matches('/')
+                    .to_string();
+                return Some(GitProvider::GitLab { base_url: base });
+            }
+            _ => {}
+        }
+    }
+
+    // Fall back to URL-based detection
+    let parsed = Url::parse(repo_url).ok()?;
+    let host = parsed.host_str()?;
+
+    if host == "github.com" {
+        Some(GitProvider::GitHub)
+    } else if host == "gitlab.com" || host.ends_with(".gitlab.com") {
+        Some(GitProvider::GitLab {
+            base_url: format!("{}://{}", parsed.scheme(), host),
+        })
+    } else if let Some(base_url) = identity_base_url {
+        // Self-hosted GitLab: identity has a git_base_url that's not github
+        Some(GitProvider::GitLab {
+            base_url: base_url.trim_end_matches('/').to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Parse owner/repo from a GitHub URL.
+/// Supports: https://github.com/owner/repo, https://github.com/owner/repo.git
+fn parse_github_owner_repo(repo_url: &str) -> Option<(String, String)> {
+    let parsed = Url::parse(repo_url).ok()?;
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    if segments.len() < 2 {
+        return None;
+    }
+    let owner = segments[0].to_string();
+    let repo = segments[1].trim_end_matches(".git").to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
+}
+
+/// Parse project path from a GitLab URL.
+/// Supports: https://gitlab.com/group/project, https://gitlab.com/group/subgroup/project.git
+fn parse_gitlab_project_path(repo_url: &str) -> Option<String> {
+    let parsed = Url::parse(repo_url).ok()?;
+    let path = parsed.path().trim_start_matches('/').trim_end_matches(".git");
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// URL-encode a path for GitLab API (replaces / with %2F).
+fn gitlab_encode_path(path: &str) -> String {
+    path.replace('/', "%2F")
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubPrResponse {
+    html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitLabMrResponse {
+    web_url: String,
+}
+
+/// Create a GitHub Pull Request.
+pub async fn create_github_pr(
+    client: &Client,
+    repo_url: &str,
+    branch: &str,
+    base: &str,
+    title: &str,
+    description: Option<&str>,
+    token: &str,
+) -> Result<String, PrCreationError> {
+    let (owner, repo) = parse_github_owner_repo(repo_url)
+        .ok_or_else(|| PrCreationError::InvalidRepoUrl(repo_url.to_string()))?;
+
+    let api_url = format!("https://api.github.com/repos/{}/{}/pulls", owner, repo);
+
+    let body = serde_json::json!({
+        "title": title,
+        "body": description.unwrap_or(""),
+        "head": branch,
+        "base": base,
+    });
+
+    let resp = client
+        .post(&api_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "remote-harness")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| PrCreationError::NetworkError(e.to_string()))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(PrCreationError::AuthError("GitHub token is invalid or lacks permissions".into()));
+    }
+    if status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let msg = body["message"].as_str().unwrap_or("Validation failed");
+        let errors = body["errors"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e["message"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .unwrap_or_default();
+        return Err(PrCreationError::ValidationError(format!("{}: {}", msg, errors)));
+    }
+    if !status.is_success() {
+        return Err(PrCreationError::ApiError(format!("GitHub API returned {}", status)));
+    }
+
+    let pr: GitHubPrResponse = resp
+        .json()
+        .await
+        .map_err(|e| PrCreationError::ApiError(format!("Failed to parse GitHub response: {}", e)))?;
+
+    Ok(pr.html_url)
+}
+
+/// Create a GitLab Merge Request.
+pub async fn create_gitlab_mr(
+    client: &Client,
+    repo_url: &str,
+    branch: &str,
+    base: &str,
+    title: &str,
+    description: Option<&str>,
+    token: &str,
+    base_url: &str,
+) -> Result<String, PrCreationError> {
+    let project_path = parse_gitlab_project_path(repo_url)
+        .ok_or_else(|| PrCreationError::InvalidRepoUrl(repo_url.to_string()))?;
+
+    let encoded_path = gitlab_encode_path(&project_path);
+    let api_url = format!(
+        "{}/api/v4/projects/{}/merge_requests",
+        base_url.trim_end_matches('/'),
+        encoded_path,
+    );
+
+    let body = serde_json::json!({
+        "title": title,
+        "source_branch": branch,
+        "target_branch": base,
+        "description": description.unwrap_or(""),
+    });
+
+    let resp = client
+        .post(&api_url)
+        .header("Authorization", format!("Bearer {}", token))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| PrCreationError::NetworkError(e.to_string()))?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(PrCreationError::AuthError("GitLab token is invalid or lacks permissions".into()));
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        return Err(PrCreationError::ValidationError("Merge request already exists for this branch".into()));
+    }
+    if !status.is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        let msg = body["message"].as_str()
+            .or_else(|| body["error"].as_str())
+            .unwrap_or("Unknown error");
+        return Err(PrCreationError::ApiError(format!("GitLab API returned {}: {}", status, msg)));
+    }
+
+    let mr: GitLabMrResponse = resp
+        .json()
+        .await
+        .map_err(|e| PrCreationError::ApiError(format!("Failed to parse GitLab response: {}", e)))?;
+
+    Ok(mr.web_url)
+}
+
+/// Errors that can occur during PR/MR creation.
+#[derive(Debug)]
+pub enum PrCreationError {
+    InvalidRepoUrl(String),
+    AuthError(String),
+    ValidationError(String),
+    NetworkError(String),
+    ApiError(String),
+    NoToken,
+    NoProvider,
+}
+
+impl std::fmt::Display for PrCreationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRepoUrl(url) => write!(f, "Invalid repository URL: {}", url),
+            Self::AuthError(msg) => write!(f, "Authentication error: {}", msg),
+            Self::ValidationError(msg) => write!(f, "Validation error: {}", msg),
+            Self::NetworkError(msg) => write!(f, "Network error: {}", msg),
+            Self::ApiError(msg) => write!(f, "API error: {}", msg),
+            Self::NoToken => write!(f, "No git token available for PR/MR creation"),
+            Self::NoProvider => write!(f, "Could not detect git provider from repo URL"),
+        }
+    }
+}
+
+/// Attempt to create a PR/MR for a completed job.
+///
+/// This is non-blocking: failures are logged but do not fail the job.
+/// Returns the PR/MR URL on success.
+pub async fn create_pr_for_job(
+    pool: &PgPool,
+    config: &Config,
+    http_client: &Client,
+    job_id: &str,
+    session_id: &str,
+    repo_url: &str,
+    branch: &str,
+    mr_title: Option<&str>,
+    mr_description: Option<&str>,
+    identity_id: &str,
+) -> Result<String, PrCreationError> {
+    let title = mr_title.unwrap_or(branch);
+
+    // Resolve identity details for provider detection and token
+    let identity_row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
+        "SELECT git_token, git_provider, git_base_url FROM identities WHERE id = $1",
+    )
+    .bind(identity_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| PrCreationError::ApiError(format!("DB error: {}", e)))?;
+
+    let (git_token, git_provider, git_base_url) = identity_row.unwrap_or((None, None, None));
+
+    // Detect provider
+    let provider = detect_provider(
+        repo_url,
+        git_provider.as_deref(),
+        git_base_url.as_deref(),
+    )
+    .ok_or(PrCreationError::NoProvider)?;
+
+    // Resolve token (with refresh for GitLab)
+    let token = match &provider {
+        GitProvider::GitLab { .. } => {
+            refresh_gitlab_token_if_needed(pool, identity_id, config)
+                .await
+                .map_err(|e| PrCreationError::ApiError(format!("Token refresh failed: {}", e.message)))?
+                .ok_or(PrCreationError::NoToken)?
+        }
+        GitProvider::GitHub => git_token.ok_or(PrCreationError::NoToken)?,
+    };
+
+    // Create PR/MR
+    let pr_url = match provider {
+        GitProvider::GitHub => {
+            create_github_pr(
+                http_client,
+                repo_url,
+                branch,
+                "main",
+                title,
+                mr_description,
+                &token,
+            )
+            .await?
+        }
+        GitProvider::GitLab { base_url } => {
+            create_gitlab_mr(
+                http_client,
+                repo_url,
+                branch,
+                "main",
+                title,
+                mr_description,
+                &token,
+                &base_url,
+            )
+            .await?
+        }
+    };
+
+    // Store PR URL on the job
+    let _ = sqlx::query("UPDATE jobs SET pull_request_url = $2, updated_at = now() WHERE id = $1::uuid")
+        .bind(job_id)
+        .bind(&pr_url)
+        .execute(pool)
+        .await;
+
+    // Log success
+    crate::routes::logs::insert_control_plane_log(
+        pool,
+        session_id,
+        Some(job_id),
+        "info",
+        &format!("PR/MR created: {}", pr_url),
+    )
+    .await;
+
+    tracing::info!(
+        job_id = %job_id,
+        session_id = %session_id,
+        pr_url = %pr_url,
+        "PR/MR created successfully"
+    );
+
+    Ok(pr_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_detect_provider_github_url() {
+        let provider = detect_provider("https://github.com/owner/repo", None, None);
+        assert_eq!(provider, Some(GitProvider::GitHub));
+    }
+
+    #[test]
+    fn test_detect_provider_github_url_with_git_suffix() {
+        let provider = detect_provider("https://github.com/owner/repo.git", None, None);
+        assert_eq!(provider, Some(GitProvider::GitHub));
+    }
+
+    #[test]
+    fn test_detect_provider_gitlab_url() {
+        let provider = detect_provider("https://gitlab.com/group/project", None, None);
+        assert_eq!(
+            provider,
+            Some(GitProvider::GitLab {
+                base_url: "https://gitlab.com".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_gitlab_subdomain() {
+        let provider = detect_provider("https://sub.gitlab.com/group/project", None, None);
+        assert_eq!(
+            provider,
+            Some(GitProvider::GitLab {
+                base_url: "https://sub.gitlab.com".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_identity_override_github() {
+        let provider = detect_provider(
+            "https://custom-host.com/owner/repo",
+            Some("oauth_github"),
+            None,
+        );
+        assert_eq!(provider, Some(GitProvider::GitHub));
+    }
+
+    #[test]
+    fn test_detect_provider_identity_override_gitlab() {
+        let provider = detect_provider(
+            "https://custom-host.com/group/project",
+            Some("oauth_gitlab"),
+            Some("https://gitlab.mycompany.com"),
+        );
+        assert_eq!(
+            provider,
+            Some(GitProvider::GitLab {
+                base_url: "https://gitlab.mycompany.com".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_self_hosted_gitlab_via_base_url() {
+        let provider = detect_provider(
+            "https://git.internal.com/team/project",
+            None,
+            Some("https://git.internal.com"),
+        );
+        assert_eq!(
+            provider,
+            Some(GitProvider::GitLab {
+                base_url: "https://git.internal.com".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_unknown_host_no_identity() {
+        let provider = detect_provider("https://bitbucket.org/owner/repo", None, None);
+        assert_eq!(provider, None);
+    }
+
+    #[test]
+    fn test_detect_provider_invalid_url() {
+        let provider = detect_provider("not-a-url", None, None);
+        assert_eq!(provider, None);
+    }
+
+    #[test]
+    fn test_parse_github_owner_repo() {
+        let (owner, repo) = parse_github_owner_repo("https://github.com/octocat/hello-world").unwrap();
+        assert_eq!(owner, "octocat");
+        assert_eq!(repo, "hello-world");
+    }
+
+    #[test]
+    fn test_parse_github_owner_repo_with_git() {
+        let (owner, repo) = parse_github_owner_repo("https://github.com/octocat/hello-world.git").unwrap();
+        assert_eq!(owner, "octocat");
+        assert_eq!(repo, "hello-world");
+    }
+
+    #[test]
+    fn test_parse_github_owner_repo_invalid() {
+        assert!(parse_github_owner_repo("https://github.com/").is_none());
+        assert!(parse_github_owner_repo("not-a-url").is_none());
+    }
+
+    #[test]
+    fn test_parse_gitlab_project_path() {
+        let path = parse_gitlab_project_path("https://gitlab.com/group/project").unwrap();
+        assert_eq!(path, "group/project");
+    }
+
+    #[test]
+    fn test_parse_gitlab_project_path_nested() {
+        let path = parse_gitlab_project_path("https://gitlab.com/group/sub/project.git").unwrap();
+        assert_eq!(path, "group/sub/project");
+    }
+
+    #[test]
+    fn test_parse_gitlab_project_path_invalid() {
+        assert!(parse_gitlab_project_path("not-a-url").is_none());
+    }
+
+    #[test]
+    fn test_gitlab_encode_path() {
+        assert_eq!(gitlab_encode_path("group/project"), "group%2Fproject");
+        assert_eq!(
+            gitlab_encode_path("group/sub/project"),
+            "group%2Fsub%2Fproject"
+        );
+    }
+
+    #[test]
+    fn test_pr_creation_error_display() {
+        assert_eq!(
+            PrCreationError::NoToken.to_string(),
+            "No git token available for PR/MR creation"
+        );
+        assert_eq!(
+            PrCreationError::NoProvider.to_string(),
+            "Could not detect git provider from repo URL"
+        );
+        assert_eq!(
+            PrCreationError::InvalidRepoUrl("bad".into()).to_string(),
+            "Invalid repository URL: bad"
+        );
+    }
+
+    #[test]
+    fn test_detect_provider_gitlab_base_url_trailing_slash() {
+        let provider = detect_provider(
+            "https://custom.com/group/project",
+            Some("oauth_gitlab"),
+            Some("https://custom.com/"),
+        );
+        assert_eq!(
+            provider,
+            Some(GitProvider::GitLab {
+                base_url: "https://custom.com".to_string()
+            })
+        );
+    }
+}
+
+=== crates/server/src/services/mod.rs ===
+
+pub mod pr_service;
+
+=== crates/server/src/routes/tasks.rs (complete_task function, PR hook section) ===
+
+    // PR/MR creation hook
+    if success && body.branch.is_some() {
+        let session_row = sqlx::query_as::<_, (String, serde_json::Value, Option<String>)>(
+            "SELECT repo_url, params, identity_id FROM sessions WHERE id = $1::uuid",
+        )
+        .bind(&session_id_str)
+        .fetch_optional(&state.pool)
+        .await?;
+
+        if let Some((repo_url, params_json, identity_id)) = session_row {
+            let branch_mode = params_json
+                .get("branch_mode")
+                .and_then(|v| v.as_str());
+
+            let branch = body.branch.as_deref().unwrap_or("");
+            let mr_title = body.mr_title.as_deref();
+
+            if branch_mode == Some("pr") && !branch.is_empty() && mr_title.map_or(false, |t| !t.is_empty()) {
+                let identity_id_str = identity_id.as_deref().unwrap_or("default");
+                let http_client = reqwest::Client::new();
+
+                match crate::services::pr_service::create_pr_for_job(
+                    &state.pool,
+                    &state.config,
+                    &http_client,
+                    &job_id_str,
+                    &session_id_str,
+                    &repo_url,
+                    branch,
+                    mr_title,
+                    body.mr_description.as_deref(),
+                    identity_id_str,
+                )
+                .await
+                {
+                    Ok(pr_url) => {
+                        tracing::info!(
+                            job_id = %job_id_str,
+                            session_id = %session_id_str,
+                            pr_url = %pr_url,
+                            "PR/MR created successfully"
+                        );
+                    }
+                    Err(e) => {
+                        // PR failure is non-blocking — job already completed
+                        tracing::warn!(
+                            job_id = %job_id_str,
+                            session_id = %session_id_str,
+                            error = %e,
+                            "PR/MR creation failed"
+                        );
+                        crate::routes::logs::insert_control_plane_log(
+                            &state.pool,
+                            &session_id_str,
+                            Some(&job_id_str),
+                            "warn",
+                            &format!("PR/MR creation failed: {}", e),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+=== crates/server/src/lib.rs (module declarations) ===
+
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod middleware;
+pub mod retention;
+pub mod routes;
+pub mod services;
+pub mod sse;
+pub mod state;
+
+== EXISTING FILES READ (for context) ==
+
+=== crates/server/src/routes/tasks.rs (full - 362 lines before modification) ===
+
+The complete_task handler at lines 242-362:
+- Validates job exists and is assigned to reporting worker
+- Checks status is assigned or running
+- Calls jobs::complete_job() with CompleteJobParams
+- Previously had a placeholder for Task 19 (PR/MR creation)
+- Now has full PR/MR creation logic
+- Publishes session events
+- Handles workflow-specific follow-up
+
+=== crates/server/src/engine/jobs.rs (full - 271 lines) ===
+
+CompleteJobParams struct (lines 113-123):
+- job_id, success, error_message, branch, commit_ref, pull_request_url, output, sentinel_reached, assistant_reply
+
+complete_job function (lines 126-194):
+- Validates state transition
+- Updates job with all output fields including pull_request_url
+- Logs control plane event
+
+=== crates/server/src/routes/oauth.rs (full - 534 lines) ===
+
+Key function used: refresh_gitlab_token_if_needed (lines 376-462)
+- Checks if GitLab OAuth token is expired/expiring (5 min buffer)
+- Refreshes using refresh_token grant
+- Updates DB with new tokens
+- Returns refreshed access token
+
+=== crates/server/src/error.rs (full - 116 lines) ===
+
+AppError with constructors: bad_request, unauthorized, not_found, conflict, forbidden, internal
+From<sqlx::Error> impl for DB errors
+
+=== crates/server/src/config.rs (full - 140 lines) ===
+
+Config struct with all environment variables including OAuth config for GitHub/GitLab
+
+=== crates/server/src/lib.rs (full - 114 lines) ===
+
+Router setup with authenticated and public routes
+
+=== crates/server/Cargo.toml ===
+
+Dependencies: api-types, axum, tokio, sqlx (postgres), reqwest (json), serde, serde_json, url, etc.
+All needed dependencies already present (reqwest for HTTP client, url for URL parsing)
+
+== AGENT EXPLORATION RESULTS ==
+
+The exploration agent provided detailed information about:
+- Overall server crate structure
+- How services are organized as handler modules by resource type
+- Task completion flow (POST /workers/tasks/:id/complete)
+- Identity/credentials resolution (git_token, refresh_token, token_expires_at, git_provider, git_base_url)
+- Database models (sessions, jobs, identities tables)
+- API types from crates/api-types (PullTaskResponse, TaskCompleteRequest, TaskInput, BranchMode, etc.)
+- Auth middleware and OAuth flows
+- All configuration environment variables
+
+== ARCHITECTURAL DECISIONS ==
+
+1. **Service module pattern**: Created `services/` directory alongside `routes/`, `engine/` since PR creation is business logic not directly tied to a route handler.
+
+2. **Non-blocking PR creation**: PR/MR creation failure is caught with match, logged, but doesn't propagate as an error. Job status remains "completed" per spec.
+
+3. **Token refresh**: For GitLab, we call the existing `refresh_gitlab_token_if_needed` from oauth.rs before making the API call. For GitHub, we use the token as-is (GitHub OAuth tokens don't expire the same way).
+
+4. **Provider detection priority**: Identity-level git_provider takes precedence over URL-based detection. This allows users who authenticate via OAuth to have their provider correctly detected even for self-hosted instances.
+
+5. **Trigger conditions**: All five conditions from the spec are checked:
+   - Job success (checked in tasks.rs: `if success`)
+   - branch_mode == "pr" (checked via session params JSON)
+   - branch non-empty (checked)
+   - mr_title non-empty (checked)
+   - Valid token available (checked in create_pr_for_job)
+
+6. **No new dependencies**: All needed crates (reqwest, url, serde) were already in Cargo.toml.
+
+7. **No new migrations**: The `pull_request_url` column already exists on the jobs table from the initial schema.

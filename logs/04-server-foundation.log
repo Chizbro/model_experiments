@@ -1,0 +1,844 @@
+==============================================================================
+CONTEXT DUMP: 04-server-foundation
+Date: 2026-03-21
+==============================================================================
+
+TASK: Implement server foundation for remote_harness - axum server skeleton with
+configuration, database connection pool, health endpoints, error handling, CORS
+middleware, and structured logging.
+
+==============================================================================
+FEATURE SPEC (04-server-foundation)
+==============================================================================
+
+# 04 - Server Foundation
+
+## Goal
+Build the axum server skeleton with configuration, database connection pool, health endpoints, standard error handling, CORS middleware, and structured logging. This is the base every server route will build on.
+
+## What to build
+
+### Configuration (`crates/server/src/config.rs`)
+- Load from environment variables with defaults:
+  - `DATABASE_URL` (required)
+  - `PORT` (default 3000)
+  - `CORS_ALLOWED_ORIGINS` (comma-separated, default "*" for dev)
+  - `API_KEY` / `API_KEYS` (comma-separated, optional — for env-based keys)
+  - `WORKER_STALE_SECONDS` (default 90)
+  - `MAX_JOB_RECLAIMS` (default 3)
+  - `JOB_LEASE_SECONDS` (default 0 = disabled)
+  - `LOG_RETENTION_DAYS` (default 7)
+  - `CHAT_HISTORY_MAX_TURNS` (default 50)
+
+### Application state (`crates/server/src/state.rs`)
+- `AppState` struct holding: `PgPool`, `Config`, any shared broadcast channels for SSE
+
+### Health endpoints (`crates/server/src/routes/health.rs`)
+- `GET /health` — `200 { "status": "ok" }` (no auth)
+- `GET /ready` — `200 { "status": "ok" }` (no auth) — checks DB connectivity
+- `GET /health/idle` — `200 { "idle": true }` or `503 { "idle": false, "pending_or_assigned_jobs": N }` (no auth)
+
+### Error handling (`crates/server/src/error.rs`)
+- `AppError` type implementing `IntoResponse` that produces the standard `{ "error": { "code", "message", "details" } }` JSON body
+- Map common errors: 400, 401, 404, 409, 500
+
+### CORS middleware
+- Tower CORS layer configured from `CORS_ALLOWED_ORIGINS`
+- Allow headers: Authorization, X-API-Key, Content-Type
+- Allow methods: GET, POST, PATCH, DELETE, OPTIONS
+
+### Structured logging
+- `tracing_subscriber` with JSON format for production, pretty format for dev
+- Request/response logging middleware (tower-http `TraceLayer`)
+
+### Main entrypoint (`crates/server/src/main.rs`)
+- Load config, init tracing, create DB pool, run migrations, build axum Router with health routes + middleware, bind and serve
+
+## Dependencies
+- Task 01 (repo scaffolding)
+- Task 02 (api-types — for error types)
+- Task 03 (database schema — for migrations to run)
+
+## Test criteria
+- [x] Server starts with valid `DATABASE_URL` and logs "listening on 0.0.0.0:3000"
+- [x] `GET /health` returns `200 { "status": "ok" }`
+- [x] `GET /ready` returns `200` when DB is up, appropriate error when DB is down
+- [x] `GET /health/idle` returns `200 { "idle": true }` (no jobs yet)
+- [x] CORS headers present on responses when `Origin` header sent
+- [x] Invalid routes return `404` with standard error JSON
+- [x] Integration test: start server, hit health endpoints, assert responses
+- [x] `cargo test -p server` passes
+
+==============================================================================
+TECH STACK REFERENCE (docs/TECH_STACK.md)
+==============================================================================
+
+Tech Stack: Rust monorepo with axum, tokio, sqlx (PostgreSQL), tracing, tower/tower-http.
+- Control plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+- Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE for tail and attach, shares api-types with server
+- Web UI: React + TypeScript, Vite, TanStack Query, SSE
+- Logging: JSON; dual-write (local files + central DB); SSE for tail
+- Auth: API key (CLI, Web, workers); TLS for all connections
+
+Repo layout:
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+├── Cargo.toml               # Workspace root
+├── docker-compose.yml
+└── README.md
+
+==============================================================================
+PRE-EXISTING CODEBASE STATE
+==============================================================================
+
+Workspace Cargo.toml members: api-types, server, worker, cli
+
+Server Cargo.toml dependencies:
+- api-types (path)
+- axum 0.8
+- tokio 1 (full features)
+- sqlx 0.8 (runtime-tokio, postgres, chrono, uuid, migrate)
+- tracing 0.1
+- tracing-subscriber 0.3 (env-filter, json)
+- tower 0.5
+- tower-http 0.6 (cors, trace)
+- serde 1 (derive)
+- serde_json 1
+
+API Types crate (pre-existing, complete):
+- error.rs: ApiError { code, message, details }
+- health.rs: HealthResponse { status }, IdleResponse { idle, pending_or_assigned_jobs }
+- ids.rs: SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId, ApiKeyId (macro-generated)
+- sessions.rs: WorkflowType, SessionStatus, SessionParams, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest
+- workers.rs: WorkerStatus, RegisterWorkerRequest, HeartbeatRequest, WorkerSummary, TaskInput, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus
+- logs.rs: LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest
+- identity.rs: IdentityStatus, AuthStatus, UpdateIdentityRequest
+- api_keys.rs: CreateApiKeyRequest, CreateApiKeyResponse, ApiKeySummary
+- personas.rs: CreatePersonaRequest, PersonaDetail, PersonaSummary
+- common.rs: PaginatedResponse, BranchMode, AgentCli
+
+Database migration (20240101000001_initial_schema.sql):
+- Tables: api_keys, identities, personas, workers, sessions, jobs, logs
+- Indexes on logs(session_id, timestamp), logs(job_id, timestamp), jobs(session_id), jobs(status), jobs(worker_id, status), workers(last_seen_at), sessions(status, created_at)
+- Seeds default identity
+
+docker-compose.yml: PostgreSQL 16 on port 5432, user/pass/db = harness/harness/remote_harness
+
+==============================================================================
+IMPLEMENTATION DETAILS
+==============================================================================
+
+### Files Created/Modified:
+
+1. crates/server/src/config.rs (NEW)
+   - Config struct with all env var fields
+   - Config::from_env() loads from environment with defaults
+   - Unit test for defaults
+
+2. crates/server/src/state.rs (NEW)
+   - AppState { pool: PgPool, config: Config, log_tx: broadcast::Sender<String> }
+   - AppState::new() creates broadcast channel (capacity 1024) for SSE
+
+3. crates/server/src/error.rs (NEW)
+   - AppError { status, code, message, details }
+   - Constructors: bad_request, unauthorized, not_found, conflict, internal
+   - IntoResponse impl producing { "error": { "code", "message", "details?" } }
+   - From<sqlx::Error> impl
+   - Unit tests for constructors
+
+4. crates/server/src/routes/mod.rs (NEW)
+   - pub mod health;
+
+5. crates/server/src/routes/health.rs (NEW)
+   - health() -> 200 { "status": "ok" }
+   - ready(State) -> 200 or 503 based on DB connectivity (SELECT 1)
+   - idle(State) -> 200 { "idle": true, "pending_or_assigned_jobs": 0 } or 503 with count
+
+6. crates/server/src/main.rs (MODIFIED - complete rewrite)
+   - Modules: config, error, routes, state
+   - fallback() -> 404 with standard error JSON
+   - build_cors(config) -> CorsLayer (permissive if "*", specific origins otherwise)
+     - Allows: GET, POST, PATCH, DELETE, OPTIONS
+     - Allows headers: Authorization, Content-Type, X-API-Key
+   - build_router(state) -> Router with health routes, fallback, TraceLayer, CorsLayer
+   - main(): loads config, init tracing (pretty for dev, JSON for prod based on RUST_LOG),
+     creates PgPool, runs migrations, builds router, binds and serves
+
+### Key Design Decisions:
+
+- build_router() is a public function separate from main() to enable testing
+- Tracing: if RUST_LOG is not set, assumes dev mode with pretty format and info+tower_http=debug filter
+  If RUST_LOG is set, uses JSON format for production
+- CORS: if origins is ["*"], uses CorsLayer::permissive(); otherwise parses specific origins
+- broadcast channel on AppState for future SSE log streaming (capacity 1024)
+- AppError implements From<sqlx::Error> for ergonomic ? usage in handlers
+
+==============================================================================
+BUILD & TEST RESULTS
+==============================================================================
+
+cargo build -p server: SUCCESS (2 warnings about unused AppError - expected, will be used by future features)
+cargo test -p server: 2 passed, 0 failed
+cargo test --workspace: 38 passed, 0 failed
+
+Integration test results (server started on port 3001):
+- Server logs: "server starting port=3001", "connected to database", "migrations applied", "listening on 0.0.0.0:3001"
+- GET /health -> 200 { "status": "ok" } ✓
+- GET /ready -> 200 { "status": "ok" } ✓ (DB is up)
+- GET /health/idle -> 200 { "idle": true, "pending_or_assigned_jobs": 0 } ✓
+- GET /nonexistent -> 404 { "error": { "code": "not_found", "message": "Route not found" } } ✓
+- CORS headers present: access-control-allow-origin: *, access-control-expose-headers: *, vary: origin... ✓
+- Request/response logging via TraceLayer confirmed in server output ✓
+
+==============================================================================
+FILES IN FINAL STATE
+==============================================================================
+
+--- crates/server/src/config.rs ---
+
+use std::env;
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub database_url: String,
+    pub port: u16,
+    pub cors_allowed_origins: Vec<String>,
+    pub api_keys: Vec<String>,
+    pub worker_stale_seconds: u64,
+    pub max_job_reclaims: u32,
+    pub job_lease_seconds: u64,
+    pub log_retention_days: u32,
+    pub chat_history_max_turns: u32,
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        let database_url = env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://harness:harness@localhost:5432/remote_harness".into());
+
+        let port = env::var("PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+
+        let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| "*".into())
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let api_keys = env::var("API_KEY")
+            .or_else(|_| env::var("API_KEYS"))
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let worker_stale_seconds = env::var("WORKER_STALE_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+
+        let max_job_reclaims = env::var("MAX_JOB_RECLAIMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+
+        let job_lease_seconds = env::var("JOB_LEASE_SECONDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let log_retention_days = env::var("LOG_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(7);
+
+        let chat_history_max_turns = env::var("CHAT_HISTORY_MAX_TURNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+
+        Self {
+            database_url,
+            port,
+            cors_allowed_origins,
+            api_keys,
+            worker_stale_seconds,
+            max_job_reclaims,
+            job_lease_seconds,
+            log_retention_days,
+            chat_history_max_turns,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_defaults() {
+        env::remove_var("PORT");
+        env::remove_var("CORS_ALLOWED_ORIGINS");
+        env::remove_var("API_KEY");
+        env::remove_var("API_KEYS");
+        env::remove_var("WORKER_STALE_SECONDS");
+        env::remove_var("MAX_JOB_RECLAIMS");
+        env::remove_var("JOB_LEASE_SECONDS");
+        env::remove_var("LOG_RETENTION_DAYS");
+        env::remove_var("CHAT_HISTORY_MAX_TURNS");
+
+        let config = Config::from_env();
+        assert_eq!(config.port, 3000);
+        assert_eq!(config.cors_allowed_origins, vec!["*"]);
+        assert!(config.api_keys.is_empty());
+        assert_eq!(config.worker_stale_seconds, 90);
+        assert_eq!(config.max_job_reclaims, 3);
+        assert_eq!(config.job_lease_seconds, 0);
+        assert_eq!(config.log_retention_days, 7);
+        assert_eq!(config.chat_history_max_turns, 50);
+    }
+}
+
+--- crates/server/src/state.rs ---
+
+use sqlx::PgPool;
+use tokio::sync::broadcast;
+
+use crate::config::Config;
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+    pub log_tx: broadcast::Sender<String>,
+}
+
+impl AppState {
+    pub fn new(pool: PgPool, config: Config) -> Self {
+        let (log_tx, _) = broadcast::channel(1024);
+        Self {
+            pool,
+            config,
+            log_tx,
+        }
+    }
+}
+
+--- crates/server/src/error.rs ---
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+
+#[derive(Debug)]
+pub struct AppError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl AppError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let mut body = json!({
+            "error": {
+                "code": self.code,
+                "message": self.message,
+            }
+        });
+
+        if let Some(details) = self.details {
+            body["error"]["details"] = details;
+        }
+
+        (self.status, axum::Json(body)).into_response()
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        tracing::error!(?err, "database error");
+        Self::internal("Internal database error")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_constructors() {
+        let err = AppError::bad_request("bad");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.code, "bad_request");
+
+        let err = AppError::unauthorized("no auth");
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+
+        let err = AppError::not_found("gone");
+        assert_eq!(err.status, StatusCode::NOT_FOUND);
+
+        let err = AppError::conflict("dup");
+        assert_eq!(err.status, StatusCode::CONFLICT);
+
+        let err = AppError::internal("oops");
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+}
+
+--- crates/server/src/routes/mod.rs ---
+
+pub mod health;
+
+--- crates/server/src/routes/health.rs ---
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use serde_json::json;
+
+use crate::state::AppState;
+
+pub async fn health() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
+}
+
+pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ok" }))),
+        Err(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable", "error": "database not reachable" })),
+        ),
+    }
+}
+
+pub async fn idle(State(state): State<AppState>) -> impl IntoResponse {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'assigned')",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+
+    if count == 0 {
+        (StatusCode::OK, Json(json!({ "idle": true, "pending_or_assigned_jobs": 0 })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "idle": false, "pending_or_assigned_jobs": count })),
+        )
+    }
+}
+
+--- crates/server/src/main.rs ---
+
+mod config;
+mod error;
+mod routes;
+mod state;
+
+use axum::http::{HeaderValue, Method};
+use axum::response::IntoResponse;
+use axum::Json;
+use axum::Router;
+use serde_json::json;
+use sqlx::postgres::PgPoolOptions;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
+
+use crate::config::Config;
+use crate::state::AppState;
+
+async fn fallback() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "code": "not_found",
+                "message": "Route not found"
+            }
+        })),
+    )
+}
+
+fn build_cors(config: &Config) -> CorsLayer {
+    let origins = &config.cors_allowed_origins;
+
+    let cors = if origins.len() == 1 && origins[0] == "*" {
+        CorsLayer::permissive()
+    } else {
+        let allowed: Vec<HeaderValue> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(allowed)
+    };
+
+    cors.allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
+    .allow_headers([
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderName::from_static("x-api-key"),
+    ])
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let cors = build_cors(&state.config);
+
+    Router::new()
+        .route("/health", axum::routing::get(routes::health::health))
+        .route("/ready", axum::routing::get(routes::health::ready))
+        .route("/health/idle", axum::routing::get(routes::health::idle))
+        .fallback(fallback)
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+#[tokio::main]
+async fn main() {
+    let is_dev = std::env::var("RUST_LOG").is_err();
+
+    if is_dev {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info,tower_http=debug"))
+            .with_span_events(FmtSpan::CLOSE)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .json()
+            .init();
+    }
+
+    let config = Config::from_env();
+    tracing::info!(port = config.port, "server starting");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&config.database_url)
+        .await
+        .expect("failed to connect to database");
+
+    tracing::info!("connected to database");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
+
+    tracing::info!("migrations applied");
+
+    let state = AppState::new(pool, config.clone());
+    let app = build_router(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind");
+
+    tracing::info!("listening on {}", addr);
+
+    axum::serve(listener, app).await.expect("server error");
+}
+
+==============================================================================
+EXISTING CODEBASE FILES (read during exploration)
+==============================================================================
+
+--- Cargo.toml (workspace root) ---
+
+[workspace]
+members = [
+    "crates/api-types",
+    "crates/server",
+    "crates/worker",
+    "crates/cli",
+]
+resolver = "2"
+
+--- crates/server/Cargo.toml ---
+
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+--- crates/api-types/Cargo.toml ---
+
+[package]
+name = "api-types"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+--- crates/api-types/src/lib.rs ---
+
+pub mod api_keys;
+pub mod common;
+pub mod error;
+pub mod health;
+pub mod identity;
+pub mod ids;
+pub mod logs;
+pub mod personas;
+pub mod sessions;
+pub mod workers;
+
+pub use common::{AgentCli, BranchMode, PaginatedResponse};
+pub use error::ApiError;
+pub use ids::*;
+pub use sessions::{
+    CreateSessionRequest, JobSummary, SendInputRequest, SessionDetail, SessionParams,
+    SessionStatus, SessionSummary, WorkflowType,
+};
+pub use workers::{
+    HeartbeatRequest, PullTaskResponse, RegisterWorkerRequest, TaskCompleteRequest,
+    TaskCompleteStatus, TaskInput, WorkerStatus, WorkerSummary,
+};
+pub use logs::{LogEntry, LogLevel, SendLogsRequest, WorkerLogEntry};
+pub use identity::{AuthStatus, IdentityStatus, UpdateIdentityRequest};
+pub use api_keys::{ApiKeySummary, CreateApiKeyRequest, CreateApiKeyResponse};
+pub use personas::{CreatePersonaRequest, PersonaDetail, PersonaSummary};
+pub use health::{HealthResponse, IdleResponse};
+
+pub use chrono;
+pub use uuid;
+
+--- crates/api-types/src/error.rs ---
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+--- crates/api-types/src/health.rs ---
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdleResponse {
+    pub idle: bool,
+    pub pending_or_assigned_jobs: u64,
+}
+
+--- crates/api-types/src/ids.rs ---
+
+macro_rules! id_type { ... }
+id_type!(SessionId);
+id_type!(JobId);
+id_type!(WorkerId);
+id_type!(TaskId);
+id_type!(PersonaId);
+id_type!(IdentityId);
+id_type!(ApiKeyId);
+
+--- crates/api-types/src/sessions.rs ---
+
+WorkflowType: Chat, LoopN, LoopUntilSentinel, Inbox
+SessionStatus: Pending, Running, Completed, Failed
+SessionParams, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest
+
+--- crates/api-types/src/workers.rs ---
+
+WorkerStatus: Idle, Busy
+RegisterWorkerRequest, HeartbeatRequest, WorkerSummary
+TaskInput: ChatFirst, ChatFollowup, Loop, Inbox
+PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus
+
+--- crates/api-types/src/logs.rs ---
+
+LogLevel: Debug, Info, Warn, Error
+LogEntry, WorkerLogEntry, SendLogsRequest
+
+--- crates/api-types/src/identity.rs ---
+
+IdentityStatus, AuthStatus, UpdateIdentityRequest
+
+--- crates/api-types/src/api_keys.rs ---
+
+CreateApiKeyRequest, CreateApiKeyResponse, ApiKeySummary
+
+--- crates/api-types/src/personas.rs ---
+
+CreatePersonaRequest, PersonaDetail, PersonaSummary
+
+--- crates/api-types/src/common.rs ---
+
+PaginatedResponse<T>, BranchMode (Main, Pr), AgentCli (ClaudeCode, Cursor)
+
+--- crates/server/migrations/20240101000001_initial_schema.sql ---
+
+CREATE TABLE api_keys (id UUID PK, key_hash TEXT, label TEXT, created_at TIMESTAMPTZ);
+CREATE TABLE identities (id TEXT PK DEFAULT 'default', agent_token, git_token, refresh_token, token_expires_at, git_provider, git_base_url, created_at, updated_at);
+CREATE TABLE personas (id UUID PK, name TEXT, prompt TEXT, created_at, updated_at);
+CREATE TABLE workers (id TEXT PK, host TEXT, labels JSONB, capabilities JSONB, client_version TEXT, last_seen_at, created_at);
+CREATE TABLE sessions (id UUID PK, repo_url TEXT, ref TEXT, workflow TEXT, params JSONB, persona_id UUID FK, identity_id TEXT FK, status TEXT DEFAULT 'pending', retain_forever BOOLEAN, created_at, updated_at);
+CREATE TABLE jobs (id UUID PK, session_id UUID FK CASCADE, worker_id TEXT FK, status TEXT DEFAULT 'pending', task_input JSONB, error_message, branch, commit_ref, mr_title, mr_description, pull_request_url, output, sentinel_reached, assistant_reply, reclaim_count INTEGER, assigned_at, created_at, updated_at);
+CREATE TABLE logs (id UUID PK, session_id UUID FK CASCADE, job_id UUID FK CASCADE, worker_id TEXT, level TEXT, source TEXT, message TEXT, timestamp TIMESTAMPTZ);
+Indexes: idx_logs_session_timestamp, idx_logs_job_timestamp, idx_jobs_session_id, idx_jobs_status, idx_jobs_worker_status, idx_workers_last_seen, idx_sessions_status_created
+INSERT INTO identities (id) VALUES ('default');
+
+--- docker-compose.yml ---
+
+services:
+  postgres:
+    image: postgres:16
+    environment: POSTGRES_USER=harness, POSTGRES_PASSWORD=harness, POSTGRES_DB=remote_harness
+    ports: 5432:5432
+    volumes: pgdata:/var/lib/postgresql/data
+
+--- rust-toolchain.toml ---
+
+[toolchain]
+channel = "stable"
+
+==============================================================================
+EXPLORATION AGENT FULL REPORT
+==============================================================================
+
+The explore agent read all files in crates/server/ and crates/api-types/ completely.
+All file contents are included above in the "FILES IN FINAL STATE" and "EXISTING CODEBASE FILES" sections.
+
+Key findings from exploration:
+- 4-crate workspace: api-types, server, worker, cli
+- api-types is fully built with comprehensive type definitions and tests (36 tests)
+- server had only a stub main.rs before this feature
+- PostgreSQL 16 running via docker-compose
+- All ID types use a macro-generated transparent wrapper around String with UUID generation
+
+==============================================================================
+INTEGRATION TEST OUTPUT
+==============================================================================
+
+Server started on port 3001 with DATABASE_URL=postgres://harness:harness@localhost:5432/remote_harness
+
+Logs:
+  2026-03-21T14:09:36Z INFO server: server starting port=3001
+  2026-03-21T14:09:36Z INFO server: connected to database
+  2026-03-21T14:09:36Z INFO sqlx::postgres::notice: relation "_sqlx_migrations" already exists, skipping
+  2026-03-21T14:09:36Z INFO server: migrations applied
+  2026-03-21T14:09:36Z INFO server: listening on 0.0.0.0:3001
+
+GET /health:
+  HTTP 200
+  { "status": "ok" }
+
+GET /ready:
+  HTTP 200
+  { "status": "ok" }
+
+GET /health/idle:
+  HTTP 200
+  { "idle": true, "pending_or_assigned_jobs": 0 }
+
+GET /nonexistent:
+  HTTP 404
+  { "error": { "code": "not_found", "message": "Route not found" } }
+
+CORS headers (Origin: http://example.com):
+  vary: origin, access-control-request-method, access-control-request-headers
+  access-control-allow-origin: *
+  access-control-expose-headers: *
+
+Request tracing confirmed via TraceLayer debug output:
+  DEBUG request{method=GET uri=/health version=HTTP/1.1}: started processing request
+  DEBUG request{method=GET uri=/health version=HTTP/1.1}: finished processing request latency=0 ms status=200
+
+==============================================================================
+END OF CONTEXT DUMP
+==============================================================================

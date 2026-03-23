@@ -1,0 +1,1358 @@
+== CONTEXT DUMP: 02-api-types-design ==
+== Date: 2026-03-21 ==
+== Feature: API Types Crate Design ==
+== Status: COMPLETE ==
+
+== TASK DESCRIPTION ==
+Design and implement all shared request/response types, error shapes, and ID types in `crates/api-types` so server, worker, and CLI all share a single contract.
+
+== INITIAL STATE ==
+- Branch: experiment/opus_4_6
+- Workspace Cargo.toml already had api-types in members
+- crates/api-types/Cargo.toml existed with serde, serde_json, chrono, uuid dependencies
+- crates/api-types/src/lib.rs existed with only `pub use chrono;` and `pub use uuid;`
+
+== SPEC (from plan/02-api-types-design-processing.md) ==
+# 02 - API Types Crate Design
+
+## Goal
+Design and implement all shared request/response types, error shapes, and ID types in `crates/api-types` so server, worker, and CLI all share a single contract. This is deliberate upfront design work — getting these types right prevents rework later.
+
+## What to build
+All types derive `Serialize`/`Deserialize` and are grouped by domain:
+
+### Error types
+- `ApiError { code: String, message: String, details: Option<serde_json::Value> }` — standard error envelope
+
+### ID types
+- `SessionId`, `JobId`, `WorkerId`, `TaskId`, `PersonaId`, `IdentityId`, `ApiKeyId` — newtype wrappers over `String` or `Uuid`
+
+### Session types
+- `CreateSessionRequest { repo_url, ref_, workflow, params, persona_id, identity_id, retain_forever }`
+- `WorkflowType` enum: `Chat`, `LoopN`, `LoopUntilSentinel`, `Inbox`
+- `SessionParams` — workflow-specific params (prompt, n, sentinel, agent_cli, model, branch_mode, branch_name_prefix)
+- `SessionStatus` enum: `Pending`, `Running`, `Completed`, `Failed`
+- `SessionSummary` (for list), `SessionDetail` (for get, includes jobs)
+- `JobSummary { job_id, status, created_at, error_message, pull_request_url }`
+- `SendInputRequest { message }`
+- `PaginatedResponse<T> { items: Vec<T>, next_cursor: Option<String> }`
+
+### Worker types
+- `RegisterWorkerRequest { id, host, labels, capabilities, client_version }`
+- `HeartbeatRequest { status: WorkerStatus, current_job_id }`
+- `WorkerStatus` enum: `Idle`, `Busy`
+- `WorkerSummary { worker_id, host, labels, status, last_seen_at }`
+- `PullTaskResponse` — full task payload including credentials, prompt_context, task_input, params
+- `TaskInput` — enum/struct for chat (first/followup), loop, inbox variants
+- `TaskCompleteRequest { status, worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply }`
+
+### Log types
+- `LogEntry { id, timestamp, level, session_id, job_id, worker_id, source, message }`
+- `LogLevel` enum: `Debug`, `Info`, `Warn`, `Error`
+- `SendLogsRequest` — Vec of worker log entries (no session/job — server fills those)
+- `WorkerLogEntry { timestamp, level, message, source }`
+
+### Identity types
+- `IdentityStatus { has_git_token, has_agent_token }`
+- `AuthStatus { git_token_status, git_provider, token_expires_at, message }`
+- `UpdateIdentityRequest { agent_token, git_token, refresh_token }`
+
+### API key types
+- `CreateApiKeyRequest { label }`, `CreateApiKeyResponse { id, key, label, created_at }`
+- `ApiKeySummary { id, label, created_at }`
+
+### Persona types
+- `CreatePersonaRequest { name, prompt }`, `PersonaDetail`, `PersonaSummary`
+
+### Health types
+- `HealthResponse { status }`, `IdleResponse { idle, pending_or_assigned_jobs }`
+
+## Dependencies
+- Task 01 (repo scaffolding)
+
+## Design decisions
+- Use `#[serde(rename_all = "snake_case")]` consistently
+- Optional fields use `Option<T>` with `#[serde(skip_serializing_if = "Option::is_none")]`
+- `BranchMode` enum: `Main`, `Pr` with serde rename to `"main"` / `"pr"`
+- `AgentCli` enum: `ClaudeCode`, `Cursor` with serde rename
+- Keep types in separate modules by domain (sessions.rs, workers.rs, logs.rs, etc.) with re-exports from lib.rs
+
+## Test criteria
+- [x] `cargo build -p api-types` compiles
+- [x] Unit tests for serde round-trip (serialize then deserialize) for all request/response types
+- [x] Unit tests for enum serialization (e.g. `WorkflowType::Chat` serializes to `"chat"`)
+- [x] `cargo test -p api-types` passes
+
+== REFERENCE DOCS READ ==
+
+### docs/TECH_STACK.md (full contents)
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). | — |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI ([API_OVERVIEW](API_OVERVIEW.md)). v1: SSE only. | Long-polling (fallback only) |
+
+**CLI surface (conceptual):** Commands map to operations in [API_OVERVIEW.md](API_OVERVIEW.md); do not restate parameters or status codes here ([API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+- `remote-harness config show` — show resolved config and precedence
+- `remote-harness session start [--repo URL] [--workflow type] [--params ...]`
+- `remote-harness session list` / `remote-harness session show <id>` / `remote-harness session delete <id>`
+- `remote-harness attach <session_id>`
+- `remote-harness logs tail [--session-id id] [--job-id id]` — loads full history then SSE stream; same client contract as Web ([API_OVERVIEW §6](API_OVERVIEW.md#6-rest--logs))
+- `remote-harness logs delete [--session-id id] [--job-id id]` — maps to **`DELETE /sessions/:id/logs`**; omit `--job-id` to delete all logs for the session in the central store ([API_OVERVIEW §6 — Delete session logs](API_OVERVIEW.md#delete-session-logs))
+- `remote-harness workers list` / `remote-harness workers clear <worker_id>`
+- `remote-harness credentials show` / `remote-harness credentials set` — identity tokens (BYOL)
+- `remote-harness inbox send <agent_id>` (with `--payload` or `--prompt`; optional `--persona-id`) / `remote-harness inbox list <agent_id>` (optional `--limit`, `--cursor`)
+- `remote-harness session start --workflow inbox --agent-id <id>` (and optional `--repo`, `--agent-cli`, `--model`, `--branch-mode`)
+
+---
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+**Key views:** Dashboard (sessions list, workers), Session detail (log tail, attach, inputs; delete session, delete logs, retain_forever), Worker list, Inbox / agent list, **Settings** — control plane URL and API key (e.g. for Tailscale URL when opening the UI from anywhere); BYOL credentials (identity tokens) and GitHub/GitLab OAuth sign-in for storing git_token on an identity. Same API as the CLI ([AGENTS.md](../AGENTS.md), [API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+**Client-only API access:** When the UI is hosted publicly (e.g. on an always-on host) while the control plane is only reachable via Tailscale (or a private network), the browser must talk to the control plane directly. The UI must **not** use server-side code in the framework to proxy or fetch from the control plane (no Next.js server components, Nuxt server routes, etc. that call the API). Use a **client-side only** pattern: SPA with browser-based **REST + SSE** to the control plane URL. See [Hosting §4b](HOSTING.md#4b-ui-hosting-public-url-client-only-api-access).
+
+**UI security (API keys):** The v1 UI stores the control plane API key in **browser storage** (e.g. localStorage) for simplicity. Treat the UI as a **high-trust** surface: no untrusted third-party scripts, strong **Content-Security-Policy** where deployed, and HTTPS in production. A future iteration may move to **httpOnly** cookies or short-lived tokens. **Normative operator and UX expectations:** [HOSTING §14 — Web UI threat model](HOSTING.md#14-web-ui-threat-model-api-key-in-browser) and [CLIENT_EXPERIENCE §11](CLIENT_EXPERIENCE.md#11-web-ui-and-api-key-operator-expectations).
+
+---
+
+## 5. Logging (Unified)
+
+| Layer | Recommendation | Rationale |
+|-------|----------------|-----------|
+| **Format** | **Structured JSON** (e.g. `{"time":"...","level":"info","session_id":"...","job_id":"...","message":"..."}`) | Easy to parse, filter, index. |
+| **Transport from workers** | **HTTPS POST** to control plane log endpoint | Workers send log entries to the control plane; control plane aggregates and stores. No queue. |
+| **Tail API** | **SSE** (Server-Sent Events) with filters (`session_id`, `job_id`, `level`) | Same for CLI and Web. v1: SSE only; no WebSocket for log tail. |
+| **Persistence** | **Dual-write; all logs go to disk.** (1) **Local files:** Every log line is written to disk on the component that produced it (control plane → files on backend; each worker → files on that worker). (2) **Central store (PostgreSQL)** on the control plane: control plane writes its own logs and ingested worker logs to the DB so the CLI and Web UI can both show all logs from all places. If streaming or either client breaks, logs are still in files on backend or worker. See [Architecture §6](ARCHITECTURE.md#6-logging-architecture). | Retention and "retain forever" / manual delete apply to the central store. |
+
+---
+
+## 6. Security & Auth (control plane only)
+
+This section is about **auth to the Remote Harness control plane** (who can use the API, which workers are trusted). Auth to Git and to the agent CLI (BYOL) are separate; see [Architecture §8](ARCHITECTURE.md#8-three-auth-concerns).
+
+| Area | Recommendation |
+|------|----------------|
+| **Control plane API** | API key in header (`Authorization: Bearer <key>` or `X-API-Key`) for CLI and Web. |
+| **Workers** | API key (machine token) in env or config; sent with every request to the control plane. |
+| **TLS** | All connections to the control plane over HTTPS (TLS). |
+| **Secrets** | Git credentials in control plane or env; workers receive per-job. Agent execution uses user's Claude Code / Cursor token (BYOL), stored and refreshed by control plane. |
+
+**v1: API key only.** No OIDC or mTLS in v1.
+
+### Control plane auth: configuration (API key)
+
+Configuration must be clear and consistent across components.
+
+| Component | Where the API key is set | How it's used |
+|-----------|---------------------------|----------------|
+| **Server** | Server stores issued API keys (e.g. in DB or config). Keys are created via CLI or Web UI (e.g. `remote-harness api-key create` or Settings in UI). Server validates the key on every request. | Validates `Authorization` or `X-API-Key` header. |
+| **CLI** | **Env:** `REMOTE_HARNESS_API_KEY` (or `API_KEY`). **Config file:** `~/.config/remote-harness/config.yaml` with `api_key: <key>`. **Precedence:** CLI flag > env > config file. Document in CLI help and README. | Sent on every request to the control plane URL. |
+| **Web UI** | User enters the API key once (e.g. Login or Set API key in UI). Stored in browser **localStorage** (control plane URL and API key); logout clears them. | Sent in `Authorization: Bearer <key>` or `X-API-Key` on every API call. |
+| **Worker** | **Env:** `REMOTE_HARNESS_API_KEY` or `API_KEY`. **Config file:** e.g. `config.yaml` or `~/.config/remote-harness-worker/config.yaml` with `control_plane_url` and `api_key`. **Precedence:** env > config file (no flags for worker). Document in worker README. | Sent on every request (register, heartbeat, pull task, send logs). |
+
+**Current implementation:** Server accepts keys from env (`API_KEY`, `API_KEYS`), config file, and **issued keys** stored in the DB (created via `remote-harness api-key create` or Web UI Settings → Create API key). Issued keys are stored as SHA-256 hashes; the plain key is shown only once at creation. Worker reads config from a **YAML** file; default path when `REMOTE_HARNESS_CONFIG` is unset is `~/.config/remote-harness-worker/config.yaml` (env overrides file).
+
+**Control plane URL** (for CLI and worker): env `REMOTE_HARNESS_URL` or `CONTROL_PLANE_URL`, or config file `control_plane_url`. Same precedence as api_key (CLI: flag > env > config; worker: env > config). Document alongside `api_key` so both are in one place.
+
+---
+
+## 7. Repo Layout (Rust Monorepo)
+
+Control plane, workers, and CLI are all **Rust** in one workspace; shared types and API contracts live in a common crate.
+
+```
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI with user token)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+│   ├── src/
+│   └── package.json
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TECH_STACK.md
+│   └── PRODUCT.md
+├── Cargo.toml               # Workspace root
+├── Cargo.lock
+├── Dockerfile               # Build and run control plane / services with Docker
+├── docker-compose.yml       # Compose for server, DB, and optional worker/UI
+└── README.md
+```
+
+Each binary is built with `cargo build -p server`, `cargo build -p worker`, `cargo build -p cli`. The `api-types` crate keeps REST JSON payloads in sync between server, worker, and CLI. For containerized build and run, use the repo root **Dockerfile** and **docker-compose.yml**; see [GETTING_STARTED.md §1](GETTING_STARTED.md#1-docker-compose-recommended).
+
+---
+
+## 8. Summary Table
+
+| Component | Stack |
+|-----------|-----------------|
+| Control plane | **Rust** (axum, tokio, sqlx), REST + **SSE**, PostgreSQL (task queue in DB) |
+| Workers | **Rust** (tokio, reqwest, git2); agent via **Claude Code or Cursor CLI** (BYOL—user's token) |
+| CLI | **Rust** (clap), SSE for tail and attach, shares `api-types` with server |
+| Web UI | React + TypeScript, Vite, TanStack Query, SSE for log/session stream |
+| Logging | JSON; dual-write (local files + central DB); SSE for tail; retention and manual delete on central store |
+| Auth | API key (CLI, Web, workers); TLS for all connections |
+
+---
+
+*Previous: [Architecture](ARCHITECTURE.md) | Next: [Product & Features](PRODUCT.md) | [Client experience](CLIENT_EXPERIENCE.md)*
+
+== WORKSPACE STATE ==
+Cargo.toml (workspace root):
+[workspace]
+members = [
+    "crates/api-types",
+    "crates/server",
+    "crates/worker",
+    "crates/cli",
+]
+resolver = "2"
+
+crates/api-types/Cargo.toml:
+[package]
+name = "api-types"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+== FILES CREATED ==
+
+### crates/api-types/src/lib.rs
+pub mod api_keys;
+pub mod common;
+pub mod error;
+pub mod health;
+pub mod identity;
+pub mod ids;
+pub mod logs;
+pub mod personas;
+pub mod sessions;
+pub mod workers;
+
+// Re-export commonly used types at crate root
+pub use common::{AgentCli, BranchMode, PaginatedResponse};
+pub use error::ApiError;
+pub use ids::*;
+pub use sessions::{
+    CreateSessionRequest, JobSummary, SendInputRequest, SessionDetail, SessionParams,
+    SessionStatus, SessionSummary, WorkflowType,
+};
+pub use workers::{
+    HeartbeatRequest, PullTaskResponse, RegisterWorkerRequest, TaskCompleteRequest,
+    TaskCompleteStatus, TaskInput, WorkerStatus, WorkerSummary,
+};
+pub use logs::{LogEntry, LogLevel, SendLogsRequest, WorkerLogEntry};
+pub use identity::{AuthStatus, IdentityStatus, UpdateIdentityRequest};
+pub use api_keys::{ApiKeySummary, CreateApiKeyRequest, CreateApiKeyResponse};
+pub use personas::{CreatePersonaRequest, PersonaDetail, PersonaSummary};
+pub use health::{HealthResponse, IdleResponse};
+
+pub use chrono;
+pub use uuid;
+
+### crates/api-types/src/ids.rs
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use uuid::Uuid;
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4().to_string())
+            }
+
+            pub fn from_string(s: impl Into<String>) -> Self {
+                Self(s.into())
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self {
+                Self(s)
+            }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self {
+                Self(s.to_string())
+            }
+        }
+    };
+}
+
+id_type!(SessionId);
+id_type!(JobId);
+id_type!(WorkerId);
+id_type!(TaskId);
+id_type!(PersonaId);
+id_type!(IdentityId);
+id_type!(ApiKeyId);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_id_serde_roundtrip() {
+        let id = SessionId::from_string("test-123");
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"test-123\"");
+        let deserialized: SessionId = serde_json::from_str(&json).unwrap();
+        assert_eq!(id, deserialized);
+    }
+
+    #[test]
+    fn test_id_display() {
+        let id = WorkerId::from_string("worker-1");
+        assert_eq!(format!("{}", id), "worker-1");
+    }
+
+    #[test]
+    fn test_id_new_generates_uuid() {
+        let id = JobId::new();
+        assert!(!id.0.is_empty());
+        // Should be a valid UUID
+        assert!(Uuid::parse_str(&id.0).is_ok());
+    }
+}
+
+### crates/api-types/src/error.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_error_roundtrip() {
+        let err = ApiError {
+            code: "not_found".to_string(),
+            message: "Session not found".to_string(),
+            details: None,
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(!json.contains("details"));
+        let deserialized: ApiError = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.code, "not_found");
+    }
+
+    #[test]
+    fn test_api_error_with_details() {
+        let err = ApiError {
+            code: "validation_error".to_string(),
+            message: "Invalid input".to_string(),
+            details: Some(serde_json::json!({"field": "repo_url"})),
+        };
+        let json = serde_json::to_string(&err).unwrap();
+        assert!(json.contains("details"));
+        let deserialized: ApiError = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            deserialized.details.unwrap()["field"],
+            serde_json::json!("repo_url")
+        );
+    }
+}
+
+### crates/api-types/src/common.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaginatedResponse<T> {
+    pub items: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchMode {
+    Main,
+    Pr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCli {
+    ClaudeCode,
+    Cursor,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_branch_mode_serde() {
+        assert_eq!(
+            serde_json::to_string(&BranchMode::Main).unwrap(),
+            "\"main\""
+        );
+        assert_eq!(
+            serde_json::to_string(&BranchMode::Pr).unwrap(),
+            "\"pr\""
+        );
+        let deserialized: BranchMode = serde_json::from_str("\"main\"").unwrap();
+        assert_eq!(deserialized, BranchMode::Main);
+    }
+
+    #[test]
+    fn test_agent_cli_serde() {
+        assert_eq!(
+            serde_json::to_string(&AgentCli::ClaudeCode).unwrap(),
+            "\"claude_code\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentCli::Cursor).unwrap(),
+            "\"cursor\""
+        );
+    }
+
+    #[test]
+    fn test_paginated_response_roundtrip() {
+        let resp = PaginatedResponse {
+            items: vec!["a".to_string(), "b".to_string()],
+            next_cursor: Some("abc123".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: PaginatedResponse<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.items.len(), 2);
+        assert_eq!(deserialized.next_cursor, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_paginated_response_no_cursor() {
+        let resp = PaginatedResponse {
+            items: vec![1, 2, 3],
+            next_cursor: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("next_cursor"));
+    }
+}
+
+### crates/api-types/src/sessions.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::common::{AgentCli, BranchMode};
+use crate::ids::{IdentityId, JobId, PersonaId, SessionId};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowType {
+    Chat,
+    LoopN,
+    LoopUntilSentinel,
+    Inbox,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sentinel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_cli: Option<AgentCli>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_mode: Option<BranchMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_name_prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSessionRequest {
+    pub repo_url: String,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_: Option<String>,
+    pub workflow: WorkflowType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<SessionParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona_id: Option<PersonaId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_id: Option<IdentityId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain_forever: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: SessionId,
+    pub repo_url: String,
+    pub workflow: WorkflowType,
+    pub status: SessionStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain_forever: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionDetail {
+    pub session_id: SessionId,
+    pub repo_url: String,
+    pub workflow: WorkflowType,
+    pub status: SessionStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<SessionParams>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona_id: Option<PersonaId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_id: Option<IdentityId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retain_forever: Option<bool>,
+    pub jobs: Vec<JobSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub job_id: JobId,
+    pub status: SessionStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pull_request_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendInputRequest {
+    pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_workflow_type_serde() {
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Chat).unwrap(),
+            "\"chat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::LoopN).unwrap(),
+            "\"loop_n\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::LoopUntilSentinel).unwrap(),
+            "\"loop_until_sentinel\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkflowType::Inbox).unwrap(),
+            "\"inbox\""
+        );
+    }
+
+    #[test]
+    fn test_session_status_serde() {
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Pending).unwrap(),
+            "\"pending\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Running).unwrap(),
+            "\"running\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+
+    #[test]
+    fn test_create_session_request_roundtrip() {
+        let req = CreateSessionRequest {
+            repo_url: "https://github.com/test/repo".to_string(),
+            ref_: Some("main".to_string()),
+            workflow: WorkflowType::Chat,
+            params: Some(SessionParams {
+                prompt: Some("Fix the bug".to_string()),
+                n: None,
+                sentinel: None,
+                agent_cli: Some(AgentCli::ClaudeCode),
+                model: None,
+                branch_mode: Some(BranchMode::Pr),
+                branch_name_prefix: None,
+            }),
+            persona_id: None,
+            identity_id: None,
+            retain_forever: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"ref\""));
+        assert!(!json.contains("ref_"));
+        let deserialized: CreateSessionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.repo_url, req.repo_url);
+        assert_eq!(deserialized.workflow, WorkflowType::Chat);
+    }
+
+    #[test]
+    fn test_session_detail_roundtrip() {
+        let detail = SessionDetail {
+            session_id: SessionId::from_string("sess-1"),
+            repo_url: "https://github.com/test/repo".to_string(),
+            workflow: WorkflowType::LoopN,
+            status: SessionStatus::Running,
+            created_at: Utc::now(),
+            updated_at: None,
+            params: None,
+            persona_id: None,
+            identity_id: None,
+            retain_forever: Some(true),
+            jobs: vec![JobSummary {
+                job_id: JobId::from_string("job-1"),
+                status: SessionStatus::Completed,
+                created_at: Utc::now(),
+                error_message: None,
+                pull_request_url: Some("https://github.com/test/repo/pull/1".to_string()),
+            }],
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let deserialized: SessionDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.jobs.len(), 1);
+        assert_eq!(deserialized.status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn test_send_input_request_roundtrip() {
+        let req = SendInputRequest {
+            message: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: SendInputRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.message, "hello");
+    }
+}
+
+### crates/api-types/src/workers.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::common::{AgentCli, BranchMode};
+use crate::ids::{JobId, SessionId, TaskId, WorkerId};
+use crate::sessions::{SessionParams, WorkflowType};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    Idle,
+    Busy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterWorkerRequest {
+    pub id: WorkerId,
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    pub status: WorkerStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_job_id: Option<JobId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSummary {
+    pub worker_id: WorkerId,
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    pub status: WorkerStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskInput {
+    ChatFirst {
+        prompt: String,
+    },
+    ChatFollowup {
+        message: String,
+    },
+    Loop {
+        prompt: String,
+        iteration: u32,
+    },
+    Inbox {
+        prompt: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        payload: Option<serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullTaskResponse {
+    pub task_id: TaskId,
+    pub session_id: SessionId,
+    pub job_id: JobId,
+    pub repo_url: String,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_: Option<String>,
+    pub workflow: WorkflowType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<SessionParams>,
+    pub input: TaskInput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_cli: Option<AgentCli>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_mode: Option<BranchMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_context: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCompleteRequest {
+    pub status: TaskCompleteStatus,
+    pub worker_id: WorkerId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mr_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mr_description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sentinel_reached: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assistant_reply: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskCompleteStatus {
+    Completed,
+    Failed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_worker_status_serde() {
+        assert_eq!(
+            serde_json::to_string(&WorkerStatus::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkerStatus::Busy).unwrap(),
+            "\"busy\""
+        );
+    }
+
+    #[test]
+    fn test_register_worker_roundtrip() {
+        let req = RegisterWorkerRequest {
+            id: WorkerId::from_string("w-1"),
+            host: "host-1".to_string(),
+            labels: Some(vec!["gpu".to_string()]),
+            capabilities: None,
+            client_version: Some("0.1.0".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: RegisterWorkerRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.host, "host-1");
+        assert!(!json.contains("capabilities"));
+    }
+
+    #[test]
+    fn test_heartbeat_roundtrip() {
+        let req = HeartbeatRequest {
+            status: WorkerStatus::Busy,
+            current_job_id: Some(JobId::from_string("job-1")),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: HeartbeatRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.status, WorkerStatus::Busy);
+    }
+
+    #[test]
+    fn test_task_input_serde() {
+        let input = TaskInput::ChatFirst {
+            prompt: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&input).unwrap();
+        assert!(json.contains("chat_first"));
+        let deserialized: TaskInput = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            TaskInput::ChatFirst { prompt } => assert_eq!(prompt, "hello"),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_task_complete_request_roundtrip() {
+        let req = TaskCompleteRequest {
+            status: TaskCompleteStatus::Completed,
+            worker_id: WorkerId::from_string("w-1"),
+            branch: Some("feature/fix".to_string()),
+            commit_ref: Some("abc123".to_string()),
+            mr_title: None,
+            mr_description: None,
+            error_message: None,
+            output: Some("done".to_string()),
+            sentinel_reached: None,
+            assistant_reply: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: TaskCompleteRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.status, TaskCompleteStatus::Completed);
+    }
+
+    #[test]
+    fn test_pull_task_response_roundtrip() {
+        let resp = PullTaskResponse {
+            task_id: TaskId::from_string("t-1"),
+            session_id: SessionId::from_string("s-1"),
+            job_id: JobId::from_string("j-1"),
+            repo_url: "https://github.com/test/repo".to_string(),
+            ref_: Some("main".to_string()),
+            workflow: WorkflowType::Chat,
+            params: None,
+            input: TaskInput::ChatFirst {
+                prompt: "test".to_string(),
+            },
+            git_token: Some("token".to_string()),
+            agent_token: None,
+            agent_cli: None,
+            model: None,
+            branch_mode: None,
+            prompt_context: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"ref\""));
+        let deserialized: PullTaskResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.task_id, TaskId::from_string("t-1"));
+    }
+
+    #[test]
+    fn test_task_complete_status_serde() {
+        assert_eq!(
+            serde_json::to_string(&TaskCompleteStatus::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TaskCompleteStatus::Failed).unwrap(),
+            "\"failed\""
+        );
+    }
+}
+
+### crates/api-types/src/logs.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::ids::{JobId, SessionId, WorkerId};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub level: LogLevel,
+    pub session_id: SessionId,
+    pub job_id: JobId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<WorkerId>,
+    pub source: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub level: LogLevel,
+    pub message: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendLogsRequest {
+    pub entries: Vec<WorkerLogEntry>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_log_level_serde() {
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Debug).unwrap(),
+            "\"debug\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Info).unwrap(),
+            "\"info\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Warn).unwrap(),
+            "\"warn\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogLevel::Error).unwrap(),
+            "\"error\""
+        );
+    }
+
+    #[test]
+    fn test_log_entry_roundtrip() {
+        let entry = LogEntry {
+            id: "log-1".to_string(),
+            timestamp: Utc::now(),
+            level: LogLevel::Info,
+            session_id: SessionId::from_string("s-1"),
+            job_id: JobId::from_string("j-1"),
+            worker_id: Some(WorkerId::from_string("w-1")),
+            source: "worker".to_string(),
+            message: "Task started".to_string(),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let deserialized: LogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.level, LogLevel::Info);
+        assert_eq!(deserialized.message, "Task started");
+    }
+
+    #[test]
+    fn test_send_logs_request_roundtrip() {
+        let req = SendLogsRequest {
+            entries: vec![WorkerLogEntry {
+                timestamp: Utc::now(),
+                level: LogLevel::Debug,
+                message: "cloning repo".to_string(),
+                source: "git".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: SendLogsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.entries.len(), 1);
+    }
+}
+
+### crates/api-types/src/identity.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdentityStatus {
+    pub has_git_token: bool,
+    pub has_agent_token: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthStatus {
+    pub git_token_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateIdentityRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_identity_status_roundtrip() {
+        let status = IdentityStatus {
+            has_git_token: true,
+            has_agent_token: false,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: IdentityStatus = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.has_git_token);
+        assert!(!deserialized.has_agent_token);
+    }
+
+    #[test]
+    fn test_auth_status_roundtrip() {
+        let status = AuthStatus {
+            git_token_status: "valid".to_string(),
+            git_provider: Some("github".to_string()),
+            token_expires_at: None,
+            message: None,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: AuthStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.git_token_status, "valid");
+    }
+
+    #[test]
+    fn test_update_identity_request_roundtrip() {
+        let req = UpdateIdentityRequest {
+            agent_token: Some("token-abc".to_string()),
+            git_token: None,
+            refresh_token: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("git_token"));
+        let deserialized: UpdateIdentityRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.agent_token, Some("token-abc".to_string()));
+    }
+}
+
+### crates/api-types/src/api_keys.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::ids::ApiKeyId;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyResponse {
+    pub id: ApiKeyId,
+    pub key: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeySummary {
+    pub id: ApiKeyId,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_api_key_request_roundtrip() {
+        let req = CreateApiKeyRequest {
+            label: "my-key".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: CreateApiKeyRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.label, "my-key");
+    }
+
+    #[test]
+    fn test_create_api_key_response_roundtrip() {
+        let resp = CreateApiKeyResponse {
+            id: ApiKeyId::from_string("key-1"),
+            key: "rh_abc123".to_string(),
+            label: "my-key".to_string(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: CreateApiKeyResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.key, "rh_abc123");
+    }
+
+    #[test]
+    fn test_api_key_summary_roundtrip() {
+        let summary = ApiKeySummary {
+            id: ApiKeyId::from_string("key-1"),
+            label: "test".to_string(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: ApiKeySummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.label, "test");
+    }
+}
+
+### crates/api-types/src/personas.rs
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::ids::PersonaId;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatePersonaRequest {
+    pub name: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaDetail {
+    pub persona_id: PersonaId,
+    pub name: String,
+    pub prompt: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonaSummary {
+    pub persona_id: PersonaId,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_persona_request_roundtrip() {
+        let req = CreatePersonaRequest {
+            name: "reviewer".to_string(),
+            prompt: "You are a code reviewer".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: CreatePersonaRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "reviewer");
+    }
+
+    #[test]
+    fn test_persona_detail_roundtrip() {
+        let detail = PersonaDetail {
+            persona_id: PersonaId::from_string("p-1"),
+            name: "reviewer".to_string(),
+            prompt: "Review code".to_string(),
+            created_at: Utc::now(),
+            updated_at: None,
+        };
+        let json = serde_json::to_string(&detail).unwrap();
+        let deserialized: PersonaDetail = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.name, "reviewer");
+    }
+
+    #[test]
+    fn test_persona_summary_roundtrip() {
+        let summary = PersonaSummary {
+            persona_id: PersonaId::from_string("p-1"),
+            name: "reviewer".to_string(),
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let deserialized: PersonaSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.persona_id, PersonaId::from_string("p-1"));
+    }
+}
+
+### crates/api-types/src/health.rs
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IdleResponse {
+    pub idle: bool,
+    pub pending_or_assigned_jobs: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_response_roundtrip() {
+        let resp = HealthResponse {
+            status: "ok".to_string(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: HealthResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.status, "ok");
+    }
+
+    #[test]
+    fn test_idle_response_roundtrip() {
+        let resp = IdleResponse {
+            idle: true,
+            pending_or_assigned_jobs: 0,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: IdleResponse = serde_json::from_str(&json).unwrap();
+        assert!(deserialized.idle);
+        assert_eq!(deserialized.pending_or_assigned_jobs, 0);
+    }
+
+    #[test]
+    fn test_idle_response_not_idle() {
+        let resp = IdleResponse {
+            idle: false,
+            pending_or_assigned_jobs: 3,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let deserialized: IdleResponse = serde_json::from_str(&json).unwrap();
+        assert!(!deserialized.idle);
+        assert_eq!(deserialized.pending_or_assigned_jobs, 3);
+    }
+}
+
+== BUILD & TEST RESULTS ==
+- `cargo build -p api-types` — SUCCESS (no errors)
+- `cargo test -p api-types` — SUCCESS (36 passed; 0 failed; 0 ignored)
+- `cargo build` (full workspace) — SUCCESS (no errors)
+
+== IMPLEMENTATION DECISIONS ==
+1. Used a macro `id_type!` to DRY the 7 ID newtype wrappers (SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId, ApiKeyId). Each wraps String with transparent serde, Display, From<String>, From<&str>, Default (generates UUID v4), and as_str().
+2. All enums use `#[serde(rename_all = "snake_case")]` per spec.
+3. All optional fields use `#[serde(skip_serializing_if = "Option::is_none")]` per spec.
+4. `CreateSessionRequest.ref_` uses `#[serde(rename = "ref")]` since `ref` is a Rust keyword.
+5. `TaskInput` is modeled as a tagged enum with variants: ChatFirst, ChatFollowup, Loop, Inbox.
+6. `TaskCompleteStatus` is separate from `SessionStatus` since task completion has only Completed/Failed.
+7. Modules organized by domain: ids, error, common, sessions, workers, logs, identity, api_keys, personas, health.
+8. All types re-exported from lib.rs for ergonomic imports.
+9. 36 unit tests covering serde round-trips for all types and enum serialization verification.
+
+== PLAN FILE STATE ==
+plan/02-api-types-design-complete.md (renamed from pending → processing → complete)

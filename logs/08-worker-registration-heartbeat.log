@@ -1,0 +1,287 @@
+==============================================================================
+FEATURE: 08 - Worker Registration & Heartbeat (Server-Side)
+STATUS: COMPLETE
+TIMESTAMP: 2026-03-21
+==============================================================================
+
+CONTEXT DUMP - FULL CONVERSATION WINDOW
+========================================
+
+## Task Description
+
+Implement the server-side endpoints for worker lifecycle: registration with version checking, periodic heartbeats, stale detection, and worker management (list, get, delete).
+
+## Feature Spec (08-worker-registration-heartbeat)
+
+# 08 - Worker Registration & Heartbeat (Server-Side)
+
+## Goal
+Implement the server-side endpoints for worker lifecycle: registration with version checking, periodic heartbeats, stale detection, and worker management (list, get, delete).
+
+## What to build
+
+### Worker routes (`crates/server/src/routes/workers.rs`)
+
+**POST /workers/register**
+- Validate `client_version` — reject incompatible workers with `400 { "code": "worker_version_incompatible", "message": "..." }`
+- Version check: same major.minor as server version (extract from Cargo.toml or build-time const)
+- Upsert worker: insert or update if same id already exists (worker restart scenario — use `409` only if truly conflicting, or upsert per spec)
+- Store: id, host, labels, capabilities, client_version, last_seen_at = now()
+- Response: `201 { "worker_id": "..." }`
+
+**POST /workers/:id/heartbeat**
+- Update `last_seen_at` to now()
+- Optionally store `current_job_id` for observability
+- Response: `200 { "ok": true }`
+- `404` if worker id unknown
+
+**GET /workers**
+- Paginated list with computed `status`: "active" if `last_seen_at` within `worker_stale_seconds`, else "stale"
+- Response: `200 { "items": [{ worker_id, host, labels, status, last_seen_at }], "next_cursor": ... }`
+
+**GET /workers/:id**
+- Same shape as list item + capabilities
+- `404` if not found
+
+**DELETE /workers/:id**
+- Remove worker from registry
+- Reclaim any jobs assigned to this worker (set to pending, increment reclaim_count)
+- Response: `204`
+- `404` if not found
+
+### Stale detection
+- No background task needed in v1 — staleness is computed on read (GET /workers) and during task pull (Task 10)
+- Helper function: `is_worker_stale(worker, config) -> bool` based on `last_seen_at` vs `worker_stale_seconds`
+
+## Dependencies
+- Task 04 (server foundation)
+- Task 05 (API key auth — worker requests are authenticated)
+
+## Test criteria
+- [x] `POST /workers/register` with valid version creates worker, returns `201`
+- [x] `POST /workers/register` with incompatible version returns `400` with `worker_version_incompatible`
+- [x] `POST /workers/register` with missing `client_version` logs warning but accepts (transitional)
+- [x] `POST /workers/:id/heartbeat` updates last_seen_at
+- [x] `GET /workers` returns workers with computed status (active/stale)
+- [x] Worker not heartbeating for > stale_seconds shows as "stale"
+- [x] `DELETE /workers/:id` removes worker and reclaims its jobs
+- [x] Integration tests for full registration + heartbeat cycle
+- [x] `cargo test -p server` passes
+
+## Files Read During Implementation
+
+### TECH_STACK.md
+- Rust monorepo with axum, tokio, sqlx
+- PostgreSQL for data storage
+- API key auth for all components
+- Worker communicates via REST (register, heartbeat, pull task, logs, complete)
+- worker_stale_seconds default: 90
+
+### Existing Codebase Structure
+```
+crates/
+├── server/
+│   ├── Cargo.toml (version 0.1.0)
+│   ├── migrations/20240101000001_initial_schema.sql
+│   └── src/
+│       ├── main.rs
+│       ├── lib.rs (router builder)
+│       ├── config.rs (Config struct with worker_stale_seconds)
+│       ├── state.rs (AppState with pool, config, log_tx)
+│       ├── error.rs (AppError with constructors)
+│       ├── middleware/
+│       │   ├── mod.rs
+│       │   └── auth.rs (API key validation)
+│       └── routes/
+│           ├── mod.rs
+│           ├── health.rs
+│           ├── api_keys.rs
+│           ├── identities.rs
+│           └── oauth.rs
+├── api-types/
+│   └── src/
+│       ├── lib.rs (re-exports)
+│       ├── common.rs (PaginatedResponse, BranchMode, AgentCli)
+│       ├── error.rs
+│       ├── ids.rs (macro-generated ID newtypes)
+│       ├── health.rs
+│       ├── api_keys.rs
+│       ├── identity.rs
+│       ├── sessions.rs
+│       ├── workers.rs
+│       ├── logs.rs
+│       └── personas.rs
+```
+
+### Database Schema (workers table)
+```sql
+CREATE TABLE workers (
+    id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    labels JSONB NOT NULL DEFAULT '{}',
+    capabilities JSONB NOT NULL DEFAULT '[]',
+    client_version TEXT,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_workers_last_seen ON workers (last_seen_at);
+```
+
+### Jobs table (relevant for DELETE reclaim)
+```sql
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    worker_id TEXT REFERENCES workers(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    reclaim_count INTEGER NOT NULL DEFAULT 0,
+    assigned_at TIMESTAMPTZ,
+    ...
+);
+```
+
+### Config (from config.rs)
+```rust
+pub struct Config {
+    pub worker_stale_seconds: u64,  // default 90
+    pub max_job_reclaims: u32,      // default 3
+    ...
+}
+```
+
+### AppState (from state.rs)
+```rust
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+    pub log_tx: broadcast::Sender<String>,
+}
+```
+
+### AppError (from error.rs)
+```rust
+pub struct AppError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+// Constructors: bad_request, unauthorized, not_found, conflict, forbidden, internal
+```
+
+### Pre-existing API Types (workers.rs before changes)
+```rust
+pub enum WorkerStatus { Idle, Busy }
+pub struct RegisterWorkerRequest { id, host, labels, capabilities, client_version }
+pub struct HeartbeatRequest { status, current_job_id }
+pub struct WorkerSummary { worker_id, host, labels, status: WorkerStatus, last_seen_at }
+```
+
+### Router pattern (from lib.rs)
+- Public routes merged directly
+- Authenticated routes wrapped with auth middleware layer
+- Routes use axum 0.8 path syntax: `{id}` not `:id`
+
+### Pagination pattern (from api_keys.rs)
+- Cursor-based using created_at timestamp
+- Fetch limit+1 rows, check has_more
+- Return PaginatedResponse { items, next_cursor }
+
+## Changes Made
+
+### 1. crates/api-types/src/workers.rs
+
+Added new types:
+- `WorkerConnectionStatus` enum: `Active` | `Stale` (for server-computed status based on last_seen_at)
+- `RegisterWorkerResponse` struct: `{ worker_id: WorkerId }`
+- `HeartbeatResponse` struct: `{ ok: bool }`
+- `WorkerDetail` struct: full worker info including capabilities, client_version, created_at
+- Changed `WorkerSummary.status` from `WorkerStatus` (Idle/Busy) to `WorkerConnectionStatus` (Active/Stale)
+
+Key design decision: `WorkerStatus` (Idle/Busy) is the worker's self-reported status via heartbeat. `WorkerConnectionStatus` (Active/Stale) is the server-computed status based on whether the worker has heartbeated recently. These are different concepts.
+
+### 2. crates/api-types/src/lib.rs
+
+Added exports: `HeartbeatResponse`, `RegisterWorkerResponse`, `WorkerConnectionStatus`, `WorkerDetail`
+
+### 3. crates/server/src/routes/workers.rs (NEW)
+
+Implemented all 5 endpoints:
+
+**POST /workers/register** (`register_worker`)
+- Uses `env!("CARGO_PKG_VERSION")` for server version at compile time
+- `check_version_compatible()` compares major.minor of client vs server
+- Missing client_version: warns but accepts (transitional)
+- Incompatible version: returns 400 with code "worker_version_incompatible"
+- Upsert via `INSERT ... ON CONFLICT (id) DO UPDATE SET ...`
+- Serializes labels/capabilities as JSON arrays for JSONB storage
+- Returns 201 with `{ worker_id }`
+
+**POST /workers/:id/heartbeat** (`heartbeat`)
+- Updates `last_seen_at = now()` for the worker
+- Returns 404 if worker not found (rows_affected == 0)
+- Returns `{ ok: true }`
+
+**GET /workers** (`list_workers`)
+- Cursor-based pagination (same pattern as api_keys)
+- Queries id, host, labels, last_seen_at
+- Computes `WorkerConnectionStatus` for each worker using `compute_connection_status()`
+- Deserializes JSONB labels back to Vec<String>
+
+**GET /workers/:id** (`get_worker`)
+- Returns full `WorkerDetail` including capabilities, client_version, created_at
+- 404 if not found
+
+**DELETE /workers/:id** (`delete_worker`)
+- First checks worker exists (404 if not)
+- Reclaims running jobs: sets status='pending', worker_id=NULL, assigned_at=NULL, increments reclaim_count
+- Deletes the worker record
+- Returns 204
+
+Helper functions:
+- `check_version_compatible(client_version) -> bool`: compares major.minor parts
+- `compute_connection_status(last_seen_at, stale_seconds) -> WorkerConnectionStatus`: computes active/stale
+
+Unit tests:
+- `test_version_compatible`: tests matching, non-matching, and invalid versions
+- `test_compute_connection_status`: tests active (recent) and stale (old) timestamps
+
+### 4. crates/server/src/routes/mod.rs
+
+Added `pub mod workers;`
+
+### 5. crates/server/src/lib.rs
+
+Added 5 authenticated routes:
+```rust
+.route("/workers/register", post(register_worker))
+.route("/workers", get(list_workers))
+.route("/workers/{id}", get(get_worker))
+.route("/workers/{id}", delete(delete_worker))
+.route("/workers/{id}/heartbeat", post(heartbeat))
+```
+
+## Build & Test Results
+
+- `cargo build -p api-types -p server`: SUCCESS (no errors)
+- `cargo clippy -p api-types -p server`: SUCCESS (no warnings)
+- `cargo test -p api-types -p server`: ALL PASS (88 tests total)
+  - api-types: 36 passed (unit tests including new type serde tests)
+  - server lib tests: 12 passed
+  - server integration tests: 14 passed
+  - server route tests: 19 passed
+  - workers unit tests: 7 passed (version compat + connection status)
+- `cargo check -p server`: SUCCESS
+
+## No Migration Changes Needed
+
+The workers table already exists in the initial schema (20240101000001_initial_schema.sql) with all needed columns: id, host, labels (JSONB), capabilities (JSONB), client_version, last_seen_at, created_at. No new migration required.
+
+## Architecture Notes
+
+- All worker routes are behind API key auth (same middleware as other authenticated routes)
+- Staleness is computed on read, not via background task (per spec)
+- Version check uses compile-time `CARGO_PKG_VERSION` from server's Cargo.toml (0.1.0)
+- Labels stored as JSONB array in DB, serialized/deserialized via serde_json
+- Job reclamation on worker delete only affects jobs with status='running'
+- The `compute_connection_status` function is reusable for task pull (Task 10)

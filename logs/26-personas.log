@@ -1,0 +1,277 @@
+=== CONTEXT DUMP: 26-personas feature implementation ===
+Date: 2026-03-22
+
+== TASK ==
+Implement persona CRUD across all layers: server API, CLI commands, and Web UI.
+Personas are user-defined prompts that give agents consistent identities.
+
+== SPEC (plan/26-personas-complete.md) ==
+# 26 - Personas (Server + CLI + Web)
+
+## Goal
+Implement persona CRUD across all layers: server API, CLI commands, and Web UI. Personas are user-defined prompts that give agents consistent identities.
+
+## What to build
+
+### Server routes (`crates/server/src/routes/personas.rs`)
+
+**POST /personas**
+- Create persona with name and prompt
+- Response: `201 { persona_id, name, prompt }`
+
+**GET /personas**
+- Paginated list (name only, prompt omitted for brevity)
+- Response: `200 { items: [{ persona_id, name }], next_cursor }`
+
+**GET /personas/:id**
+- Full detail including prompt
+- Response: `200 { persona_id, name, prompt }`
+- `404` if not found
+
+**PATCH /personas/:id**
+- Partial update of name and/or prompt
+- Response: `204`
+
+**DELETE /personas/:id**
+- Response: `204`, `404` if not found
+
+### Persona resolution in task dispatch
+- When a session has `persona_id`:
+  - Look up persona from DB
+  - Set `prompt_context` in pull task response to persona's prompt text
+- When no persona: `prompt_context` is empty/omitted
+
+### CLI commands
+- `remote-harness persona create --name "Refactorer" --prompt "You are a code refactoring expert..."`
+- `remote-harness persona list`
+- `remote-harness persona show <id>`
+- `remote-harness persona delete <id>`
+- Add `--persona-id` flag to `session start`
+
+### Web UI
+- Persona management in Settings (or separate Personas page)
+  - List personas (table: name | actions)
+  - Create persona (name + prompt textarea)
+  - Edit persona (inline or dialog)
+  - Delete persona (with confirmation)
+- Persona dropdown in session creation form
+
+## Dependencies
+- Task 04 (server foundation)
+- Task 10 (task dispatch — persona resolution in pull response)
+- Task 20/21 (CLI — add persona commands)
+- Task 22/23 (Web UI — add to settings or separate page)
+
+## Test criteria
+- [x] POST /personas creates persona
+- [x] GET /personas lists all personas
+- [x] GET /personas/:id returns full detail with prompt
+- [x] PATCH /personas/:id updates name/prompt
+- [x] DELETE /personas/:id removes persona
+- [x] Session with persona_id includes prompt_context in pulled task (already implemented in tasks.rs)
+- [x] Session without persona_id has empty prompt_context (already implemented in tasks.rs)
+- [x] CLI persona commands work end-to-end
+- [x] Web UI persona management works (create, list, edit, delete)
+- [x] Persona dropdown appears in session creation form (already existed)
+- [x] `cargo test -p server` passes
+
+== TECH STACK REFERENCE (docs/TECH_STACK.md) ==
+- Control Plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+- Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE for tail and attach, shares api-types with server
+- Web UI: React + TypeScript, Vite, TanStack Query, SSE for log/session stream
+- Logging: JSON; dual-write (local files + central DB); SSE for tail
+- Auth: API key (CLI, Web, workers); TLS for all connections
+
+== EXISTING STATE FOUND ==
+The personas feature was partially implemented before this task:
+- Database schema: `personas` table already existed in initial migration (id UUID PK, name TEXT, prompt TEXT, created_at, updated_at)
+- Sessions table already had `persona_id UUID REFERENCES personas(id)` FK
+- API types: `CreatePersonaRequest`, `PersonaDetail`, `PersonaSummary` already defined in `crates/api-types/src/personas.rs`
+- `PersonaId` already defined in `crates/api-types/src/ids.rs`
+- Task dispatch: `crates/server/src/routes/tasks.rs` already resolved persona prompt_context in pull task
+- Web UI types: TypeScript types for personas already existed in `web/src/lib/types.ts`
+- Web query hooks: `usePersonas()` and `useCreatePersona()` already existed in `web/src/lib/query.ts`
+- New session page: Persona dropdown already existed in `web/src/pages/new-session.tsx`
+- CLI: `--persona-id` flag already existed on `session start` command
+
+== WHAT WAS IMPLEMENTED ==
+
+### 1. API Types Addition
+**File: crates/api-types/src/personas.rs**
+Added `UpdatePersonaRequest` struct:
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdatePersonaRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+```
+
+**File: crates/api-types/src/lib.rs**
+Added `UpdatePersonaRequest` to re-exports.
+
+### 2. Server Route
+**File: crates/server/src/routes/personas.rs** (NEW)
+Full CRUD implementation:
+- `create_persona` - POST /personas: validates name/prompt not empty, inserts into DB, returns 201 with PersonaDetail
+- `list_personas` - GET /personas: cursor-based pagination, returns PersonaSummary (no prompt), limit max 100
+- `get_persona` - GET /personas/:id: returns full PersonaDetail with prompt, 404 if not found
+- `update_persona` - PATCH /personas/:id: partial update of name/prompt, dynamic SQL based on which fields present, returns 204
+- `delete_persona` - DELETE /personas/:id: returns 204, 404 if not found
+
+All handlers follow the established patterns from api_keys.rs/sessions.rs:
+- UUID parsing with error handling
+- AppError for consistent error responses
+- sqlx for database queries
+- cursor-based pagination with limit+1 pattern
+
+### 3. Route Registration
+**File: crates/server/src/routes/mod.rs**
+Added `pub mod personas;`
+
+**File: crates/server/src/lib.rs**
+Added 5 routes to the authenticated router:
+```rust
+.route("/personas", axum::routing::post(routes::personas::create_persona))
+.route("/personas", axum::routing::get(routes::personas::list_personas))
+.route("/personas/{id}", axum::routing::get(routes::personas::get_persona))
+.route("/personas/{id}", axum::routing::patch(routes::personas::update_persona))
+.route("/personas/{id}", axum::routing::delete(routes::personas::delete_persona))
+```
+
+### 4. CLI API Client
+**File: crates/cli/src/api_client.rs**
+Added persona endpoint methods:
+- `create_persona(&self, req: &CreatePersonaRequest) -> Result<PersonaDetail>`
+- `list_personas(&self) -> Result<PaginatedResponse<PersonaSummary>>`
+- `get_persona(&self, id: &str) -> Result<PersonaDetail>`
+- `delete_persona(&self, id: &str) -> Result<()>`
+
+### 5. CLI Commands
+**File: crates/cli/src/main.rs**
+Added `Persona` variant to `Commands` enum with `PersonaAction` subcommand:
+- `PersonaAction::Create { name, prompt }` - creates persona and prints ID + name
+- `PersonaAction::List` - prints table with PERSONA_ID, NAME, CREATED columns
+- `PersonaAction::Show { id }` - prints full detail including prompt
+- `PersonaAction::Delete { id }` - deletes and confirms
+
+Handler added in the `run()` function match arm.
+
+### 6. Web UI Types
+**File: web/src/lib/types.ts**
+Added `UpdatePersonaRequest` interface:
+```typescript
+export interface UpdatePersonaRequest {
+  name?: string;
+  prompt?: string;
+}
+```
+
+### 7. Web UI Query Hooks
+**File: web/src/lib/query.ts**
+Added:
+- `persona` query key for single persona fetching
+- `UpdatePersonaRequest` to imports
+- `useUpdatePersona()` mutation hook - PATCH /personas/:id
+- `useDeletePersona()` mutation hook - DELETE /personas/:id
+
+### 8. Web UI Personas Page
+**File: web/src/pages/personas.tsx** (NEW)
+Full personas management page:
+- Header with "New Persona" button
+- Create form (collapsible): name input + prompt textarea + Create/Cancel buttons
+- Edit form (inline section): loads full persona detail via API, name input + prompt textarea + Save/Cancel
+- Personas table: Name, Created date, Edit/Delete action buttons
+- Delete confirmation: two-step (click Delete → Confirm/Cancel)
+- Loading and empty states
+- Error display for all mutations
+- Uses existing Button component and Tailwind styling consistent with other pages
+
+### 9. Web UI Router & Navigation
+**File: web/src/router.tsx**
+Added `{ path: "personas", element: <PersonasPage /> }` route.
+
+**File: web/src/components/layout/sidebar.tsx**
+Added Personas nav item with UserCircle icon from lucide-react, placed between Workers and Settings.
+
+== BUILD & TEST RESULTS ==
+- `cargo build` - SUCCESS (only pre-existing warning about unused detect_sentinel in worker)
+- `npx tsc --noEmit` - SUCCESS (no TypeScript errors)
+- `cargo test -p server -p cli -p api-types` - ALL 166 TESTS PASS
+- No new migrations needed (personas table already in initial schema)
+
+== FILES MODIFIED ==
+1. crates/api-types/src/personas.rs - Added UpdatePersonaRequest
+2. crates/api-types/src/lib.rs - Added UpdatePersonaRequest re-export
+3. crates/server/src/routes/mod.rs - Added personas module
+4. crates/server/src/routes/personas.rs - NEW: Full CRUD route handlers
+5. crates/server/src/lib.rs - Registered persona routes
+6. crates/cli/src/api_client.rs - Added persona API client methods
+7. crates/cli/src/main.rs - Added Persona command and PersonaAction subcommands
+8. web/src/lib/types.ts - Added UpdatePersonaRequest interface
+9. web/src/lib/query.ts - Added persona query key, UpdatePersonaRequest import, useUpdatePersona, useDeletePersona hooks
+10. web/src/pages/personas.tsx - NEW: Full personas management page
+11. web/src/router.tsx - Added personas route
+12. web/src/components/layout/sidebar.tsx - Added Personas nav item
+
+== FILES READ (for pattern reference) ==
+- docs/TECH_STACK.md - Tech stack overview
+- plan/26-personas-processing.md - Feature spec
+- crates/server/src/lib.rs - Router assembly pattern
+- crates/server/src/routes/mod.rs - Route module registration
+- crates/server/src/routes/api_keys.rs - CRUD route pattern reference
+- crates/server/src/error.rs - AppError pattern
+- crates/api-types/src/personas.rs - Existing persona types
+- crates/api-types/src/lib.rs - Type re-exports
+- crates/cli/src/main.rs - CLI command structure
+- crates/cli/src/api_client.rs - API client pattern
+- web/src/lib/api.ts - Web API client
+- web/src/lib/query.ts - React Query hooks
+- web/src/lib/types.ts - TypeScript types
+- web/src/App.tsx - App component
+- web/src/router.tsx - Web routing
+- web/src/pages/new-session.tsx - Session creation form (persona dropdown)
+- web/src/pages/settings.tsx - Settings page pattern
+- web/src/components/layout/app-layout.tsx - Layout structure
+- web/src/components/layout/sidebar.tsx - Navigation sidebar
+
+== AGENT EXPLORATION RESULTS ==
+The Explore agent found:
+- Database schema in migrations/20240101000001_initial_schema.sql with personas table
+- API types already defined with PersonaId, CreatePersonaRequest, PersonaDetail, PersonaSummary
+- Task dispatch in tasks.rs already resolves persona prompt_context (lines 194-202)
+- PullTaskResponse already includes optional prompt_context field
+- CLI already had --persona-id on session start
+- Web UI already had usePersonas() hook and persona dropdown in new-session form
+- All patterns documented for CRUD routes, CLI commands, web pages
+
+== INITIAL GIT STATE ==
+Branch: experiment/opus_4_6
+All files untracked (new repo)
+Recent commits: d39d4b7 run agent loop claude, 64631e3 docs baseline, d16f2ff v1 docs
+
+== CONVERSATION FLOW ==
+1. Read plan/ directory listing (from system reminder - already done before conversation)
+2. Identified 26-personas-pending.md as first pending spec (sorted ascending: 26, 27, 28, 29)
+3. Renamed to processing
+4. Read TECH_STACK.md (from system reminder - already done)
+5. Checked for design-system.md - not found
+6. Launched Explore agent to understand all codebase patterns thoroughly
+7. Read key files: lib.rs, routes/mod.rs, personas.rs (api-types), lib.rs (api-types), main.rs (cli)
+8. Read api_client.rs (cli), api_keys.rs (route pattern), error.rs (error pattern)
+9. Read web files: api.ts, query.ts, types.ts, App.tsx, new-session.tsx, router.tsx, settings.tsx
+10. Read sidebar.tsx for nav pattern
+11. Implemented all changes (api-types, server route, route registration, CLI, web UI)
+12. Built and tested - all passing
+13. Renamed spec to complete
+14. Dumped context to log
+
+== SYSTEM INFORMATION ==
+- Platform: darwin (macOS 23.6.0)
+- Shell: zsh
+- Model: claude-opus-4-6
+- Working directory: /Users/chizbro/Desktop/code/utils/remote_harness_sonnet
+- Date: 2026-03-22

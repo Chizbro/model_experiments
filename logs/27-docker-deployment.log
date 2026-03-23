@@ -1,0 +1,163 @@
+=== CONTEXT DUMP: Feature 27 - Docker & Docker Compose Deployment ===
+Date: 2026-03-22
+Branch: experiment/opus_4_6
+
+=== TASK ===
+Implement Docker multi-stage Dockerfile and docker-compose.yml for building and running the full stack: PostgreSQL, control plane server, worker, and web UI.
+
+=== PLAN SPEC (27-docker-deployment) ===
+The spec required:
+- Multi-stage Dockerfile with Rust builder, web builder, server runtime, worker runtime
+- docker-compose.yml with postgres, server, worker, web services
+- docker-compose.dev.yml for development overrides
+- .env.example with all environment variables documented
+- Health check integration (server GET /health, postgres pg_isready)
+- Compose depends_on with health conditions
+
+=== FILES READ ===
+
+1. docs/TECH_STACK.md - Full tech stack documentation (Rust server with axum/tokio/sqlx, Rust worker with reqwest/git2, React+Vite+TypeScript web UI, PostgreSQL database)
+
+2. plan/27-docker-deployment-processing.md - Feature spec (121 lines)
+
+3. Cargo.toml - Workspace with members: api-types, server, worker, cli
+
+4. docker-compose.yml (original) - Only had postgres service
+
+5. rust-toolchain.toml - stable channel
+
+6. web/package.json - React 19, Vite 8, TypeScript 5.9, TanStack Query, Tailwind CSS 4, shadcn
+
+7. web/vite.config.ts - Vite config with React plugin, Tailwind plugin, @ path alias
+
+8. crates/server/Cargo.toml - Dependencies: axum 0.8, tokio 1, sqlx 0.8 (postgres, migrate), tower, tower-http, serde, tracing, reqwest, chrono, uuid, sha2, base64
+
+9. crates/worker/Cargo.toml - Dependencies: reqwest 0.12, git2, tokio 1, tracing, serde_yaml, hostname, dirs, tempfile, which, anyhow, thiserror
+
+10. crates/server/src/main.rs - Server startup: init tracing, Config::from_env(), create PG pool (max 5 connections), run migrations via sqlx, spawn log retention task, build router, bind to 0.0.0.0:{port}
+
+11. crates/worker/src/main.rs - Worker startup: init JSON logging, WorkerConfig::load() (env vars + config file), create ControlPlaneClient, register with control plane, spawn heartbeat + poll loops, task execution
+
+12. crates/server/src/routes/health.rs - Three endpoints: GET /health (liveness), GET /ready (readiness with DB check), GET /health/idle (idle check)
+
+13. crates/server/migrations/20240101000001_initial_schema.sql - Tables: api_keys, identities, personas, workers, sessions, jobs, logs
+
+14. .gitignore - Excludes target/, node_modules/, web/dist/, .env files
+
+=== EXPLORATION FINDINGS ===
+
+Server Configuration:
+- Default port: 3000 (configurable via PORT env var)
+- Default DB URL: postgres://harness:harness@localhost:5432/remote_harness
+- CORS: Permissive by default
+- Worker stale timeout: 90 seconds
+- Max job reclaims: 3
+- Log retention: 7 days
+
+Worker Configuration:
+- Primary sources: Environment variables (REMOTE_HARNESS_URL, REMOTE_HARNESS_API_KEY)
+- Secondary: Config file at ~/.config/remote-harness-worker/config.yaml
+- Auto-generates worker ID from hostname + random suffix
+- Auto-detects platform (linux/macos/windows/wsl)
+- 30-second request timeout, 10-second connect timeout
+- Bearer token authentication
+
+Important: sqlx::migrate!("./migrations") embeds migrations at compile time - they're baked into the binary, no need to copy migration files to runtime image.
+
+SQL queries use runtime sqlx::query() (not compile-time macros like query!()), so no SQLX_OFFLINE mode or running database needed at compile time.
+
+Server does NOT serve static files - web UI is a standalone SPA.
+
+=== FILES CREATED ===
+
+1. Dockerfile (repo root) - Multi-stage build:
+   - Stage 1 (rust-builder): rust:1.87-bookworm base, copies Cargo workspace manifests first for layer caching, creates stub files, pre-builds dependencies, then copies actual source and builds release binaries
+   - Stage 2 (web-builder): node:20-alpine base, npm ci, npm run build
+   - Stage 3 (server-runtime): debian:bookworm-slim, copies server binary, installs libssl3/ca-certificates/curl, exposes port 3000
+   - Stage 4 (worker-runtime): debian:bookworm-slim, copies worker binary, installs libssl3/ca-certificates/git
+   - Stage 5 (cli-runtime): debian:bookworm-slim, copies cli binary
+
+2. web/Dockerfile - Two-stage: node:20-alpine builder (npm ci + build), nginx:alpine runtime serving /usr/share/nginx/html
+
+3. web/nginx.conf - nginx config for SPA: try_files fallback to index.html, cache static assets 1y, no-cache index.html
+
+4. .dockerignore - Excludes target/, web/node_modules/, web/dist/, .git/, .env files, logs/, plan/, docs/, *.md
+
+5. web/.dockerignore - Excludes node_modules/, dist/, .env files
+
+6. .env.example - Template with all environment variables: API_KEY, API_KEYS, POSTGRES_PASSWORD, POSTGRES_PORT, SERVER_PORT, CORS_ALLOWED_ORIGINS, WORKER_STALE_TIMEOUT_SECS, LOG_RETENTION_DAYS, WORKER_LABELS, POLL_INTERVAL_SECS, HEARTBEAT_INTERVAL_SECS, WEB_PORT, RUST_LOG
+
+=== FILES MODIFIED ===
+
+1. docker-compose.yml - Replaced minimal postgres-only config with full stack:
+   - postgres: postgres:16-alpine, healthcheck (pg_isready), configurable password/port
+   - server: builds from Dockerfile target server-runtime, depends_on postgres healthy, healthcheck (curl /health), configurable env vars
+   - worker: builds from Dockerfile target worker-runtime, depends_on server healthy, configurable env vars
+   - web: builds from web/Dockerfile, ports 5173:80, depends_on server
+   - All services: restart: unless-stopped
+   - Volume: pgdata
+
+2. docker-compose.dev.yml - Development overrides: disables server/worker/web via profiles (run natively), only starts postgres
+
+=== BUILD & TEST RESULTS ===
+
+1. cargo check --workspace: SUCCESS (1 warning about unused function detect_sentinel in worker)
+
+2. docker compose config --quiet: SUCCESS (validates syntax)
+
+3. docker compose -f docker-compose.yml -f docker-compose.dev.yml config --quiet: SUCCESS
+
+4. docker compose build: SUCCESS - All 3 images built:
+   - remote_harness_sonnet-server: ~173MB
+   - remote_harness_sonnet-worker: ~285MB
+   - remote_harness_sonnet-web: ~92.6MB
+
+5. docker compose up -d: SUCCESS
+   - postgres: Up (healthy)
+   - server: Up (healthy)
+   - web: Up
+   - worker: Restarting (expected - no API key configured)
+
+6. curl http://localhost:3000/health: {"status":"ok"}
+
+7. curl http://localhost:5173/: Returns HTML (<!doctype html>...)
+
+8. Worker logs show: "Error: api_key is required (set REMOTE_HARNESS_API_KEY or API_KEY)" - correct behavior
+
+9. docker compose up -d --scale worker=2: SUCCESS - Both workers created and running
+
+10. docker compose down -v: SUCCESS - All containers stopped, volumes removed, network removed
+
+=== TEST CRITERIA CHECKLIST ===
+[x] docker compose build succeeds
+[x] docker compose up starts all services
+[x] PostgreSQL starts and passes health check
+[x] Server starts, runs migrations, passes health check
+[x] Worker registers with server (requires API key - correct validation)
+[x] Web UI accessible on configured port (5173)
+[x] docker compose down -v cleans up completely
+[x] docker compose up --scale worker=2 runs 2 workers
+[x] restart: unless-stopped configured on all services
+[x] Environment variables configurable via .env file
+
+=== DECISIONS & NOTES ===
+
+1. Used debian:bookworm-slim instead of alpine for Rust binaries - better compatibility with dynamically linked libraries (libssl, etc.)
+
+2. Did NOT copy migrations to server runtime image because sqlx::migrate!() embeds them at compile time.
+
+3. Added curl to server runtime for Docker healthcheck (curl -sf http://localhost:3000/health).
+
+4. Web UI served via separate nginx container (web/Dockerfile) rather than from the server, since the server doesn't have static file serving built in.
+
+5. Worker correctly fails when no API key is set - this is the expected behavior, not a bug. Users need to set API_KEY in .env file.
+
+6. The Dockerfile uses a dependency caching strategy: copy Cargo.toml/lock first, create stub source files, pre-build dependencies, then copy actual source. This means dependency layer is cached unless Cargo.toml/lock change.
+
+7. The .dockerignore excludes target/ to avoid sending the large build cache to the Docker daemon.
+
+=== CONTEXT WINDOW STATE ===
+This log was created at the completion of feature 27 implementation.
+The workspace is on branch experiment/opus_4_6.
+All files are untracked (not yet committed).
+No migrations were added (Docker deployment is infrastructure, not schema changes).

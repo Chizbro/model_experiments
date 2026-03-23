@@ -1,0 +1,544 @@
+== CONTEXT DUMP: 03-database-schema ==
+Date: 2026-03-21
+Feature: 03 - Database Schema & Migrations
+
+== TASK ==
+Design and implement the full PostgreSQL schema via SQLx migrations. The schema supports all v1 features (sessions, jobs, workers, identities, API keys, personas, logs, inboxes).
+
+== WHAT WAS READ ==
+
+1. plan/03-database-schema-processing.md - Full spec for all tables, indexes, seed data, and test criteria
+2. docs/TECH_STACK.md - Tech stack reference (Rust, axum, sqlx, PostgreSQL, etc.)
+3. plan/design-system.md - Does not exist
+4. Cargo.toml (workspace root) - Members: api-types, server, worker, cli
+5. crates/server/Cargo.toml - Dependencies: api-types, axum 0.8, tokio 1, sqlx 0.8, tracing, tower, serde
+6. crates/server/src/main.rs - Minimal main with tracing init
+7. crates/api-types/Cargo.toml - Dependencies: serde, chrono, uuid
+8. crates/api-types/src/lib.rs - Re-exports all types
+9. crates/api-types/src/ids.rs - ID types: SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId, ApiKeyId
+10. crates/api-types/src/sessions.rs - WorkflowType, SessionStatus, SessionParams, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest
+11. crates/api-types/src/workers.rs - WorkerStatus, RegisterWorkerRequest, HeartbeatRequest, WorkerSummary, TaskInput, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus
+12. crates/api-types/src/logs.rs - LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest
+
+== WHAT WAS CREATED/MODIFIED ==
+
+### New Files:
+
+1. crates/server/migrations/20240101000001_initial_schema.sql
+   - Full schema with 7 tables: api_keys, identities, personas, workers, sessions, jobs, logs
+   - All indexes as specified: logs (session_id+timestamp, job_id+timestamp), jobs (session_id, status, worker_id+status), workers (last_seen_at), sessions (status+created_at)
+   - Seed data: INSERT INTO identities (id) VALUES ('default')
+   - Uses TIMESTAMPTZ everywhere, JSONB for params/labels/capabilities/task_input
+   - Foreign keys: sessions->personas, sessions->identities, jobs->sessions (CASCADE), jobs->workers, logs->sessions (CASCADE), logs->jobs (CASCADE)
+
+2. docker-compose.yml
+   - PostgreSQL 16 service
+   - Credentials: harness/harness, database: remote_harness
+   - Port 5432 exposed
+   - Named volume pgdata for persistence
+
+### Modified Files:
+
+3. crates/server/Cargo.toml
+   - Added "migrate" to sqlx features list
+
+4. crates/server/src/main.rs
+   - Added DATABASE_URL env var reading with default fallback to postgres://harness:harness@localhost:5432/remote_harness
+   - Added PgPoolOptions connection with max_connections=5
+   - Added sqlx::migrate!("./migrations").run(&pool).await before HTTP binding
+   - Tracing logs: "connected to database", "migrations applied"
+
+== TEST RESULTS ==
+
+All test criteria from the spec verified:
+
+1. docker compose up -d postgres - PASS - PostgreSQL starts successfully
+2. Server starts and runs migrations - PASS - "migrations applied" logged
+3. All tables exist - PASS - Verified via \dt: api_keys, identities, jobs, logs, personas, sessions, workers (plus _sqlx_migrations)
+4. Default identity seeded - PASS - SELECT * FROM identities shows row with id='default'
+5. Idempotent re-run - PASS - Second cargo run -p server succeeds without errors
+6. Clean re-creation - PASS - docker compose down -v && up && cargo run succeeds
+7. Full workspace check - PASS - SQLX_OFFLINE=true cargo check --workspace succeeds
+
+== SCHEMA DETAILS ==
+
+Table: api_keys
+  id UUID PK DEFAULT gen_random_uuid()
+  key_hash TEXT NOT NULL
+  label TEXT
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: identities
+  id TEXT PK DEFAULT 'default'
+  agent_token TEXT
+  git_token TEXT
+  refresh_token TEXT
+  token_expires_at TIMESTAMPTZ
+  git_provider TEXT
+  git_base_url TEXT
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: personas
+  id UUID PK DEFAULT gen_random_uuid()
+  name TEXT NOT NULL
+  prompt TEXT NOT NULL
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: workers
+  id TEXT PK
+  host TEXT NOT NULL
+  labels JSONB NOT NULL DEFAULT '{}'
+  capabilities JSONB NOT NULL DEFAULT '[]'
+  client_version TEXT
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: sessions
+  id UUID PK DEFAULT gen_random_uuid()
+  repo_url TEXT NOT NULL
+  ref TEXT NOT NULL DEFAULT 'main'
+  workflow TEXT NOT NULL
+  params JSONB NOT NULL DEFAULT '{}'
+  persona_id UUID REFERENCES personas(id)
+  identity_id TEXT NOT NULL DEFAULT 'default' REFERENCES identities(id)
+  status TEXT NOT NULL DEFAULT 'pending'
+  retain_forever BOOLEAN NOT NULL DEFAULT false
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: jobs
+  id UUID PK DEFAULT gen_random_uuid()
+  session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+  worker_id TEXT REFERENCES workers(id)
+  status TEXT NOT NULL DEFAULT 'pending'
+  task_input JSONB NOT NULL DEFAULT '{}'
+  error_message TEXT
+  branch TEXT
+  commit_ref TEXT
+  mr_title TEXT
+  mr_description TEXT
+  pull_request_url TEXT
+  output TEXT
+  sentinel_reached BOOLEAN DEFAULT false
+  assistant_reply TEXT
+  reclaim_count INTEGER NOT NULL DEFAULT 0
+  assigned_at TIMESTAMPTZ
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Table: logs
+  id UUID PK DEFAULT gen_random_uuid()
+  session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE
+  job_id UUID REFERENCES jobs(id) ON DELETE CASCADE
+  worker_id TEXT
+  level TEXT NOT NULL DEFAULT 'info'
+  source TEXT NOT NULL DEFAULT 'control_plane'
+  message TEXT NOT NULL
+  timestamp TIMESTAMPTZ NOT NULL DEFAULT now()
+
+Indexes:
+  idx_logs_session_timestamp ON logs (session_id, timestamp)
+  idx_logs_job_timestamp ON logs (job_id, timestamp)
+  idx_jobs_session_id ON jobs (session_id)
+  idx_jobs_status ON jobs (status)
+  idx_jobs_worker_status ON jobs (worker_id, status)
+  idx_workers_last_seen ON workers (last_seen_at)
+  idx_sessions_status_created ON sessions (status, created_at)
+
+== DESIGN DECISIONS ==
+
+- Used TIMESTAMPTZ everywhere for timezone safety (per spec)
+- JSONB columns for params, labels, capabilities, task_input (per spec)
+- TEXT for status columns instead of enums for flexibility during development (per spec)
+- No inbox tables yet (P1 feature, per spec)
+- Single migration file since this is the initial schema
+- Default DATABASE_URL points to docker-compose postgres instance
+- PgPoolOptions with max_connections=5 for dev
+
+== EXISTING CODEBASE CONTEXT ==
+
+The project is a Rust monorepo with 4 crates:
+- api-types: Shared request/response types, IDs, contracts
+- server: Control plane (axum HTTP + SSE, sqlx PostgreSQL)
+- worker: Worker (reqwest, git2, runs Claude Code/Cursor CLI)
+- cli: CLI (clap, API client, log tail)
+
+The api-types crate defines ID types as newtype wrappers around String (using a macro). UUID IDs in the DB map to String IDs in the API types. WorkflowType and SessionStatus are enums with snake_case serde. TaskInput is a tagged enum. All timestamps use chrono::DateTime<Utc>.
+
+The web/ directory exists for the React + TypeScript + Vite UI but was not touched in this task.
+
+== RAW TOOL OUTPUTS ==
+
+--- ls plan/ ---
+18-loop-workflows-pending.md
+24-web-ui-dashboard-sessions-pending.md
+09-session-job-state-machine-pending.md
+27-docker-deployment-pending.md
+25-web-ui-workers-logs-pending.md
+11-log-ingestion-storage-pending.md
+04-server-foundation-pending.md
+14-worker-git-operations-pending.md
+02-api-types-design-complete.md
+13-worker-foundation-pending.md
+06-identity-credentials-pending.md
+07-git-oauth-flows-pending.md
+19-pr-mr-creation-pending.md
+08-worker-registration-heartbeat-pending.md
+28-ci-pipeline-pending.md
+26-personas-pending.md
+12-log-sse-streaming-pending.md
+03-database-schema-pending.md
+20-cli-foundation-pending.md
+23-web-ui-settings-auth-pending.md
+22-web-ui-foundation-pending.md
+21-cli-commands-pending.md
+29-e2e-integration-tests-pending.md
+05-api-key-auth-pending.md
+10-task-dispatch-completion-pending.md
+16-worker-task-lifecycle-logging-pending.md
+01-repo-scaffolding-complete.md
+15-worker-agent-cli-execution-pending.md
+17-chat-workflow-pending.md
+
+--- Cargo.toml (workspace) ---
+[workspace]
+members = [
+    "crates/api-types",
+    "crates/server",
+    "crates/worker",
+    "crates/cli",
+]
+resolver = "2"
+
+--- crates/server/Cargo.toml (after edit) ---
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+--- crates/server/src/main.rs (after edit) ---
+use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    tracing::info!("server starting");
+
+    let database_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://harness:harness@localhost:5432/remote_harness".to_string());
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url)
+        .await
+        .expect("failed to connect to database");
+
+    tracing::info!("connected to database");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
+
+    tracing::info!("migrations applied");
+
+    println!("server starting — migrations applied");
+}
+
+--- crates/server/migrations/20240101000001_initial_schema.sql ---
+-- Initial schema for Remote Harness v1
+
+-- API Keys
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash TEXT NOT NULL,
+    label TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Identities
+CREATE TABLE identities (
+    id TEXT PRIMARY KEY DEFAULT 'default',
+    agent_token TEXT,
+    git_token TEXT,
+    refresh_token TEXT,
+    token_expires_at TIMESTAMPTZ,
+    git_provider TEXT,
+    git_base_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Personas
+CREATE TABLE personas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Workers
+CREATE TABLE workers (
+    id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    labels JSONB NOT NULL DEFAULT '{}',
+    capabilities JSONB NOT NULL DEFAULT '[]',
+    client_version TEXT,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Sessions
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    repo_url TEXT NOT NULL,
+    ref TEXT NOT NULL DEFAULT 'main',
+    workflow TEXT NOT NULL,
+    params JSONB NOT NULL DEFAULT '{}',
+    persona_id UUID REFERENCES personas(id),
+    identity_id TEXT NOT NULL DEFAULT 'default' REFERENCES identities(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    retain_forever BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Jobs
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    worker_id TEXT REFERENCES workers(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    task_input JSONB NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    branch TEXT,
+    commit_ref TEXT,
+    mr_title TEXT,
+    mr_description TEXT,
+    pull_request_url TEXT,
+    output TEXT,
+    sentinel_reached BOOLEAN DEFAULT false,
+    assistant_reply TEXT,
+    reclaim_count INTEGER NOT NULL DEFAULT 0,
+    assigned_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Logs
+CREATE TABLE logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    worker_id TEXT,
+    level TEXT NOT NULL DEFAULT 'info',
+    source TEXT NOT NULL DEFAULT 'control_plane',
+    message TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes
+CREATE INDEX idx_logs_session_timestamp ON logs (session_id, timestamp);
+CREATE INDEX idx_logs_job_timestamp ON logs (job_id, timestamp);
+CREATE INDEX idx_jobs_session_id ON jobs (session_id);
+CREATE INDEX idx_jobs_status ON jobs (status);
+CREATE INDEX idx_jobs_worker_status ON jobs (worker_id, status);
+CREATE INDEX idx_workers_last_seen ON workers (last_seen_at);
+CREATE INDEX idx_sessions_status_created ON sessions (status, created_at);
+
+-- Seed default identity
+INSERT INTO identities (id) VALUES ('default');
+
+--- docker-compose.yml ---
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness
+      POSTGRES_DB: remote_harness
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
+
+--- docker compose up output ---
+PostgreSQL 16 started on port 5432
+
+--- cargo run -p server (first run) ---
+server starting
+connected to database
+migrations applied
+server starting — migrations applied
+
+--- \dt output ---
+ Schema |       Name       | Type  |  Owner
+--------+------------------+-------+---------
+ public | _sqlx_migrations | table | harness
+ public | api_keys         | table | harness
+ public | identities       | table | harness
+ public | jobs             | table | harness
+ public | logs             | table | harness
+ public | personas         | table | harness
+ public | sessions         | table | harness
+ public | workers          | table | harness
+
+--- SELECT * FROM identities ---
+   id    | agent_token | git_token | refresh_token | token_expires_at | git_provider | git_base_url |          created_at           |          updated_at
+---------+-------------+-----------+---------------+------------------+--------------+--------------+-------------------------------+-------------------------------
+ default |             |           |               |                  |              |              | 2026-03-21 14:03:49.770569+00 | 2026-03-21 14:03:49.770569+00
+
+--- Idempotent re-run ---
+server starting
+connected to database
+relation "_sqlx_migrations" already exists, skipping
+migrations applied
+server starting — migrations applied
+
+--- Clean re-creation (down -v + up + run) ---
+server starting
+connected to database
+migrations applied
+server starting — migrations applied
+
+--- SQLX_OFFLINE=true cargo check --workspace ---
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+
+== API-TYPES CRATE CONTENTS ==
+
+--- crates/api-types/src/lib.rs ---
+pub mod api_keys;
+pub mod common;
+pub mod error;
+pub mod health;
+pub mod identity;
+pub mod ids;
+pub mod logs;
+pub mod personas;
+pub mod sessions;
+pub mod workers;
+
+pub use common::{AgentCli, BranchMode, PaginatedResponse};
+pub use error::ApiError;
+pub use ids::*;
+pub use sessions::{
+    CreateSessionRequest, JobSummary, SendInputRequest, SessionDetail, SessionParams,
+    SessionStatus, SessionSummary, WorkflowType,
+};
+pub use workers::{
+    HeartbeatRequest, PullTaskResponse, RegisterWorkerRequest, TaskCompleteRequest,
+    TaskCompleteStatus, TaskInput, WorkerStatus, WorkerSummary,
+};
+pub use logs::{LogEntry, LogLevel, SendLogsRequest, WorkerLogEntry};
+pub use identity::{AuthStatus, IdentityStatus, UpdateIdentityRequest};
+pub use api_keys::{ApiKeySummary, CreateApiKeyRequest, CreateApiKeyResponse};
+pub use personas::{CreatePersonaRequest, PersonaDetail, PersonaSummary};
+pub use health::{HealthResponse, IdleResponse};
+
+pub use chrono;
+pub use uuid;
+
+--- crates/api-types/src/ids.rs ---
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use uuid::Uuid;
+
+macro_rules! id_type {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(pub String);
+
+        impl $name {
+            pub fn new() -> Self {
+                Self(Uuid::new_v4().to_string())
+            }
+            pub fn from_string(s: impl Into<String>) -> Self {
+                Self(s.into())
+            }
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self { Self::new() }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+
+        impl From<String> for $name {
+            fn from(s: String) -> Self { Self(s) }
+        }
+
+        impl From<&str> for $name {
+            fn from(s: &str) -> Self { Self(s.to_string()) }
+        }
+    };
+}
+
+id_type!(SessionId);
+id_type!(JobId);
+id_type!(WorkerId);
+id_type!(TaskId);
+id_type!(PersonaId);
+id_type!(IdentityId);
+id_type!(ApiKeyId);
+
+--- crates/api-types/src/sessions.rs ---
+(Full contents as read above - WorkflowType enum with Chat/LoopN/LoopUntilSentinel/Inbox, SessionStatus enum with Pending/Running/Completed/Failed, SessionParams struct, CreateSessionRequest, SessionSummary, SessionDetail, JobSummary, SendInputRequest, and comprehensive tests)
+
+--- crates/api-types/src/workers.rs ---
+(Full contents as read above - WorkerStatus, RegisterWorkerRequest, HeartbeatRequest, WorkerSummary, TaskInput tagged enum, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus, and comprehensive tests)
+
+--- crates/api-types/src/logs.rs ---
+(Full contents as read above - LogLevel, LogEntry, WorkerLogEntry, SendLogsRequest, and tests)
+
+== TECH_STACK.md SUMMARY ==
+
+Control plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL (task queue in DB)
+Workers: Rust (tokio, reqwest, git2), agent via Claude Code or Cursor CLI (BYOL)
+CLI: Rust (clap), SSE for tail/attach
+Web UI: React + TypeScript, Vite, TanStack Query, SSE
+Logging: JSON, dual-write (local files + central DB), SSE for tail
+Auth: API key (CLI, Web, workers), TLS
+
+Repo layout:
+remote_harness/
+├── crates/
+│   ├── server/
+│   ├── worker/
+│   ├── cli/
+│   └── api-types/
+├── web/
+├── docs/
+├── Cargo.toml
+└── docker-compose.yml
+
+== END CONTEXT DUMP ==

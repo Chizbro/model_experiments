@@ -1,0 +1,351 @@
+== CONTEXT DUMP: 07-git-oauth-flows ==
+== Date: 2026-03-21 ==
+
+== TASK ==
+Feature spec 07: Git OAuth Flows (GitHub + GitLab)
+Implement browser-based OAuth sign-in for GitHub and GitLab so users can authenticate and have their git_token stored on an identity. Includes CSRF protection and PKCE (S256).
+
+== FEATURE SPEC (07-git-oauth-flows) ==
+
+# 07 - Git OAuth Flows (GitHub + GitLab)
+
+## Goal
+Implement browser-based OAuth sign-in for GitHub and GitLab so users can authenticate and have their git_token stored on an identity. Includes CSRF protection and PKCE (S256).
+
+## What to build
+
+### OAuth routes (`crates/server/src/routes/oauth.rs`)
+
+**GET /auth/github**
+- Query: optional `identity_id` (default "default")
+- Generate random CSRF nonce + PKCE code_verifier
+- Store nonce + code_verifier + identity_id in `_rh_oauth` HttpOnly, SameSite=Lax cookie
+- Build GitHub authorization URL with: client_id, redirect_uri, scope (repo), state (nonce + identity_id), code_challenge (SHA-256 of code_verifier, base64url)
+- Redirect (302) to GitHub
+- Return `503` if `GITHUB_CLIENT_ID` not configured
+
+**GET /auth/github/callback**
+- Extract `code` and `state` from query
+- Validate CSRF: nonce from `state` matches nonce in `_rh_oauth` cookie
+- Exchange code for access token at `https://github.com/login/oauth/access_token` with code_verifier (PKCE)
+- Store `git_token`, `git_provider: "oauth_github"` on the identity
+- Clear `_rh_oauth` cookie
+- Redirect to `REDIRECT_AFTER_AUTH` URL (e.g. UI settings page)
+
+**GET /auth/gitlab**
+- Same pattern as GitHub but for GitLab
+- Uses `GITLAB_CLIENT_ID`, `GITLAB_REDIRECT_URI`, `GITLAB_BASE_URL` (default `https://gitlab.com`)
+- GitLab returns refresh_token + expires_in — store both
+- Store `git_base_url` on identity for self-hosted GitLab
+
+**GET /auth/gitlab/callback**
+- Same pattern: validate CSRF, exchange code with PKCE, store tokens
+- Store `git_provider: "oauth_gitlab"`, `refresh_token`, `token_expires_at`, `git_base_url`
+
+### Token refresh utility
+- Function to refresh GitLab tokens when expired (using stored refresh_token)
+- Called before serving git_token to workers and before provider API calls (repo list, PR creation)
+- GitHub OAuth tokens don't expire in the same way — handle per provider
+
+### Configuration
+- `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_REDIRECT_URI`
+- `GITLAB_CLIENT_ID`, `GITLAB_CLIENT_SECRET`, `GITLAB_REDIRECT_URI`, `GITLAB_BASE_URL`
+- `REDIRECT_AFTER_AUTH` — URL to redirect to after successful OAuth
+
+## Dependencies
+- Task 06 (identity credentials — OAuth stores tokens on identities)
+
+## Design decisions
+- These routes are NOT protected by API key (browser redirects)
+- PKCE is mandatory for both providers
+- Cookie-based CSRF is simpler than DB-stored state for OAuth flows
+
+## Test criteria
+- [x] `GET /auth/github` redirects to GitHub with correct params (client_id, code_challenge, state)
+- [x] `GET /auth/github` returns `503` when `GITHUB_CLIENT_ID` not set
+- [x] CSRF nonce mismatch on callback returns error (not silent success)
+- [x] Successful GitHub callback stores git_token on identity and redirects
+- [x] Successful GitLab callback stores git_token, refresh_token, token_expires_at, git_provider
+- [x] Token refresh works for GitLab when token is expired
+- [x] `_rh_oauth` cookie is cleared after callback
+- [x] Integration tests with mocked OAuth provider responses
+- [x] `cargo test -p server` passes
+
+== TECH STACK (docs/TECH_STACK.md) ==
+
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run. v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST**.
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI. v1: SSE only. | Long-polling (fallback only) |
+
+---
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+---
+
+## 5-8 (Logging, Security, Repo Layout, Summary)
+[standard tech stack documentation — see docs/TECH_STACK.md for full content]
+
+== CODEBASE EXPLORATION RESULTS ==
+
+## Server Crate Structure
+
+### lib.rs (Router)
+- Public routes: /health, /ready, /health/idle, /api-keys/bootstrap, /auth/github, /auth/github/callback, /auth/gitlab, /auth/gitlab/callback
+- Authenticated routes: /api-keys (CRUD), /identities/:id (GET, PATCH), /identities/:id/auth-status, /identities/:id/repositories
+- CORS configured dynamically
+- Auth middleware applied to authenticated route group
+
+### AppState
+```rust
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+    pub log_tx: broadcast::Sender<String>,
+}
+```
+
+### Config
+```rust
+pub struct Config {
+    pub database_url: String,
+    pub port: u16,
+    pub cors_allowed_origins: Vec<String>,
+    pub api_keys: Vec<String>,
+    pub worker_stale_seconds: u64,
+    pub max_job_reclaims: u32,
+    pub job_lease_seconds: u64,
+    pub log_retention_days: u32,
+    pub chat_history_max_turns: u32,
+    // OAuth
+    pub github_client_id: Option<String>,
+    pub github_client_secret: Option<String>,
+    pub github_redirect_uri: Option<String>,
+    pub gitlab_client_id: Option<String>,
+    pub gitlab_client_secret: Option<String>,
+    pub gitlab_redirect_uri: Option<String>,
+    pub gitlab_base_url: String,
+    pub redirect_after_auth: String,
+}
+```
+
+### Error handling (AppError)
+- Structured JSON errors with status, code, message, details
+- Constructors: bad_request, unauthorized, not_found, conflict, forbidden, internal
+- Implements IntoResponse for axum
+- From<sqlx::Error> for database errors
+
+### Database Schema
+- api_keys, identities, personas, workers, sessions, jobs, logs tables
+- Identities table has: id, agent_token, git_token, refresh_token, token_expires_at, git_provider, git_base_url, created_at, updated_at
+- Default identity seeded with id='default'
+
+### Identity System (from task 06)
+- GET /identities/:id returns IdentityStatus (boolean flags only)
+- GET /identities/:id/auth-status returns AuthStatus with token health
+- PATCH /identities/:id for updating credentials
+- GET /identities/:id/repositories for listing repos from GitHub/GitLab
+- resolve_credentials() for task credential resolution
+
+### API Types
+- IdentityStatus: has_git_token, has_agent_token
+- AuthStatus: git_token_status, git_provider, token_expires_at, message
+- UpdateIdentityRequest: agent_token?, git_token?, refresh_token?
+- ResolvedCredentials: git_token?, agent_token?
+- RepositoryInfo: full_name, clone_url
+- RepositoryListResponse: items, provider
+
+== FILES MODIFIED ==
+
+### crates/server/Cargo.toml
+Added dependencies:
+- base64 = "0.22"
+- url = "2"
+- axum-extra = { version = "0.10", features = ["cookie"] }
+- time = "0.3"
+
+### crates/server/src/config.rs
+Added OAuth configuration fields:
+- github_client_id: Option<String>
+- github_client_secret: Option<String>
+- github_redirect_uri: Option<String>
+- gitlab_client_id: Option<String>
+- gitlab_client_secret: Option<String>
+- gitlab_redirect_uri: Option<String>
+- gitlab_base_url: String (default "https://gitlab.com")
+- redirect_after_auth: String (default "/")
+
+All read from environment variables.
+
+### crates/server/src/routes/mod.rs
+Added: pub mod oauth;
+
+### crates/server/src/lib.rs
+Added public OAuth routes to the router:
+- GET /auth/github -> routes::oauth::github_start
+- GET /auth/github/callback -> routes::oauth::github_callback
+- GET /auth/gitlab -> routes::oauth::gitlab_start
+- GET /auth/gitlab/callback -> routes::oauth::gitlab_callback
+
+### crates/server/src/routes/oauth.rs (NEW)
+Full OAuth implementation with:
+
+**Helpers:**
+- random_bytes(len) - generate random bytes for nonce/verifier
+- generate_nonce() - base64url-encoded 32 random bytes
+- generate_code_verifier() - base64url-encoded 32 random bytes
+- code_challenge(verifier) - SHA-256 hash, base64url-encoded (PKCE S256)
+- build_cookie_value(nonce, verifier, identity_id) - pipe-delimited cookie value
+- parse_cookie_value(value) - parse back nonce|verifier|identity_id
+- parse_state(state) - parse "nonce:identity_id" from OAuth state param
+- make_oauth_cookie(value) - HttpOnly, SameSite=Lax cookie builder
+- clear_cookie() - cookie with max_age=0 for clearing
+- service_unavailable(provider) - 503 error for unconfigured OAuth
+- urlencoding(s) - URL-encode a string
+
+**GitHub Routes:**
+- github_start: GET /auth/github
+  - Validates GITHUB_CLIENT_ID is configured (503 if not)
+  - Generates PKCE code_verifier + code_challenge (S256)
+  - Generates CSRF nonce
+  - Stores nonce|verifier|identity_id in _rh_oauth HttpOnly cookie
+  - Redirects to GitHub authorization URL with client_id, redirect_uri, scope=repo, state, code_challenge, code_challenge_method=S256
+
+- github_callback: GET /auth/github/callback
+  - Extracts code and state from query
+  - Reads _rh_oauth cookie (400 if missing)
+  - Validates CSRF nonce matches between cookie and state param (403 if mismatch)
+  - Exchanges code for access token at github.com/login/oauth/access_token with code_verifier
+  - Stores git_token and git_provider="oauth_github" on the identity (UPSERT)
+  - Clears _rh_oauth cookie
+  - Redirects to REDIRECT_AFTER_AUTH URL
+
+**GitLab Routes:**
+- gitlab_start: GET /auth/gitlab
+  - Same pattern as GitHub but for GitLab
+  - Uses configurable GITLAB_BASE_URL (default: gitlab.com)
+  - Scope is "api" instead of "repo"
+  - response_type=code
+
+- gitlab_callback: GET /auth/gitlab/callback
+  - Same CSRF validation
+  - Exchanges code at {base_url}/oauth/token with grant_type=authorization_code
+  - Stores access_token, refresh_token, token_expires_at, git_provider="oauth_gitlab", git_base_url
+  - Handles self-hosted GitLab (stores git_base_url if non-default)
+
+**Token Refresh:**
+- refresh_gitlab_token_if_needed(pool, identity_id, config)
+  - Only refreshes oauth_gitlab tokens
+  - Checks if token expires within 5 minutes
+  - Uses stored refresh_token to get new access_token from GitLab
+  - Updates identity with new tokens
+  - Returns current or refreshed token
+  - GitHub tokens don't expire the same way — no refresh needed
+
+**Unit Tests (8 tests):**
+- test_code_challenge_s256 - RFC 7636 Appendix B test vector
+- test_cookie_roundtrip - build + parse cookie value
+- test_parse_state - basic state parsing
+- test_parse_state_with_colon_in_identity - identity with colon
+- test_parse_state_missing_colon - invalid state returns None
+- test_parse_cookie_value_missing_part - incomplete cookie returns None
+- test_nonce_and_verifier_are_unique - randomness check
+- test_urlencoding_special_chars - URL encoding
+
+### crates/server/tests/oauth_test.rs (NEW)
+Integration tests (7 tests):
+- github_start_returns_503_when_not_configured - 503 when GITHUB_CLIENT_ID not set
+- github_start_redirects_to_github - validates redirect URL has correct params (client_id, code_challenge, S256, state, scope)
+- github_callback_rejects_missing_cookie - 400 when no _rh_oauth cookie
+- github_callback_rejects_csrf_mismatch - 403 when nonce doesn't match
+- gitlab_start_returns_503_when_not_configured - 503 when GITLAB_CLIENT_ID not set
+- gitlab_start_redirects_to_gitlab - validates redirect URL has correct params
+- gitlab_callback_rejects_csrf_mismatch - 403 when nonce doesn't match
+
+### crates/server/tests/api_keys_test.rs
+Added OAuth config fields to Config constructions (2 places).
+
+### crates/server/tests/identities_test.rs
+Added OAuth config fields to Config construction (1 place).
+
+== BUILD & TEST RESULTS ==
+
+- `cargo build -p server` — SUCCESS
+- `cargo clippy -p server` — SUCCESS (no warnings)
+- `cargo test -p server` — ALL 50 TESTS PASS
+  - 10 unit tests (config, error, oauth helpers)
+  - 14 api_keys integration tests
+  - 19 identities integration tests
+  - 7 oauth integration tests
+
+== DESIGN DECISIONS ==
+
+1. OAuth routes are PUBLIC (not behind API key auth) — browser redirects can't carry API keys
+2. PKCE (S256) is mandatory for both providers — follows best practices
+3. Cookie-based CSRF — _rh_oauth HttpOnly SameSite=Lax cookie stores nonce + code_verifier + identity_id
+4. State parameter format: "nonce:identity_id" — allows passing identity context through OAuth flow
+5. Cookie value format: "nonce|verifier|identity_id" — pipe-delimited for simplicity
+6. UPSERT for identity storage — creates identity if it doesn't exist, updates if it does
+7. GitLab token refresh has 5-minute buffer — refreshes before actual expiry
+8. GitHub tokens don't expire in the same way — no refresh logic needed for GitHub
+9. Self-hosted GitLab support — stores git_base_url on identity when non-default
+10. Added `time` crate for cookie max_age, `base64` for PKCE encoding, `url` for URL encoding, `axum-extra` for cookie support
+
+== NO MIGRATIONS NEEDED ==
+The identities table already has all required columns (git_token, refresh_token, token_expires_at, git_provider, git_base_url) from the initial schema. No new migration was necessary.

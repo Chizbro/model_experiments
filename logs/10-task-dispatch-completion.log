@@ -1,0 +1,547 @@
+== CONTEXT DUMP: 10-task-dispatch-completion ==
+Date: 2026-03-21
+
+== TASK ==
+Implement the server-side task pull (dispatch) and task complete endpoints — the core worker-to-server interaction for executing jobs. Includes job reclaim from stale workers and bounded retries.
+
+== FEATURE SPEC ==
+File: plan/10-task-dispatch-completion-complete.md
+
+### Task routes (crates/server/src/routes/tasks.rs)
+
+**POST /workers/tasks/pull**
+- Request: optional `worker_id`
+- Step 1: **Stale reclaim** — in one transaction, reclaim jobs from stale workers:
+  ```sql
+  UPDATE jobs SET worker_id = NULL, status = 'pending', reclaim_count = reclaim_count + 1
+  WHERE status = 'assigned' AND worker_id IN (SELECT id FROM workers WHERE last_seen_at < $stale_cutoff)
+  AND reclaim_count < $max_job_reclaims
+  ```
+- Step 1b: Fail jobs over reclaim cap:
+  ```sql
+  UPDATE jobs SET status = 'failed', error_message = '[MAX_WORKER_LOSS_RETRIES]'
+  WHERE status = 'assigned' AND worker_id IN (SELECT id FROM workers WHERE last_seen_at < $stale_cutoff)
+  AND reclaim_count >= $max_job_reclaims
+  ```
+- Step 1c: **Lease reclaim** (when `job_lease_seconds > 0`): fail jobs in `assigned` state longer than lease
+- Step 2: Select one `pending` job, assign to worker (set worker_id, status = 'assigned', assigned_at = now())
+- Step 3: Build full pull response: resolve credentials from identity, build task_input, include prompt_context (persona), params, credentials
+- Response (task available): `200 { task_id, job_id, session_id, repo_url, ref, workflow, prompt_context, task_input, params, credentials }`
+- Response (no work): `204 No Content`
+
+**POST /workers/tasks/:id/complete**
+- Validate task is assigned to the reporting worker
+- Update job: status, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply
+- Update session status based on job outcomes
+- For loop_until_sentinel: if `sentinel_reached` is true, mark session completed; otherwise create next job
+- For loop_n: if all jobs completed, mark session completed
+- For chat: update session, store assistant_reply for future history assembly
+- Trigger PR/MR creation if applicable (defer actual implementation to Task 19)
+- Response: `200 { "ok": true }`
+- `404` if task unknown or already completed
+
+== INITIAL CODEBASE EXPLORATION ==
+
+### Server Crate Structure
+- src/main.rs - Application entry point
+- src/lib.rs - Router setup and builder
+- src/state.rs - AppState definition (PgPool, Config, broadcast::Sender)
+- src/config.rs - Configuration from environment
+- src/error.rs - AppError type and handlers
+- src/middleware/mod.rs - Middleware module export
+- src/middleware/auth.rs - API key authentication
+- src/routes/mod.rs - Route module exports
+- src/routes/health.rs - Health check routes
+- src/routes/workers.rs - Worker management routes
+- src/routes/sessions.rs - Session management routes
+- src/routes/identities.rs - Identity/credential routes
+- src/routes/api_keys.rs - API key management
+- src/routes/oauth.rs - GitHub/GitLab OAuth flows
+- src/engine/mod.rs - Session job creation engine
+- src/engine/jobs.rs - Job state machine logic
+
+### Database Schema
+- sessions: id UUID, repo_url, ref, workflow, params JSONB, persona_id UUID, identity_id TEXT, status, retain_forever, timestamps
+- jobs: id UUID, session_id UUID, worker_id TEXT, status, task_input JSONB, error_message, branch, commit_ref, mr_title, mr_description, pull_request_url, output, sentinel_reached BOOLEAN, assistant_reply, reclaim_count INTEGER, assigned_at, timestamps
+- workers: id TEXT, host, labels JSONB, capabilities JSONB, client_version, last_seen_at, created_at
+- identities: id TEXT, agent_token, git_token, refresh_token, token_expires_at, git_provider, git_base_url, timestamps
+- personas: id UUID, name, prompt, timestamps
+
+### API Types
+- PullTaskResponse: task_id, session_id, job_id, repo_url, ref_, workflow, params, input (TaskInput), git_token, agent_token, agent_cli, model, branch_mode, prompt_context
+- TaskCompleteRequest: status (TaskCompleteStatus), worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply
+- TaskCompleteStatus: Completed | Failed
+- TaskInput: ChatFirst { prompt } | ChatFollowup { message } | Loop { prompt, iteration } | Inbox { prompt, payload? }
+
+### Config
+- worker_stale_seconds: u64 (default 90)
+- max_job_reclaims: u32 (default 3)
+- job_lease_seconds: u64 (default 0)
+
+### Existing Engine Code
+- engine::create_jobs_for_session() - Creates initial jobs for Chat, LoopN, LoopUntilSentinel, Inbox workflows
+- engine::on_job_completed() - Handles loop_until_sentinel follow-up: creates next job if sentinel not reached
+- engine::jobs::assign_to_worker() - Transitions pending -> assigned
+- engine::jobs::complete_job() - Transitions to completed/failed with output fields
+- engine::jobs::derive_session_status() / update_session_status() - Calculates and updates session status from job statuses
+
+== IMPLEMENTATION ==
+
+### Files Created
+1. **crates/server/src/routes/tasks.rs** - New file with pull_task and complete_task handlers
+
+### Files Modified
+1. **crates/server/src/routes/mod.rs** - Added `pub mod tasks;`
+2. **crates/server/src/lib.rs** - Added routes:
+   - `.route("/workers/tasks/pull", axum::routing::post(routes::tasks::pull_task))`
+   - `.route("/workers/tasks/{id}/complete", axum::routing::post(routes::tasks::complete_task))`
+3. **crates/server/src/engine/jobs.rs** - Added `::uuid` casts to all SQL queries binding text to UUID columns
+4. **crates/server/src/engine/mod.rs** - Added `::uuid` casts to all SQL queries binding text to UUID columns
+5. **crates/server/src/routes/sessions.rs** - Added `::uuid` casts to all SQL queries binding text to UUID columns (pre-existing bug fix)
+
+### Test File Created
+6. **crates/server/tests/tasks_test.rs** - 15 integration tests
+
+== KEY IMPLEMENTATION DETAILS ==
+
+### POST /workers/tasks/pull (pull_task)
+1. Validates worker_id is provided and worker exists
+2. **Stale reclaim**: Reclaims jobs from stale workers (workers whose last_seen_at < now - worker_stale_seconds) by setting status back to pending and incrementing reclaim_count
+3. **Fail over-reclaim**: Jobs with reclaim_count >= max_job_reclaims are failed with error_message '[MAX_WORKER_LOSS_RETRIES]'
+4. **Lease expiry** (when job_lease_seconds > 0): Jobs in assigned state longer than the lease are failed with '[JOB_LEASE_EXPIRED]'
+5. **Select pending job**: Uses `FOR UPDATE SKIP LOCKED` for concurrency safety, selects oldest pending job
+6. **Assign job**: Uses engine::jobs::assign_to_worker()
+7. **Build response**: Fetches session details, resolves credentials from identity, resolves persona prompt_context, parses TaskInput from JSONB
+8. Returns 200 with PullTaskResponse or 204 No Content
+
+### POST /workers/tasks/:id/complete (complete_task)
+1. Looks up job by id (the URL task_id maps to the job_id in DB)
+2. Validates the reporting worker_id matches the assigned worker
+3. Validates job status is assigned or running
+4. Calls engine::jobs::complete_job() with all output fields
+5. Logs PR/MR creation hook (deferred to Task 19)
+6. For successful completions: calls engine::on_job_completed() which handles loop_until_sentinel follow-up
+7. For failures: calls jobs::update_session_status() directly
+8. Returns 200 { "ok": true }
+
+### UUID Casting Bug Fix
+Discovered that throughout the codebase, string-typed IDs (from the api-types crate) were being bound to UUID columns in PostgreSQL without explicit casts. PostgreSQL does not implicitly cast TEXT to UUID in INSERT/UPDATE SET expressions. Fixed by adding `::uuid` casts throughout:
+- engine/jobs.rs: All WHERE id = $1 and WHERE session_id = $1 queries
+- engine/mod.rs: All INSERT INTO jobs and SELECT FROM sessions/jobs queries
+- routes/sessions.rs: All WHERE id = $1 on sessions and jobs tables
+- routes/tasks.rs: All new queries
+
+== TESTS (15 tests, all passing) ==
+
+1. test_pull_no_pending_jobs_returns_204 - Pull with no work returns 204
+2. test_pull_assigns_pending_job_and_returns_payload - Pull assigns job and returns full PullTaskResponse
+3. test_pull_includes_credentials - Pull response includes git_token and agent_token from identity
+4. test_complete_success_marks_job_completed - Complete with status=completed marks job completed in DB
+5. test_complete_failed_marks_job_failed - Complete with status=failed marks job failed with error_message
+6. test_stale_worker_jobs_reclaimed - Stale worker's jobs are reclaimed during pull (reclaim_count incremented)
+7. test_jobs_exceeding_max_reclaims_are_failed - Jobs over max_job_reclaims are failed with [MAX_WORKER_LOSS_RETRIES]
+8. test_lease_expiry_fails_jobs - Jobs exceeding lease time are failed with [JOB_LEASE_EXPIRED]
+9. test_loop_until_sentinel_reached_completes_session - sentinel_reached=true completes session, no new jobs
+10. test_loop_until_sentinel_not_reached_creates_next_job - sentinel_reached=false creates next iteration job
+11. test_chat_assistant_reply_stored - assistant_reply is stored in jobs table
+12. test_session_status_updates_after_completion - Session status transitions: pending -> running (on pull) -> completed (on complete)
+13. test_pull_then_complete_full_cycle - Full loop_n cycle: pull->complete->pull->complete->204->session completed
+14. test_complete_wrong_worker_returns_403 - Complete from wrong worker returns 403 Forbidden
+15. test_complete_nonexistent_task_returns_404 - Complete for unknown task returns 404
+
+== FULL TEST RESULTS ==
+cargo test -p server: 69 tests passed, 0 failed
+- Unit tests: 14 passed
+- api_keys_test: 14 passed
+- identities_test: 7 passed
+- oauth_test: 19 passed
+- tasks_test: 15 passed
+
+== BUILD/LINT ==
+cargo build: SUCCESS (full workspace)
+cargo clippy -p server: No warnings
+
+== TECH STACK REFERENCE (from docs/TECH_STACK.md) ==
+- Control Plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL (task queue in DB)
+- Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE for tail and attach
+- Web UI: React + TypeScript, Vite, TanStack Query, SSE
+- Auth: API key (CLI, Web, workers); TLS for all connections
+
+Config from environment:
+- DATABASE_URL = postgres://harness:harness@localhost:5432/remote_harness
+- PORT = 3000
+- CORS_ALLOWED_ORIGINS = *
+- WORKER_STALE_SECONDS = 90
+- MAX_JOB_RECLAIMS = 3
+- JOB_LEASE_SECONDS = 0
+- LOG_RETENTION_DAYS = 7
+- CHAT_HISTORY_MAX_TURNS = 50
+
+== FILES CONTENT ==
+
+=== crates/server/src/routes/tasks.rs ===
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+
+use api_types::{
+    AgentCli, BranchMode, JobId, PullTaskResponse, SessionParams, TaskCompleteRequest,
+    TaskCompleteStatus, TaskId, TaskInput, WorkflowType,
+};
+
+use crate::engine;
+use crate::engine::jobs;
+use crate::error::AppError;
+use crate::state::AppState;
+
+#[derive(Debug, Deserialize)]
+pub struct PullTaskRequest {
+    pub worker_id: Option<String>,
+}
+
+/// POST /workers/tasks/pull
+pub async fn pull_task(
+    State(state): State<AppState>,
+    Json(body): Json<PullTaskRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let worker_id = body
+        .worker_id
+        .as_deref()
+        .ok_or_else(|| AppError::bad_request("worker_id is required"))?;
+
+    // Verify worker exists
+    let worker_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workers WHERE id = $1)")
+            .bind(worker_id)
+            .fetch_one(&state.pool)
+            .await?;
+
+    if !worker_exists {
+        return Err(AppError::not_found("Worker not found"));
+    }
+
+    let stale_cutoff = chrono::Utc::now()
+        - chrono::Duration::seconds(state.config.worker_stale_seconds as i64);
+    let max_reclaims = state.config.max_job_reclaims as i32;
+
+    // Step 1: Reclaim jobs from stale workers (under reclaim cap)
+    let reclaimed = sqlx::query(
+        r#"
+        UPDATE jobs SET worker_id = NULL, status = 'pending', reclaim_count = reclaim_count + 1, updated_at = now()
+        WHERE status = 'assigned' AND worker_id IN (SELECT id FROM workers WHERE last_seen_at < $1)
+        AND reclaim_count < $2
+        "#,
+    )
+    .bind(stale_cutoff)
+    .bind(max_reclaims)
+    .execute(&state.pool)
+    .await?;
+
+    if reclaimed.rows_affected() > 0 {
+        tracing::info!(count = reclaimed.rows_affected(), "Reclaimed jobs from stale workers");
+    }
+
+    // Step 1b: Fail jobs over reclaim cap
+    let failed_reclaim = sqlx::query(
+        r#"
+        UPDATE jobs SET status = 'failed', error_message = '[MAX_WORKER_LOSS_RETRIES]', updated_at = now()
+        WHERE status = 'assigned' AND worker_id IN (SELECT id FROM workers WHERE last_seen_at < $1)
+        AND reclaim_count >= $2
+        "#,
+    )
+    .bind(stale_cutoff)
+    .bind(max_reclaims)
+    .execute(&state.pool)
+    .await?;
+
+    if failed_reclaim.rows_affected() > 0 {
+        tracing::warn!(
+            count = failed_reclaim.rows_affected(),
+            "Failed jobs exceeding max reclaim count"
+        );
+        // Update session statuses for affected jobs
+        let affected_sessions: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT session_id::text FROM jobs WHERE status = 'failed' AND error_message = '[MAX_WORKER_LOSS_RETRIES]' AND updated_at > now() - interval '5 seconds'",
+        )
+        .fetch_all(&state.pool)
+        .await?;
+
+        for sid in &affected_sessions {
+            let _ = jobs::update_session_status(&state.pool, sid).await;
+        }
+    }
+
+    // Step 1c: Lease expiry (when job_lease_seconds > 0)
+    if state.config.job_lease_seconds > 0 {
+        let lease_cutoff = chrono::Utc::now()
+            - chrono::Duration::seconds(state.config.job_lease_seconds as i64);
+
+        let failed_lease = sqlx::query(
+            r#"
+            UPDATE jobs SET status = 'failed', error_message = '[JOB_LEASE_EXPIRED]', updated_at = now()
+            WHERE status = 'assigned' AND assigned_at < $1
+            "#,
+        )
+        .bind(lease_cutoff)
+        .execute(&state.pool)
+        .await?;
+
+        if failed_lease.rows_affected() > 0 {
+            tracing::warn!(
+                count = failed_lease.rows_affected(),
+                "Failed jobs due to lease expiry"
+            );
+            let affected_sessions: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT session_id::text FROM jobs WHERE status = 'failed' AND error_message = '[JOB_LEASE_EXPIRED]' AND updated_at > now() - interval '5 seconds'",
+            )
+            .fetch_all(&state.pool)
+            .await?;
+
+            for sid in &affected_sessions {
+                let _ = jobs::update_session_status(&state.pool, sid).await;
+            }
+        }
+    }
+
+    // Step 2: Select one pending job and assign to worker
+    let job_row = sqlx::query_as::<_, (String, String, serde_json::Value)>(
+        r#"
+        SELECT j.id::text, j.session_id::text, j.task_input
+        FROM jobs j
+        WHERE j.status = 'pending'
+        ORDER BY j.created_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (job_id_str, session_id_str, task_input_json) = match job_row {
+        Some(row) => row,
+        None => return Ok(StatusCode::NO_CONTENT.into_response()),
+    };
+
+    // Assign the job
+    jobs::assign_to_worker(&state.pool, &job_id_str, worker_id).await?;
+
+    // Update session status to running
+    jobs::update_session_status(&state.pool, &session_id_str).await?;
+
+    // Step 3: Build full pull response
+    // Fetch session details
+    let session_row = sqlx::query_as::<_, (String, Option<String>, String, serde_json::Value, Option<String>, Option<String>)>(
+        r#"SELECT repo_url, ref, workflow, params, persona_id::text, identity_id FROM sessions WHERE id = $1::uuid"#,
+    )
+    .bind(&session_id_str)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let (repo_url, ref_, workflow_str, params_json, persona_id, identity_id) = session_row;
+
+    // Resolve credentials from identity
+    let identity_id_str = identity_id.as_deref().unwrap_or("default");
+    let cred_row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT git_token, agent_token FROM identities WHERE id = $1",
+    )
+    .bind(identity_id_str)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (git_token, agent_token) = cred_row.unwrap_or((None, None));
+
+    // Resolve persona prompt_context
+    let prompt_context: Option<String> = if let Some(ref pid) = persona_id {
+        sqlx::query_scalar("SELECT prompt FROM personas WHERE id = $1::uuid")
+            .bind(pid)
+            .fetch_optional(&state.pool)
+            .await?
+    } else {
+        None
+    };
+
+    // Parse types
+    let workflow: WorkflowType =
+        serde_json::from_value(json!(workflow_str)).unwrap_or(WorkflowType::Chat);
+    let params: Option<SessionParams> = serde_json::from_value(params_json.clone()).ok();
+
+    // Parse task_input from JSON to TaskInput enum
+    let input: TaskInput = serde_json::from_value(task_input_json.clone())
+        .map_err(|e| AppError::internal(format!("Failed to parse task_input: {}", e)))?;
+
+    // Extract agent_cli, model, branch_mode from params
+    let agent_cli: Option<AgentCli> = params.as_ref().and_then(|p| p.agent_cli.clone());
+    let model: Option<String> = params.as_ref().and_then(|p| p.model.clone());
+    let branch_mode: Option<BranchMode> = params.as_ref().and_then(|p| p.branch_mode.clone());
+
+    let task_id = TaskId::new();
+    let job_id = JobId::from_string(&job_id_str);
+
+    let response = PullTaskResponse {
+        task_id,
+        session_id: api_types::SessionId::from_string(&session_id_str),
+        job_id,
+        repo_url,
+        ref_,
+        workflow,
+        params,
+        input,
+        git_token,
+        agent_token,
+        agent_cli,
+        model,
+        branch_mode,
+        prompt_context,
+    };
+
+    Ok(Json(response).into_response())
+}
+
+/// POST /workers/tasks/:id/complete
+pub async fn complete_task(
+    State(state): State<AppState>,
+    Path(task_id): Path<String>,
+    Json(body): Json<TaskCompleteRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    // The task_id in the URL is the job_id (task_id is ephemeral, job_id is the DB key)
+    // We look up by job_id since that's what's stored
+    let job_row = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT id::text, session_id::text, worker_id FROM jobs WHERE id = $1::uuid",
+    )
+    .bind(&task_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let (job_id_str, session_id_str, assigned_worker_id) = match job_row {
+        Some(row) => row,
+        None => return Err(AppError::not_found("Task not found or already completed")),
+    };
+
+    // Validate the task is assigned to the reporting worker
+    let assigned = assigned_worker_id.as_deref().unwrap_or("");
+    if assigned != body.worker_id.as_str() {
+        return Err(AppError::forbidden(
+            "Task is not assigned to the reporting worker",
+        ));
+    }
+
+    // Check current status is assigned or running
+    let current_status: String =
+        sqlx::query_scalar("SELECT status FROM jobs WHERE id = $1::uuid")
+            .bind(&job_id_str)
+            .fetch_one(&state.pool)
+            .await?;
+
+    if current_status != "assigned" && current_status != "running" {
+        return Err(AppError::not_found("Task not found or already completed"));
+    }
+
+    let success = body.status == TaskCompleteStatus::Completed;
+
+    // Update job via engine
+    jobs::complete_job(
+        &state.pool,
+        jobs::CompleteJobParams {
+            job_id: &job_id_str,
+            success,
+            error_message: body.error_message.as_deref(),
+            branch: body.branch.as_deref(),
+            commit_ref: body.commit_ref.as_deref(),
+            pull_request_url: None, // PR creation deferred to Task 19
+            output: body.output.as_deref(),
+            sentinel_reached: body.sentinel_reached,
+            assistant_reply: body.assistant_reply.as_deref(),
+        },
+    )
+    .await?;
+
+    // PR/MR creation hook (deferred to Task 19)
+    if success && body.branch.is_some() {
+        let session_workflow: Option<String> =
+            sqlx::query_scalar("SELECT workflow FROM sessions WHERE id = $1::uuid")
+                .bind(&session_id_str)
+                .fetch_optional(&state.pool)
+                .await?;
+
+        if let Some(wf) = session_workflow {
+            // Check if session has branch_mode = pr
+            let session_params: Option<serde_json::Value> =
+                sqlx::query_scalar("SELECT params FROM sessions WHERE id = $1::uuid")
+                    .bind(&session_id_str)
+                    .fetch_optional(&state.pool)
+                    .await?;
+
+            let branch_mode = session_params
+                .as_ref()
+                .and_then(|p| p.get("branch_mode"))
+                .and_then(|v| v.as_str());
+
+            if branch_mode == Some("pr") {
+                tracing::info!(
+                    job_id = %job_id_str,
+                    session_id = %session_id_str,
+                    workflow = %wf,
+                    branch = ?body.branch,
+                    "PR/MR creation would happen here (deferred to Task 19)"
+                );
+            }
+        }
+    }
+
+    // Handle workflow-specific follow-up logic
+    if success {
+        engine::on_job_completed(&state.pool, &session_id_str, &job_id_str).await?;
+    } else {
+        jobs::update_session_status(&state.pool, &session_id_str).await?;
+    }
+
+    Ok(Json(json!({ "ok": true })))
+}
+
+=== crates/server/src/routes/mod.rs ===
+pub mod api_keys;
+pub mod health;
+pub mod identities;
+pub mod oauth;
+pub mod sessions;
+pub mod tasks;
+pub mod workers;
+
+=== crates/server/src/lib.rs (route registration excerpt) ===
+    let authenticated = Router::new()
+        ...
+        .route("/workers/{id}/heartbeat", axum::routing::post(routes::workers::heartbeat))
+        .route("/workers/tasks/pull", axum::routing::post(routes::tasks::pull_task))
+        .route("/workers/tasks/{id}/complete", axum::routing::post(routes::tasks::complete_task))
+        ...
+
+=== crates/server/tests/tasks_test.rs ===
+15 integration tests covering:
+- Pull with no work (204)
+- Pull assigns job and returns full payload (200)
+- Pull includes credentials from identity
+- Complete success marks job completed
+- Complete failed marks job failed with error_message
+- Stale worker jobs are reclaimed (reclaim_count incremented)
+- Jobs over max_job_reclaims are failed with [MAX_WORKER_LOSS_RETRIES]
+- Lease expiry fails jobs with [JOB_LEASE_EXPIRED]
+- Loop until sentinel: sentinel_reached=true completes session
+- Loop until sentinel: sentinel_reached=false creates next job
+- Chat: assistant_reply is stored
+- Session status updates correctly through lifecycle
+- Full pull->complete cycle for loop_n with 2 iterations
+- Wrong worker gets 403
+- Nonexistent task gets 404
+
+=== UUID Casting Fixes ===
+Fixed pre-existing bug where string-typed IDs from api-types crate were bound to UUID columns
+without explicit casts. PostgreSQL requires explicit TEXT->UUID casting in INSERT/UPDATE contexts.
+Added `::uuid` casts throughout:
+- crates/server/src/engine/jobs.rs (all WHERE id = $1 queries)
+- crates/server/src/engine/mod.rs (all INSERT/SELECT queries with UUID columns)
+- crates/server/src/routes/sessions.rs (all WHERE id = $1 on sessions/jobs tables, INSERT with UUID cols)
+- crates/server/src/routes/tasks.rs (all new queries)

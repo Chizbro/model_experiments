@@ -1,0 +1,1092 @@
+== CONTEXT DUMP: Task 25 - Web UI Workers & Log Viewer ==
+== Date: 2026-03-22 ==
+== Branch: experiment/opus_4_6 ==
+
+=== TASK DESCRIPTION ===
+Build the worker list page (with heterogeneity warnings) and the log viewer component (history + SSE streaming). The log viewer is used both standalone and embedded in session detail.
+
+=== SYSTEM CONTEXT ===
+- Working directory: /Users/chizbro/Desktop/code/utils/remote_harness_sonnet
+- Git branch: experiment/opus_4_6
+- Platform: darwin (macOS)
+- Model: claude-opus-4-6
+
+=== TECH STACK (from docs/TECH_STACK.md) ===
+- Control plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+- Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI (BYOL)
+- CLI: Rust (clap), SSE for tail and attach
+- Web UI: React + TypeScript, Vite, TanStack Query, SSE for log/session stream
+- Auth: API key (CLI, Web, workers); TLS for all connections
+
+=== FEATURE SPEC (plan/25-web-ui-workers-logs-complete.md) ===
+# 25 - Web UI Workers & Log Viewer
+
+## Goal
+Build the worker list page (with heterogeneity warnings) and the log viewer component (history + SSE streaming). The log viewer is used both standalone and embedded in session detail.
+
+## What to build
+
+### Worker List (`web/src/pages/Workers.tsx`)
+- Fetch: GET /workers
+- Table columns: worker_id | host | platform | status (badge) | last_seen_at
+- Status badges: active (green), stale (red/gray)
+- "Remove" button per worker (DELETE /workers/:id with confirmation)
+- Auto-refresh (poll every 10s)
+
+**Heterogeneity warning banner (CLIENT_EXPERIENCE §10)**
+- Detect: when 2+ non-stale workers have different `labels.platform` values
+- Show warning banner: "Mixed worker pool detected. The engine may assign any session to any worker. Mixed OS or missing CLIs can cause failures."
+- Link to documentation
+- Also detect WSL vs native Windows mix
+
+### Log Viewer Component (`web/src/components/LogViewer.tsx`)
+- Reusable component, used in:
+  - Session detail (embedded)
+  - Standalone log tail (optional page)
+- Props: sessionId, jobId? (filter), level? (filter)
+
+**History loading**
+- On mount: GET /sessions/:id/logs, paginate until all loaded
+- Show loading indicator while fetching
+- Render all log entries in scrollable container
+
+**SSE streaming**
+- After history loaded: connect to GET /sessions/:id/logs/stream
+- Append new entries to the bottom
+- Auto-scroll to bottom (with "stick to bottom" toggle)
+- Show "Reconnecting..." on disconnect
+
+**Log entry display**
+- Format: `[HH:MM:SS] [LEVEL] [source] message`
+- Color-code by level: debug (gray), info (default), warn (yellow), error (red)
+- Source badge: agent, worker, control_plane
+- Monospace font for log content
+
+**Filters**
+- Level filter: dropdown (all, debug, info, warn, error)
+- Job filter: dropdown populated from session's jobs (when in session detail context)
+- Filters apply to both history fetch and SSE stream
+
+**Performance**
+- Virtualized list for large log volumes (e.g. react-window or @tanstack/virtual)
+- Limit rendered entries with "Load earlier" button if thousands of entries
+
+### Session detail integration
+- Log viewer embedded below the session/jobs section
+- Full width, resizable height
+- Collapses to summary when session is completed
+
+## Dependencies
+- Task 22 (web UI foundation)
+- Task 08 (worker registration — server endpoints)
+- Task 11 (log ingestion — server endpoints)
+- Task 12 (SSE streaming — server SSE endpoints)
+
+## Test criteria
+- [ ] Worker list displays all workers with correct status
+- [ ] Heterogeneity warning shown when workers have different platforms
+- [ ] Warning hidden when all workers have same platform
+- [ ] Worker removal works with confirmation
+- [ ] Log viewer loads full history on mount
+- [ ] Log viewer streams new entries via SSE
+- [ ] Auto-scroll to bottom works
+- [ ] Level filter applies to history and stream
+- [ ] Job filter narrows to specific job's logs
+- [ ] Log entries color-coded by level
+- [ ] "Reconnecting..." shown on SSE disconnect
+- [ ] Handles large log volumes without freezing (virtualized)
+- [ ] Log viewer works embedded in session detail
+
+=== EXPLORATION RESULTS ===
+
+--- Web UI Codebase Structure ---
+web/
+├── src/
+│   ├── assets/              # Image assets
+│   │   ├── hero.png
+│   │   ├── react.svg
+│   │   └── vite.svg
+│   ├── components/
+│   │   ├── layout/          # Layout components
+│   │   │   ├── app-layout.tsx
+│   │   │   ├── connection-indicator.tsx
+│   │   │   ├── sidebar.tsx
+│   │   │   └── theme-toggle.tsx
+│   │   └── ui/              # UI components
+│   │       └── button.tsx
+│   ├── hooks/               # Custom hooks
+│   │   └── use-connection-status.ts
+│   ├── lib/                 # Utilities and core logic
+│   │   ├── api.ts           # API client
+│   │   ├── config.ts        # Config provider & context
+│   │   ├── query.ts         # React Query setup & hooks
+│   │   ├── sse.ts           # Server-sent events hooks
+│   │   ├── types.ts         # TypeScript types
+│   │   └── utils.ts         # Utility functions
+│   ├── pages/               # Page components
+│   │   ├── dashboard.tsx
+│   │   ├── new-session.tsx
+│   │   ├── session-detail.tsx
+│   │   ├── settings-wrapper.tsx
+│   │   ├── settings.tsx
+│   │   └── workers.tsx
+│   ├── App.tsx              # Root component
+│   ├── App.css              # Legacy CSS (for animations)
+│   ├── index.css            # Global styles & Tailwind
+│   ├── main.tsx             # Entry point
+│   └── router.tsx           # Route definitions
+├── index.html
+├── package.json
+├── tsconfig.json
+├── tsconfig.app.json
+├── tsconfig.node.json
+├── vite.config.ts
+└── docker-compose.yml
+
+--- Key Dependencies ---
+- react & react-dom v19.2.4
+- react-router-dom v7.13.1
+- @tanstack/react-query v5.94.5
+- tailwindcss v4.2.2
+- @base-ui/react v1.3.0
+- shadcn v4.1.0
+- lucide-react v0.577.0
+- class-variance-authority
+- @fontsource-variable/geist
+
+--- Router Setup ---
+BrowserRouter structure:
+- /settings → SettingsWrapper (no layout guard)
+- / → AppLayout (guarded by isConfigured)
+  - / → DashboardPage
+  - /sessions/new → NewSessionPage
+  - /sessions/:id → SessionDetailPage
+  - /workers → WorkersPage
+
+--- Server API Endpoints (Workers) ---
+File: crates/server/src/routes/workers.rs
+- POST /workers/register → register_worker()
+- GET /workers → list_workers() - paginated, returns PaginatedResponse<WorkerSummary>
+- GET /workers/:id → get_worker() - returns WorkerDetail
+- DELETE /workers/:id → delete_worker() - reclaims jobs, returns 204
+- POST /workers/:id/heartbeat → heartbeat()
+
+--- Server API Endpoints (Logs) ---
+File: crates/server/src/routes/logs.rs
+- POST /workers/tasks/:id/logs → ingest_logs()
+- GET /sessions/:id/logs → get_session_logs() - filters: limit, cursor, job_id, level, last
+- DELETE /sessions/:id/logs → delete_session_logs() - optional job_id filter
+- GET /sessions/:id/logs/stream → stream_session_logs() (SSE) - filters: job_id, level
+
+--- API Types (Workers) ---
+File: crates/api-types/src/workers.rs
+WorkerSummary: worker_id, host, labels?, status (WorkerConnectionStatus: Active|Stale), last_seen_at?
+WorkerDetail: extends with capabilities?, client_version?, created_at
+
+--- API Types (Logs) ---
+File: crates/api-types/src/logs.rs
+LogEntry: id, timestamp, level (Debug|Info|Warn|Error), session_id, job_id, worker_id?, source, message
+
+--- TypeScript Types (web/src/lib/types.ts) ---
+WorkerSummary: worker_id, host, labels?, status (WorkerStatus: idle|busy), last_seen_at?, connection_status? (WorkerConnectionStatus: active|stale)
+LogEntry: id, timestamp, level (LogLevel: debug|info|warn|error), session_id, job_id, worker_id?, source, message
+PaginatedResponse<T>: items, next_cursor?
+
+--- SSE Hooks (web/src/lib/sse.ts) ---
+useSSE<T>: Generic SSE hook with auto-reconnect, exponential backoff (max 30s)
+useLogStream: SSE for log entries - event: "log", filters: jobId, level
+useSessionEvents: SSE for session events - event: "session_event"
+
+--- Query Hooks (web/src/lib/query.ts) ---
+queryClient: staleTime 10s, retry 1
+useWorkers: GET /workers, refetchInterval 10s (auto-refresh already in place)
+useDeleteWorker: DELETE /workers/:id, invalidates workers query
+useSession: GET /sessions/:id
+useSessionLogs: (added) GET /sessions/:id/logs with filters
+
+--- Existing Workers Page (BEFORE changes) ---
+Simple table with worker_id, host, status (idle/busy badges), last_seen_at.
+No heterogeneity detection, no remove button, no platform column.
+
+--- Existing Session Detail Page (BEFORE changes) ---
+Full session detail with header, info grid, jobs table, chat input for chat workflows.
+Had a placeholder: "Log viewer will be added in Task 25"
+
+=== FILES MODIFIED ===
+
+1. web/package.json - Added @tanstack/react-virtual dependency
+2. web/src/lib/query.ts - Added useSessionLogs hook, sessionLogs query key, LogEntry/LogLevel imports
+3. web/src/components/LogViewer.tsx - NEW FILE - Full log viewer component
+4. web/src/pages/workers.tsx - Rewritten with heterogeneity warning, remove button, platform column
+5. web/src/pages/session-detail.tsx - Integrated LogViewer, removed placeholder
+
+=== DETAILED CHANGES ===
+
+--- web/src/lib/query.ts changes ---
+Added imports: LogEntry, LogLevel
+Added query key: sessionLogs: (id, jobId?, level?) => ["sessions", id, "logs", { jobId, level }]
+Added hook: useSessionLogs(sessionId, opts?: { jobId, level, last }) - fetches GET /sessions/:id/logs with query params
+
+--- web/src/components/LogViewer.tsx (NEW) ---
+Full implementation of the LogViewer component:
+
+Props:
+- sessionId: string (required)
+- jobId?: JobId (initial filter)
+- level?: LogLevel (initial filter)
+- jobs?: { job_id, status }[] (for job filter dropdown)
+- collapsed?: boolean (collapse to summary)
+
+Features:
+- Level filter dropdown (all/debug/info/warn/error)
+- Job filter dropdown (populated from jobs prop)
+- Fetches history via useSessionLogs hook (last 500 entries)
+- Streams new entries via useLogStream SSE hook
+- Merges history + stream, deduplicates by id
+- Virtualized list using @tanstack/react-virtual (estimateSize 28px, overscan 20)
+- Auto-scroll to bottom with "stick to bottom" toggle
+- Manual scroll up disables stick (threshold: 50px from bottom)
+- Loading state while fetching history
+- Empty state when no entries
+- 400px fixed height scrollable container
+
+Log entry display:
+- Format: [HH:MM:SS] [LEVEL badge] [source badge] message
+- Level colors: debug=gray, info=blue, warn=yellow, error=red
+- Source colors: agent=purple, worker=cyan, control_plane=orange
+- Monospace font, hover highlight
+
+SSE status badge:
+- open: green "Live" dot
+- reconnecting: yellow pulsing "Reconnecting..." dot
+- connecting: gray pulsing "Connecting..." dot
+- closed: hidden
+
+Collapsed mode:
+- Shows summary: "Session complete — N log entries recorded."
+
+--- web/src/pages/workers.tsx (REWRITTEN) ---
+
+Changes from original:
+1. Added platform column - extracts from labels (platform=, os=, or known OS names)
+2. Status badges now use connection_status (active/stale) instead of worker status (idle/busy)
+   - active = green, stale = red
+3. Added "Remove" button per worker with confirmation dialog
+   - Uses useDeleteWorker mutation
+   - ConfirmDialog explains the action
+4. Added heterogeneity warning banner
+   - detectHeterogeneity() checks non-stale workers for different platform labels
+   - Special case: WSL + Windows native mix detection
+   - Yellow warning banner when detected
+5. Auto-refresh already existed via useWorkers() refetchInterval: 10_000
+
+--- web/src/pages/session-detail.tsx changes ---
+- Added LogViewer import
+- Replaced Task 25 placeholder with:
+  <LogViewer sessionId={id!} jobs={session.jobs} collapsed={session.status === "completed" || session.status === "failed"} />
+- LogViewer gets jobs list for the job filter dropdown
+- Collapses when session is completed or failed
+
+=== BUILD & LINT RESULTS ===
+- TypeScript (tsc --noEmit): PASS - no errors
+- Vite build: PASS - 427KB JS bundle, 35KB CSS
+- ESLint: 1 pre-existing error (button.tsx fast refresh warning - standard shadcn pattern), 1 warning on LogViewer (compilation skipped - benign)
+
+=== EXISTING FILE CONTENTS (READ DURING SESSION) ===
+
+--- web/src/pages/workers.tsx (ORIGINAL) ---
+import { useWorkers } from "@/lib/query";
+
+export function WorkersPage() {
+  const { data, isLoading, error } = useWorkers();
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Workers</h1>
+
+      {isLoading && <p className="text-muted-foreground">Loading workers...</p>}
+      {error && (
+        <p className="text-destructive">
+          Failed to load workers: {(error as Error).message}
+        </p>
+      )}
+      {data && data.items.length === 0 && (
+        <p className="text-muted-foreground">No workers registered.</p>
+      )}
+      {data && data.items.length > 0 && (
+        <div className="rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-left text-muted-foreground">
+                <th className="px-4 py-3 font-medium">Worker</th>
+                <th className="px-4 py-3 font-medium">Host</th>
+                <th className="px-4 py-3 font-medium">Status</th>
+                <th className="px-4 py-3 font-medium">Last Seen</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.items.map((w) => (
+                <tr
+                  key={w.worker_id}
+                  className="border-b border-border last:border-0"
+                >
+                  <td className="px-4 py-3 font-mono text-xs">
+                    {w.worker_id.slice(0, 12)}
+                  </td>
+                  <td className="px-4 py-3">{w.host}</td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${
+                        w.status === "idle"
+                          ? "bg-green-500/10 text-green-500"
+                          : "bg-blue-500/10 text-blue-500"
+                      }`}
+                    >
+                      {w.status}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3 text-muted-foreground">
+                    {w.last_seen_at
+                      ? new Date(w.last_seen_at).toLocaleString()
+                      : "—"}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+--- web/src/pages/session-detail.tsx (ORIGINAL) ---
+import { useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import {
+  useSession,
+  useUpdateSession,
+  useDeleteSession,
+  useDeleteSessionLogs,
+  useSendInput,
+} from "@/lib/query";
+import { useSessionEvents } from "@/lib/sse";
+import { useQueryClient } from "@tanstack/react-query";
+import { queryKeys } from "@/lib/query";
+import type { JobSummary, SessionDetail, BranchMode } from "@/lib/types";
+import { Button } from "@/components/ui/button";
+
+const statusBadge: Record<string, string> = {
+  pending: "bg-yellow-500/10 text-yellow-500",
+  running: "bg-blue-500/10 text-blue-500",
+  completed: "bg-green-500/10 text-green-500",
+  failed: "bg-red-500/10 text-red-500",
+};
+
+function JobOutcomeHint({ job, branchMode }: { job: JobSummary; branchMode?: BranchMode }) {
+  // CLIENT_EXPERIENCE §8 compliance
+  if (job.status === "failed" && job.error_message) {
+    return (
+      <div className="mt-2 rounded-md bg-red-500/10 p-3 text-sm text-destructive">
+        <p className="font-medium">Error: {job.error_message}</p>
+        {(job.error_message.includes("auth") ||
+          job.error_message.includes("git") ||
+          job.error_message.includes("token")) && (
+          <p className="mt-1 text-xs text-muted-foreground">
+            Check Settings → Credentials to refresh your tokens.
+          </p>
+        )}
+      </div>
+    );
+  }
+
+  if (job.status === "completed" && !job.commit_ref) {
+    return (
+      <p className="mt-1 text-xs text-muted-foreground">
+        Job completed but no commit was pushed. Check logs for details.
+      </p>
+    );
+  }
+
+  if (
+    job.status === "completed" &&
+    branchMode === "pr" &&
+    job.commit_ref &&
+    !job.pull_request_url
+  ) {
+    return (
+      <p className="mt-1 text-xs text-muted-foreground">
+        PR/MR was not created despite PR mode. Possible reasons: missing branch/title in
+        payload, provider API error, or token scope issue.
+      </p>
+    );
+  }
+
+  return null;
+}
+
+function ConfirmDialog({
+  title,
+  message,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="w-full max-w-sm rounded-lg border border-border bg-card p-6 shadow-lg">
+        <h3 className="text-lg font-semibold">{title}</h3>
+        <p className="mt-2 text-sm text-muted-foreground">{message}</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button variant="destructive" size="sm" onClick={onConfirm}>
+            Confirm
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function SessionDetailPage() {
+  const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const { data, isLoading, error } = useSession(id);
+  const updateSession = useUpdateSession(id ?? "");
+  const deleteSession = useDeleteSession();
+  const deleteLogs = useDeleteSessionLogs(id ?? "");
+  const sendInput = useSendInput(id ?? "");
+
+  const [chatMessage, setChatMessage] = useState("");
+  const [confirmAction, setConfirmAction] = useState<
+    null | "delete" | "delete_logs"
+  >(null);
+
+  // SSE for real-time session events
+  const { data: events } = useSessionEvents(id);
+
+  // Invalidate session query when we get new events
+  const lastEventCount = events.length;
+  if (lastEventCount > 0) {
+    // Re-fetch session data when events arrive
+    queryClient.invalidateQueries({ queryKey: queryKeys.session(id!) });
+  }
+
+  if (isLoading) return <p className="text-muted-foreground">Loading...</p>;
+  if (error)
+    return (
+      <p className="text-destructive">Error: {(error as Error).message}</p>
+    );
+  if (!data) return <p className="text-muted-foreground">Session not found.</p>;
+
+  const session: SessionDetail = data;
+  const branchMode = session.params?.branch_mode;
+  const isChat = session.workflow === "chat";
+  const isRunning = session.status === "running";
+
+  function handleRetainToggle() {
+    updateSession.mutate({ retain_forever: !session.retain_forever });
+  }
+
+  function handleDelete() {
+    deleteSession.mutate(id!, {
+      onSuccess: () => navigate("/"),
+    });
+  }
+
+  function handleDeleteLogs() {
+    deleteLogs.mutate(undefined, {
+      onSuccess: () => setConfirmAction(null),
+    });
+  }
+
+  function handleSendChat(e: React.FormEvent) {
+    e.preventDefault();
+    if (!chatMessage.trim()) return;
+    sendInput.mutate(
+      { message: chatMessage },
+      { onSuccess: () => setChatMessage("") },
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* ... header, info, jobs table, chat input ... */}
+
+      {/* Log panel placeholder (Task 25) */}
+      <div className="rounded-lg border border-border p-4">
+        <h3 className="text-sm font-medium text-muted-foreground">
+          Log viewer will be added in Task 25
+        </h3>
+      </div>
+    </div>
+  );
+}
+
+--- web/src/lib/query.ts (ORIGINAL) ---
+(Full file with QueryClient, query keys, query hooks for health/sessions/session/workers/identity/authStatus/apiKeys/personas/repositories, and mutation hooks for CRUD operations)
+
+--- web/src/lib/sse.ts (FULL) ---
+import { useEffect, useRef, useState, useCallback } from "react";
+import type { LogEntry, SessionEvent, LogLevel } from "./types";
+
+export type SSEStatus = "connecting" | "open" | "reconnecting" | "closed";
+
+interface UseSSEOptions {
+  event?: string;
+  enabled?: boolean;
+}
+
+interface UseSSEResult<T> {
+  data: T[];
+  status: SSEStatus;
+  close: () => void;
+}
+
+const MAX_BACKOFF = 30_000;
+
+export function useSSE<T>(url: string | null, options: UseSSEOptions = {}): UseSSEResult<T> {
+  // Generic SSE hook with auto-reconnect, exponential backoff
+  // ...
+}
+
+export function useLogStream(sessionId: string | undefined, jobId?: string, level?: LogLevel) {
+  // Builds SSE URL for /sessions/:id/logs/stream with optional job_id and level params
+  // Uses useSSE<LogEntry> with event: "log"
+}
+
+export function useSessionEvents(sessionId: string | undefined) {
+  // Builds SSE URL for /sessions/:id/events
+  // Uses useSSE<SessionEvent> with event: "session_event"
+}
+
+--- web/src/lib/types.ts (FULL) ---
+// All TypeScript types matching Rust api-types crate
+// ID types, enums, common types, health, sessions, workers, logs, identity, personas, API keys, SSE events
+// Key types used:
+// - WorkerSummary: worker_id, host, labels?, status, last_seen_at?, connection_status?
+// - LogEntry: id, timestamp, level, session_id, job_id, worker_id?, source, message
+// - LogLevel: "debug" | "info" | "warn" | "error"
+// - WorkerConnectionStatus: "active" | "stale"
+// - PaginatedResponse<T>: items, next_cursor?
+
+--- web/src/lib/api.ts (FULL) ---
+// ApiClientError, NetworkError classes
+// getConfig() - reads localStorage
+// request<T>() - generic fetch wrapper with auth header, error handling, 401 redirect
+// api object: get, post, patch, delete, sseUrl
+// checkHealth(), testConnection(), checkBootstrapAvailable(), bootstrapApiKey(), checkApiKeyValid()
+
+=== FINAL FILE CONTENTS (AFTER CHANGES) ===
+
+--- web/src/components/LogViewer.tsx ---
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { useSessionLogs } from "@/lib/query";
+import { useLogStream, type SSEStatus } from "@/lib/sse";
+import type { LogEntry, LogLevel, JobId } from "@/lib/types";
+import { Button } from "@/components/ui/button";
+
+// ── Props ───────────────────────────────────────────────────────────────
+
+interface LogViewerProps {
+  sessionId: string;
+  jobId?: JobId;
+  level?: LogLevel;
+  /** Jobs available for the job filter dropdown */
+  jobs?: { job_id: string; status: string }[];
+  /** If true, collapse to a summary line */
+  collapsed?: boolean;
+}
+
+// ── Level colors ────────────────────────────────────────────────────────
+
+const levelClass: Record<LogLevel, string> = {
+  debug: "text-muted-foreground",
+  info: "text-foreground",
+  warn: "text-yellow-500",
+  error: "text-red-500",
+};
+
+const levelBadgeClass: Record<LogLevel, string> = {
+  debug: "bg-muted text-muted-foreground",
+  info: "bg-blue-500/10 text-blue-500",
+  warn: "bg-yellow-500/10 text-yellow-500",
+  error: "bg-red-500/10 text-red-500",
+};
+
+const sourceBadgeClass: Record<string, string> = {
+  agent: "bg-purple-500/10 text-purple-500",
+  worker: "bg-cyan-500/10 text-cyan-500",
+  control_plane: "bg-orange-500/10 text-orange-500",
+};
+
+// ── Component ───────────────────────────────────────────────────────────
+
+export function LogViewer({
+  sessionId,
+  jobId: initialJobId,
+  level: initialLevel,
+  jobs,
+  collapsed,
+}: LogViewerProps) {
+  const [levelFilter, setLevelFilter] = useState<LogLevel | undefined>(
+    initialLevel,
+  );
+  const [jobFilter, setJobFilter] = useState<string | undefined>(
+    initialJobId,
+  );
+  const [stickToBottom, setStickToBottom] = useState(true);
+
+  // Fetch history
+  const {
+    data: historyData,
+    isLoading: historyLoading,
+  } = useSessionLogs(sessionId, {
+    jobId: jobFilter,
+    level: levelFilter,
+    last: 500,
+  });
+
+  // SSE stream
+  const {
+    data: streamEntries,
+    status: sseStatus,
+  } = useLogStream(sessionId, jobFilter, levelFilter);
+
+  // Merge history + stream, deduplicate by id
+  const entries = useMemo(() => {
+    const historyItems = historyData?.items ?? [];
+    const seen = new Set(historyItems.map((e) => e.id));
+    const newFromStream = streamEntries.filter((e) => !seen.has(e.id));
+    return [...historyItems, ...newFromStream];
+  }, [historyData, streamEntries]);
+
+  // Virtualizer
+  const parentRef = useRef<HTMLDivElement>(null);
+  const virtualizer = useVirtualizer({
+    count: entries.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 28,
+    overscan: 20,
+  });
+
+  // Auto-scroll to bottom
+  useEffect(() => {
+    if (stickToBottom && entries.length > 0) {
+      virtualizer.scrollToIndex(entries.length - 1, { align: "end" });
+    }
+  }, [entries.length, stickToBottom, virtualizer]);
+
+  // Detect manual scroll up to disable stick
+  const handleScroll = useCallback(() => {
+    const el = parentRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 50;
+    setStickToBottom(atBottom);
+  }, []);
+
+  if (collapsed) {
+    return (
+      <div className="rounded-lg border border-border p-4">
+        <p className="text-sm text-muted-foreground">
+          Session complete — {entries.length} log entries recorded.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col rounded-lg border border-border">
+      {/* Toolbar */}
+      <div className="flex items-center gap-3 border-b border-border px-4 py-2">
+        <h3 className="text-sm font-medium">Logs</h3>
+
+        {/* Level filter */}
+        <select
+          value={levelFilter ?? ""}
+          onChange={(e) =>
+            setLevelFilter((e.target.value || undefined) as LogLevel | undefined)
+          }
+          className="rounded-md border border-input bg-background px-2 py-1 text-xs outline-none"
+        >
+          <option value="">All levels</option>
+          <option value="debug">Debug</option>
+          <option value="info">Info</option>
+          <option value="warn">Warn</option>
+          <option value="error">Error</option>
+        </select>
+
+        {/* Job filter */}
+        {jobs && jobs.length > 0 && (
+          <select
+            value={jobFilter ?? ""}
+            onChange={(e) =>
+              setJobFilter(e.target.value || undefined)
+            }
+            className="rounded-md border border-input bg-background px-2 py-1 text-xs outline-none"
+          >
+            <option value="">All jobs</option>
+            {jobs.map((j) => (
+              <option key={j.job_id} value={j.job_id}>
+                {j.job_id.slice(0, 8)} ({j.status})
+              </option>
+            ))}
+          </select>
+        )}
+
+        <div className="flex-1" />
+
+        {/* SSE status */}
+        <SSEStatusBadge status={sseStatus} />
+
+        {/* Stick to bottom toggle */}
+        <Button
+          variant={stickToBottom ? "secondary" : "outline"}
+          size="xs"
+          onClick={() => {
+            setStickToBottom(true);
+            if (entries.length > 0) {
+              virtualizer.scrollToIndex(entries.length - 1, { align: "end" });
+            }
+          }}
+        >
+          {stickToBottom ? "Auto-scroll on" : "Auto-scroll off"}
+        </Button>
+      </div>
+
+      {/* Log content */}
+      {historyLoading ? (
+        <div className="flex items-center justify-center p-8">
+          <p className="text-sm text-muted-foreground">Loading logs...</p>
+        </div>
+      ) : entries.length === 0 ? (
+        <div className="flex items-center justify-center p-8">
+          <p className="text-sm text-muted-foreground">No log entries.</p>
+        </div>
+      ) : (
+        <div
+          ref={parentRef}
+          onScroll={handleScroll}
+          className="h-[400px] overflow-auto font-mono text-xs"
+        >
+          <div
+            style={{
+              height: `${virtualizer.getTotalSize()}px`,
+              width: "100%",
+              position: "relative",
+            }}
+          >
+            {virtualizer.getVirtualItems().map((virtualRow) => {
+              const entry = entries[virtualRow.index];
+              return (
+                <div
+                  key={virtualRow.key}
+                  data-index={virtualRow.index}
+                  ref={virtualizer.measureElement}
+                  style={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    width: "100%",
+                    transform: `translateY(${virtualRow.start}px)`,
+                  }}
+                  className="flex items-baseline gap-2 px-4 py-0.5 hover:bg-muted/50"
+                >
+                  <LogEntryLine entry={entry} />
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sub-components ──────────────────────────────────────────────────────
+
+function LogEntryLine({ entry }: { entry: LogEntry }) {
+  const time = new Date(entry.timestamp);
+  const hh = String(time.getHours()).padStart(2, "0");
+  const mm = String(time.getMinutes()).padStart(2, "0");
+  const ss = String(time.getSeconds()).padStart(2, "0");
+
+  return (
+    <>
+      <span className="shrink-0 text-muted-foreground">
+        [{hh}:{mm}:{ss}]
+      </span>
+      <span
+        className={`shrink-0 inline-flex rounded px-1 py-0 text-[10px] font-medium uppercase ${levelBadgeClass[entry.level] ?? ""}`}
+      >
+        {entry.level}
+      </span>
+      <span
+        className={`shrink-0 inline-flex rounded px-1 py-0 text-[10px] font-medium ${sourceBadgeClass[entry.source] ?? "bg-muted text-muted-foreground"}`}
+      >
+        {entry.source}
+      </span>
+      <span className={`min-w-0 break-all ${levelClass[entry.level] ?? ""}`}>
+        {entry.message}
+      </span>
+    </>
+  );
+}
+
+function SSEStatusBadge({ status }: { status: SSEStatus }) {
+  if (status === "open") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-green-500">
+        <span className="h-1.5 w-1.5 rounded-full bg-green-500" />
+        Live
+      </span>
+    );
+  }
+  if (status === "reconnecting") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-yellow-500">
+        <span className="h-1.5 w-1.5 rounded-full bg-yellow-500 animate-pulse" />
+        Reconnecting...
+      </span>
+    );
+  }
+  if (status === "connecting") {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+        <span className="h-1.5 w-1.5 rounded-full bg-muted-foreground animate-pulse" />
+        Connecting...
+      </span>
+    );
+  }
+  return null;
+}
+
+--- web/src/pages/workers.tsx (FINAL) ---
+import { useState } from "react";
+import { useWorkers, useDeleteWorker } from "@/lib/query";
+import { Button } from "@/components/ui/button";
+import type { WorkerSummary } from "@/lib/types";
+
+function getPlatformLabel(worker: WorkerSummary): string | undefined {
+  return worker.labels?.find(
+    (l) =>
+      l.startsWith("platform=") ||
+      l.startsWith("os=") ||
+      ["windows", "linux", "macos", "wsl", "darwin"].includes(l.toLowerCase()),
+  );
+}
+
+function detectHeterogeneity(workers: WorkerSummary[]): string | null {
+  const active = workers.filter(
+    (w) => w.connection_status === "active" || w.status !== "idle",
+  );
+  if (active.length < 2) return null;
+
+  const platforms = new Set<string>();
+  let hasWsl = false;
+  let hasWindowsNative = false;
+
+  for (const w of active) {
+    const label = getPlatformLabel(w);
+    if (label) {
+      const val = label.includes("=") ? label.split("=")[1] : label;
+      const lower = val.toLowerCase();
+      platforms.add(lower);
+      if (lower === "wsl") hasWsl = true;
+      if (lower === "windows") hasWindowsNative = true;
+    }
+  }
+
+  if (hasWsl && hasWindowsNative) {
+    return "Mixed worker pool detected (WSL + native Windows). The engine may assign any session to any worker. Mixed OS or missing CLIs can cause failures.";
+  }
+
+  if (platforms.size >= 2) {
+    return "Mixed worker pool detected. The engine may assign any session to any worker. Mixed OS or missing CLIs can cause failures.";
+  }
+
+  return null;
+}
+
+function ConfirmDialog({ title, message, onConfirm, onCancel }: { title: string; message: string; onConfirm: () => void; onCancel: () => void; }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+      <div className="w-full max-w-sm rounded-lg border border-border bg-card p-6 shadow-lg">
+        <h3 className="text-lg font-semibold">{title}</h3>
+        <p className="mt-2 text-sm text-muted-foreground">{message}</p>
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="outline" size="sm" onClick={onCancel}>Cancel</Button>
+          <Button variant="destructive" size="sm" onClick={onConfirm}>Confirm</Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function WorkersPage() {
+  const { data, isLoading, error } = useWorkers();
+  const deleteWorker = useDeleteWorker();
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  const workers = data?.items ?? [];
+  const heterogeneityWarning = detectHeterogeneity(workers);
+
+  function handleDelete() {
+    if (!confirmDeleteId) return;
+    deleteWorker.mutate(confirmDeleteId, {
+      onSuccess: () => setConfirmDeleteId(null),
+    });
+  }
+
+  return (
+    <div className="space-y-6">
+      <h1 className="text-2xl font-bold">Workers</h1>
+
+      {confirmDeleteId && (
+        <ConfirmDialog
+          title="Remove Worker"
+          message="This will remove the worker registration and reclaim any assigned jobs. The worker process (if running) will re-register on its next heartbeat."
+          onConfirm={handleDelete}
+          onCancel={() => setConfirmDeleteId(null)}
+        />
+      )}
+
+      {heterogeneityWarning && (
+        <div className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 p-4 text-sm text-yellow-600 dark:text-yellow-400">
+          <p className="font-medium">Warning: {heterogeneityWarning}</p>
+        </div>
+      )}
+
+      {isLoading && <p className="text-muted-foreground">Loading workers...</p>}
+      {error && (
+        <p className="text-destructive">Failed to load workers: {(error as Error).message}</p>
+      )}
+      {data && workers.length === 0 && (
+        <p className="text-muted-foreground">No workers registered.</p>
+      )}
+      {workers.length > 0 && (
+        <div className="rounded-lg border border-border">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border text-left text-muted-foreground">
+                <th className="px-4 py-3 font-medium">Worker</th>
+                <th className="px-4 py-3 font-medium">Host</th>
+                <th className="px-4 py-3 font-medium">Platform</th>
+                <th className="px-4 py-3 font-medium">Status</th>
+                <th className="px-4 py-3 font-medium">Last Seen</th>
+                <th className="px-4 py-3 font-medium w-20"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {workers.map((w) => {
+                const connStatus = w.connection_status ?? "active";
+                const platform = getPlatformLabel(w);
+                return (
+                  <tr key={w.worker_id} className="border-b border-border last:border-0">
+                    <td className="px-4 py-3 font-mono text-xs">{w.worker_id.slice(0, 12)}</td>
+                    <td className="px-4 py-3">{w.host}</td>
+                    <td className="px-4 py-3 text-xs text-muted-foreground">{platform ?? "—"}</td>
+                    <td className="px-4 py-3">
+                      <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${connStatus === "active" ? "bg-green-500/10 text-green-500" : "bg-red-500/10 text-red-500"}`}>
+                        {connStatus}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-muted-foreground">
+                      {w.last_seen_at ? new Date(w.last_seen_at).toLocaleString() : "—"}
+                    </td>
+                    <td className="px-4 py-3">
+                      <Button variant="ghost" size="xs" className="text-destructive hover:text-destructive" onClick={() => setConfirmDeleteId(w.worker_id)} disabled={deleteWorker.isPending}>
+                        Remove
+                      </Button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+--- web/src/pages/session-detail.tsx (FINAL - relevant diff only) ---
+Added import: import { LogViewer } from "@/components/LogViewer";
+Replaced placeholder with:
+      {/* Log viewer */}
+      <LogViewer
+        sessionId={id!}
+        jobs={session.jobs}
+        collapsed={session.status === "completed" || session.status === "failed"}
+      />
+
+--- web/src/lib/query.ts (FINAL - additions only) ---
+Added imports: LogEntry, LogLevel from "./types"
+Added query key: sessionLogs: (id: string, jobId?: string, level?: string) => ["sessions", id, "logs", { jobId, level }] as const
+Added hook:
+export function useSessionLogs(
+  sessionId: string | undefined,
+  opts?: { jobId?: string; level?: LogLevel; last?: number },
+) {
+  return useQuery({
+    queryKey: queryKeys.sessionLogs(sessionId!, opts?.jobId, opts?.level),
+    queryFn: async () => {
+      const params = new URLSearchParams();
+      if (opts?.jobId) params.set("job_id", opts.jobId);
+      if (opts?.level) params.set("level", opts.level);
+      params.set("last", String(opts?.last ?? 500));
+      const qs = params.toString();
+      return api.get<PaginatedResponse<LogEntry>>(
+        `/sessions/${sessionId}/logs${qs ? `?${qs}` : ""}`,
+      );
+    },
+    enabled: !!sessionId,
+  });
+}
+
+=== SERVER ENDPOINTS REFERENCE ===
+
+Worker endpoints (crates/server/src/routes/workers.rs):
+- POST /workers/register - RegisterWorkerRequest → RegisterWorkerResponse
+- GET /workers - PaginatedResponse<WorkerSummary> (cursor, limit params)
+- GET /workers/:id - WorkerDetail
+- DELETE /workers/:id - 204 (reclaims assigned jobs)
+- POST /workers/:id/heartbeat - HeartbeatRequest → HeartbeatResponse
+
+Log endpoints (crates/server/src/routes/logs.rs):
+- POST /workers/tasks/:id/logs - SendLogsRequest → { accepted: true }
+- GET /sessions/:id/logs - PaginatedResponse<LogEntry> (limit, cursor, job_id, level, last params)
+- DELETE /sessions/:id/logs - 204 (optional job_id param)
+- GET /sessions/:id/logs/stream - SSE stream (job_id, level params) - events: "log", "session_event"
+
+SSE Broadcast (crates/server/src/sse.rs):
+LogEntryPayload: id, timestamp (RFC3339), level, session_id, job_id, worker_id?, source, message
+
+=== DECISIONS & RATIONALE ===
+
+1. Used @tanstack/react-virtual instead of react-window because it's from the same TanStack ecosystem as react-query and supports dynamic row heights via measureElement.
+
+2. Fetched last 500 entries by default (using the server's `last` parameter) instead of paginating through all history. This gives a good initial view without overwhelming the client. The server returns these in chronological order.
+
+3. Deduplication between history and SSE stream entries is done by id. History entries are fetched first, then SSE stream entries that aren't in the history set are appended.
+
+4. Worker heterogeneity detection uses labels to find platform information. Checks for `platform=*`, `os=*`, or bare OS names. Special-cases WSL + Windows native as a specific warning per CLIENT_EXPERIENCE §10.
+
+5. Status badges on workers use `connection_status` (active/stale) instead of `status` (idle/busy) as the spec requires active(green)/stale(red) badges.
+
+6. LogViewer collapses to a summary line when the session is completed or failed, showing the total entry count.
+
+7. Auto-scroll uses a 50px threshold from bottom to determine if user has scrolled up, disabling stick-to-bottom when they do.
+
+=== NO MIGRATIONS NEEDED ===
+This task is purely frontend (React/TypeScript). No database migrations were needed.
+
+=== END CONTEXT DUMP ===

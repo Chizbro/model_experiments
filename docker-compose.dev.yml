@@ -1,0 +1,23 @@
+# Development overrides — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Only starts postgres; run server/worker/web natively for hot-reload.
+
+services:
+  # Override server to not build/start (run natively with cargo watch)
+  server:
+    profiles: ["disabled"]
+
+  # Override worker to not build/start (run natively with cargo watch)
+  worker:
+    profiles: ["disabled"]
+
+  # Override web to not build/start (run natively with npm run dev)
+  web:
+    profiles: ["disabled"]
+
+  postgres:
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_PASSWORD: harness_dev

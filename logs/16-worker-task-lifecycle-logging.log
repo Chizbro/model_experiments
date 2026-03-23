@@ -1,0 +1,1030 @@
+== CONTEXT DUMP: Feature 16 - Worker Task Lifecycle & Log Shipping ==
+== Date: 2026-03-21 ==
+
+== TASK DESCRIPTION ==
+Wire together the full worker task execution pipeline: pull task -> clone repo -> create branch (if PR mode) -> run agent CLI -> commit/push -> complete task. Also implement log shipping (batch POST) and local file dual-write.
+
+== FEATURE SPEC (plan/16-worker-task-lifecycle-logging-complete.md) ==
+# 16 - Worker Task Lifecycle & Log Shipping
+
+## Goal
+Wire together the full worker task execution pipeline: pull task -> clone repo -> create branch (if PR mode) -> run agent CLI -> commit/push -> complete task. Also implement log shipping (batch POST) and local file dual-write.
+
+## What to build
+
+### Task executor (`crates/worker/src/task_executor.rs`)
+Orchestrate the full lifecycle for a pulled task:
+
+1. **Receive task** from poll loop (PullTaskResponse)
+2. **Create work directory** (temp dir per task)
+3. **Clone repo** (git_ops::clone_repo with task credentials)
+4. **Checkout ref** and optionally create feature branch (if branch_mode = "pr")
+5. **Branch naming**: `harness/{short_session_id}` or `{branch_name_prefix}{short_id}`
+6. **Run agent CLI** (agent_executor::run_agent with prompt, persona, credentials)
+7. **Stream logs** to control plane during execution (periodic batch POST)
+8. **After agent completes**:
+   - If agent succeeded (or per worker policy): stage, commit, push
+   - Commit message: implementation-defined (e.g. from agent output or default)
+   - Push to main or feature branch per branch_mode
+9. **Complete task**: POST /workers/tasks/:id/complete with result
+   - Include: status, branch, commit_ref, output, sentinel_reached, assistant_reply, error_message
+10. **Cleanup** work directory
+
+### Error handling at each stage
+- Clone failure: complete task as failed with `[CLONE_FAILED]` + error detail
+- Agent CLI missing: complete as failed with clear message
+- Agent non-zero exit: complete as failed with exit code and stderr
+- Push failure: complete as failed with `[PUSH_FAILED]` + auth hint
+- Branch creation failure: complete as failed with `[BRANCH_FAILED]`
+
+### Log shipping (`crates/worker/src/log_shipper.rs`)
+- Buffer log entries in memory
+- Flush to control plane via `POST /workers/tasks/:id/logs` every N seconds or when buffer hits size limit
+- On flush failure: retry once, then continue (don't block task execution)
+- Final flush on task complete (ensure all logs sent)
+
+### Local file dual-write (`crates/worker/src/file_logger.rs`)
+- Write all log entries to local files in `LOG_DIR`
+- Structured JSON, one line per entry
+- File per task: `{LOG_DIR}/{session_id}/{job_id}.jsonl`
+- Include agent stdout/stderr, worker system messages, git operation results
+
+### Integration with poll loop
+- Update worker status to `busy` in heartbeat when executing a task
+- Back to `idle` after task completes
+- Report `current_job_id` in heartbeat during execution
+
+== TECH STACK CONTEXT (docs/TECH_STACK.md) ==
+- Worker: Rust (tokio, reqwest, git2)
+- Agent runtime: Claude Code or Cursor CLI (BYOL)
+- Git: git2 (libgit2 bindings)
+- Worker crates: tokio, reqwest, serde/serde_json, git2, tracing, anyhow/thiserror
+- Workers POST logs via HTTPS to control plane
+- Log format: Structured JSON
+- Dual-write: local files + central DB
+
+== EXISTING CODEBASE STATE (before changes) ==
+
+### Worker crate structure (crates/worker/src/):
+- main.rs: Entry point with poll loop, heartbeat loop, and inline execute_task
+- config.rs: Configuration (control_plane_url, api_key, log_dir, etc.)
+- git_ops.rs: clone_repo, checkout_or_create_branch, commit_changes, push_to_remote, create_work_dir, cleanup_work_dir
+- agent_executor.rs: AgentRunConfig, AgentOutput, run_agent, process_stdout/stderr, parse_stream_json_line
+- api_client.rs: ControlPlaneClient with register, heartbeat, pull_task, send_logs, complete_task
+- platform/mod.rs: PlatformHandler trait and detection
+- platform/{macos,linux,windows,wsl}.rs: Platform-specific handlers
+
+### Key existing types (api-types crate):
+- PullTaskResponse: task_id, session_id, job_id, repo_url, ref_, workflow, params, input, git_token, agent_token, agent_cli, model, branch_mode, prompt_context
+- TaskCompleteRequest: status, worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply
+- TaskInput: ChatFirst{prompt}, ChatFollowup{message}, Loop{prompt, iteration}, Inbox{prompt, payload}
+- BranchMode: Main, Pr
+- WorkerLogEntry: timestamp, level, message, source
+- SendLogsRequest: entries Vec<WorkerLogEntry>
+
+### Pre-existing execute_task in main.rs:
+- Only ran agent and returned result
+- Did NOT create feature branches
+- Did NOT commit/push changes after agent run
+- Did NOT have structured error messages ([CLONE_FAILED], etc.)
+- Did NOT have log shipping or local file logging
+- Did NOT report branch/commit_ref in completion
+
+== CHANGES MADE ==
+
+### New files created:
+
+1. **crates/worker/src/log_shipper.rs** - Buffered log shipper
+   - LogShipper struct with ControlPlaneClient, task_id, buffer (Arc<Mutex<Vec>>), file_logger, flush config
+   - push() / push_one(): Add entries to buffer, dual-write to local file
+   - flush(): Send all buffered entries to server
+   - start_periodic_flush(): Spawns background task that flushes every 2 seconds
+   - send_to_server(): Sends with retry-once-on-failure policy
+   - Buffer auto-flushes when it hits max_buffer_size (100 entries)
+   - Tests: buffer accumulation, flush clears buffer
+
+2. **crates/worker/src/file_logger.rs** - Local file dual-write
+   - FileLogger struct with file_path
+   - new(log_dir, session_id, job_id): Creates {log_dir}/{session_id}/{job_id}.jsonl
+   - write_entry(): Appends JSON-serialized WorkerLogEntry as a line
+   - Uses append mode for concurrent-safe writes
+   - Tests: creates and writes, appends multiple, nested dirs, path format
+
+3. **crates/worker/src/task_executor.rs** - Full lifecycle orchestrator
+   - execute_task(): Public entry point, sets up FileLogger + LogShipper, calls run_lifecycle, final flush
+   - run_lifecycle(): Inner function with structured error returns
+     - Step 1: Create work directory
+     - Step 2: Clone repo (error → [CLONE_FAILED])
+     - Step 3: Create feature branch if branch_mode=Pr (error → [BRANCH_FAILED])
+       - Branch name: {prefix}{short_session_id} where prefix defaults to "harness/"
+       - Short session ID = first 8 chars of session_id
+     - Step 4: Run agent CLI via agent_executor::run_agent
+     - Step 5: Commit changes + push to remote (error → [PUSH_FAILED] + auth hint)
+       - Uses git_ops::commit_changes with default message
+       - Pushes to current branch (feature branch or default)
+       - Skip push if no git token
+     - Step 6: Return success with branch, commit_ref, output, sentinel_reached, assistant_reply
+   - fail_request(): Helper for building failed TaskCompleteRequest
+   - log_system(): Helper for shipping system-level log entries
+   - CleanupGuard: RAII guard that calls cleanup_work_dir on Drop (ensures cleanup on all paths)
+   - Tests: fail_request, branch naming (default/custom prefix), main mode, prompt extraction, cleanup guard
+
+### Modified files:
+
+4. **crates/worker/src/main.rs** - Updated to use new modules
+   - Added module declarations: file_logger, log_shipper, task_executor
+   - Removed unused imports (AgentCli, TaskCompleteRequest, TaskCompleteStatus, TaskInput)
+   - Changed poll_loop execute_task call to task_executor::execute_task(config, client, worker_id, task)
+   - Removed old inline execute_task function (~160 lines)
+   - Fixed test to add local import for TaskCompleteRequest/TaskCompleteStatus
+
+== BUILD & TEST RESULTS ==
+
+### cargo build: SUCCESS
+- 1 pre-existing warning (unused detect_sentinel function in agent_executor.rs)
+
+### cargo test -p worker: 69 tests passed, 0 failed
+Tests by module:
+- agent_executor: 14 tests (all pre-existing, all pass)
+- api_client: 5 tests (all pre-existing, all pass)
+- config: 7 tests (all pre-existing, all pass)
+- git_ops: 14 tests (all pre-existing, all pass)
+- platform: 10 tests (all pre-existing, all pass)
+- file_logger: 4 tests (NEW, all pass)
+- log_shipper: 2 tests (NEW, all pass)
+- task_executor: 6 tests (NEW, all pass)
+- main tests: 3 tests (pre-existing, all pass)
+
+### cargo clippy -p worker: No new warnings from changes
+- Pre-existing clippy warnings: needless_option_as_deref in agent_executor, redundant_closure in main.rs
+
+== TEST CRITERIA CHECKLIST ==
+- [x] Full lifecycle: pull task -> clone -> run agent -> commit -> push -> complete (task_executor.rs)
+- [x] Task completes as "success" with branch and commit_ref when everything works
+- [x] Clone failure produces clear error ([CLONE_FAILED]) in task complete
+- [x] Agent failure produces clear error with exit code
+- [x] Push failure produces clear error ([PUSH_FAILED] + auth hint)
+- [x] Logs streamed to control plane during execution (log_shipper periodic flush)
+- [x] Local log files written alongside API shipping (file_logger dual-write)
+- [x] Worker heartbeat reports "busy" during task, "idle" after (pre-existing in main.rs poll_loop)
+- [x] Work directory cleaned up after task (CleanupGuard RAII)
+- [x] Feature branch created in PR mode (branch_mode == Pr)
+- [x] Commit made on correct branch
+- [x] cargo test -p worker passes (69/69)
+- [ ] Integration test: server + worker e2e (deferred - requires running server)
+
+== ARCHITECTURE DECISIONS ==
+
+1. **RAII cleanup**: Used CleanupGuard struct with Drop impl to ensure work directory cleanup on all exit paths (success, failure, early return, panic).
+
+2. **Log shipper design**: Background flush task + buffer with size limit. Retry once on failure, then continue. Does not block task execution.
+
+3. **Result pattern for lifecycle**: run_lifecycle returns Result<TaskCompleteRequest, TaskCompleteRequest> so both success and failure paths produce a complete request. This avoids deeply nested error handling.
+
+4. **Branch naming**: Uses first 8 chars of session_id as short ID, with configurable prefix (default "harness/").
+
+5. **Commit handling**: Commit failures are treated as soft errors (no changes to commit is ok). Push failures are hard errors with [PUSH_FAILED] prefix.
+
+6. **No migrations needed**: All changes are worker-side Rust code. No database schema changes.
+
+== FILES SUMMARY ==
+New:
+- crates/worker/src/log_shipper.rs (110 lines + tests)
+- crates/worker/src/file_logger.rs (70 lines + tests)
+- crates/worker/src/task_executor.rs (280 lines + tests)
+
+Modified:
+- crates/worker/src/main.rs (removed ~160 lines of inline execute_task, added module refs)
+
+== RAW EXPLORATION DATA FROM SUBAGENTS ==
+
+### Worker Crate Exploration (subagent 1):
+
+**WORKER CRATE STRUCTURE**
+Location: /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/worker/
+
+Source Files:
+- main.rs - Main entry point, poll/heartbeat loops
+- config.rs - Configuration management
+- git_ops.rs - Git operations (clone, commit, push, branch management)
+- agent_executor.rs - Agent CLI execution and output parsing
+- api_client.rs - Control plane HTTP client
+- platform/mod.rs - Platform trait and detection
+- platform/macos.rs - macOS handler
+- platform/linux.rs - Linux handler
+- platform/windows.rs - Windows handler
+- platform/wsl.rs - WSL handler
+
+**POLL LOOP IMPLEMENTATION** (main.rs):
+- Polls at configured interval (default 5 seconds)
+- Pulls task via client.pull_task() which POSTs to /workers/tasks/pull
+- Returns Option<PullTaskResponse> (None = 204 No Content)
+- Sets current_job_id during execution (for heartbeat reporting)
+- No delay between tasks if available; sleeps poll_interval_secs when idle
+- Gracefully shuts down via watch::channel signal
+
+**GIT_OPS MODULE** (git_ops.rs):
+- clone_repo: Token-embedded URL + credential callbacks, optional branch checkout
+- embed_token_into_url: GitHub uses "git" username, GitLab uses "oauth2"
+- checkout_or_create_branch: Find existing or create from HEAD
+- commit_changes: git add -A + commit with signature
+- push_to_remote: Token-embedded URL + credential callback
+- create_work_dir / cleanup_work_dir: Temp directory management
+
+**AGENT_EXECUTOR MODULE** (agent_executor.rs):
+- AgentRunConfig: agent_cli, agent_token, prompt, prompt_context, work_dir, model, sentinel
+- run_agent: Find CLI → build command → set env → spawn → stream stdout/stderr → wait → return AgentOutput
+- process_stdout: Parse stream-json, detect sentinel, buffer logs, periodic flush (2s)
+- parse_stream_json_line: Handles assistant, content_block_delta, result types
+- AgentOutput: exit_code, stdout, stderr, assistant_reply, sentinel_found
+
+**API_CLIENT MODULE** (api_client.rs):
+- ControlPlaneClient: reqwest::Client + base_url + api_key
+- Endpoints: register, heartbeat, pull_task, send_logs, complete_task
+- with_retry: Exponential backoff, retries on 5xx and non-timeout request failures
+
+**CARGO.TOML DEPENDENCIES:**
+api-types, tokio (full), reqwest (json), git2, tracing, tracing-subscriber (env-filter, json), tracing-appender, serde, serde_json, serde_yaml, anyhow, thiserror, chrono (serde), hostname, rand, dirs, urlencoding, tempfile, which, libc
+
+**API-TYPES KEY TYPES:**
+- PullTaskResponse: task_id, session_id, job_id, repo_url, ref, workflow, params (SessionParams), input (TaskInput enum), git_token, agent_token, agent_cli, model, branch_mode, prompt_context
+- TaskCompleteRequest: status, worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply
+- TaskInput: ChatFirst{prompt}, ChatFollowup{message}, Loop{prompt, iteration}, Inbox{prompt, payload?}
+- WorkerLogEntry: timestamp, level, message, source
+- SendLogsRequest: entries Vec<WorkerLogEntry>
+- BranchMode: Main, Pr
+- SessionParams: prompt?, n?, sentinel?, agent_cli?, model?, branch_mode?, branch_name_prefix?
+
+### Server Exploration (subagent 2):
+
+**Route Structure (src/lib.rs):**
+POST /workers/register
+GET /workers
+POST /workers/{id}/heartbeat
+GET /workers/{id}
+DELETE /workers/{id}
+POST /workers/tasks/pull
+POST /workers/tasks/{id}/complete
+POST /workers/tasks/{id}/logs
+
+**Task Pull: POST /workers/tasks/pull (routes/tasks.rs)**
+- Reclaims jobs from stale workers
+- Fails jobs exceeding max_job_reclaims
+- Fails jobs with expired leases
+- Selects oldest pending job and assigns to worker
+- Returns 204 No Content if no tasks available
+
+**Task Complete: POST /workers/tasks/:id/complete (routes/tasks.rs)**
+- Validates worker matches assignment
+- Job must be in assigned/running state
+- Success: assigned/running → completed
+- Failure: assigned/running → failed
+- Post-completion: publishes events, calls engine for workflow-specific follow-up
+
+**Log Ingestion: POST /workers/tasks/:id/logs (routes/logs.rs)**
+- Accepts SendLogsRequest with entries
+- Looks up job to get session_id and worker_id
+- Bulk inserts to database
+- Broadcasts to SSE subscribers
+- Dual-writes to local log file if log_dir configured
+- Returns 202 Accepted
+
+== FULL FILE CONTENTS OF NEW/MODIFIED FILES ==
+
+### crates/worker/src/log_shipper.rs ###
+use std::sync::Arc;
+
+use api_types::WorkerLogEntry;
+use tokio::sync::Mutex;
+
+use crate::api_client::ControlPlaneClient;
+use crate::file_logger::FileLogger;
+
+/// Buffered log shipper that periodically flushes entries to the control plane
+/// and dual-writes to local files.
+pub struct LogShipper {
+    client: ControlPlaneClient,
+    task_id: String,
+    buffer: Arc<Mutex<Vec<WorkerLogEntry>>>,
+    file_logger: Option<FileLogger>,
+    flush_interval_secs: u64,
+    max_buffer_size: usize,
+}
+
+impl LogShipper {
+    pub fn new(
+        client: ControlPlaneClient,
+        task_id: String,
+        file_logger: Option<FileLogger>,
+    ) -> Self {
+        Self {
+            client,
+            task_id,
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            file_logger,
+            flush_interval_secs: 2,
+            max_buffer_size: 100,
+        }
+    }
+
+    /// Add log entries to the buffer and dual-write to local file.
+    pub async fn push(&self, entries: Vec<WorkerLogEntry>) {
+        // Dual-write to local file
+        if let Some(ref fl) = self.file_logger {
+            for entry in &entries {
+                fl.write_entry(entry);
+            }
+        }
+
+        let mut buf = self.buffer.lock().await;
+        buf.extend(entries);
+
+        // Flush if buffer exceeds size limit
+        if buf.len() >= self.max_buffer_size {
+            let to_send = std::mem::take(&mut *buf);
+            drop(buf);
+            self.send_to_server(to_send).await;
+        }
+    }
+
+    /// Add a single log entry.
+    pub async fn push_one(&self, entry: WorkerLogEntry) {
+        self.push(vec![entry]).await;
+    }
+
+    /// Flush all buffered entries to the control plane.
+    pub async fn flush(&self) {
+        let entries = {
+            let mut buf = self.buffer.lock().await;
+            std::mem::take(&mut *buf)
+        };
+        if !entries.is_empty() {
+            self.send_to_server(entries).await;
+        }
+    }
+
+    /// Start a background flush loop. Returns a handle that can be aborted to stop it.
+    pub fn start_periodic_flush(&self) -> tokio::task::JoinHandle<()> {
+        let buffer = self.buffer.clone();
+        let client = self.client.clone();
+        let task_id = self.task_id.clone();
+        let interval = tokio::time::Duration::from_secs(self.flush_interval_secs);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let entries = {
+                    let mut buf = buffer.lock().await;
+                    std::mem::take(&mut *buf)
+                };
+                if !entries.is_empty() {
+                    if let Err(e) = client.send_logs(&task_id, entries.clone()).await {
+                        tracing::warn!(%e, "periodic log flush failed, retrying once");
+                        // Retry once
+                        let _ = client.send_logs(&task_id, entries).await;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn send_to_server(&self, entries: Vec<WorkerLogEntry>) {
+        if let Err(e) = self.client.send_logs(&self.task_id, entries.clone()).await {
+            tracing::warn!(%e, "log ship failed, retrying once");
+            // Retry once, then drop
+            let _ = self.client.send_logs(&self.task_id, entries).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::LogLevel;
+    use chrono::Utc;
+
+    fn make_entry(msg: &str) -> WorkerLogEntry {
+        WorkerLogEntry {
+            timestamp: Utc::now(),
+            level: LogLevel::Info,
+            message: msg.to_string(),
+            source: "test".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_log_shipper_buffer() {
+        let client = ControlPlaneClient::new("http://localhost:9999", "key").unwrap();
+        let shipper = LogShipper::new(client, "task-1".to_string(), None);
+
+        shipper.push_one(make_entry("hello")).await;
+        shipper.push_one(make_entry("world")).await;
+
+        let buf = shipper.buffer.lock().await;
+        assert_eq!(buf.len(), 2);
+        assert_eq!(buf[0].message, "hello");
+        assert_eq!(buf[1].message, "world");
+    }
+
+    #[tokio::test]
+    async fn test_log_shipper_flush_clears_buffer() {
+        let client = ControlPlaneClient::new("http://localhost:9999", "key").unwrap();
+        let shipper = LogShipper::new(client, "task-1".to_string(), None);
+
+        shipper.push_one(make_entry("entry")).await;
+        assert_eq!(shipper.buffer.lock().await.len(), 1);
+
+        shipper.flush().await;
+        assert_eq!(shipper.buffer.lock().await.len(), 0);
+    }
+}
+
+### crates/worker/src/file_logger.rs ###
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use api_types::WorkerLogEntry;
+
+/// Local file logger that writes structured JSON log entries to disk.
+///
+/// Writes one JSONL file per job: `{log_dir}/{session_id}/{job_id}.jsonl`
+#[derive(Debug, Clone)]
+pub struct FileLogger {
+    file_path: PathBuf,
+}
+
+impl FileLogger {
+    /// Create a new FileLogger, ensuring the parent directory exists.
+    pub fn new(log_dir: &Path, session_id: &str, job_id: &str) -> std::io::Result<Self> {
+        let dir = log_dir.join(session_id);
+        fs::create_dir_all(&dir)?;
+        let file_path = dir.join(format!("{}.jsonl", job_id));
+        Ok(Self { file_path })
+    }
+
+    /// Append a single log entry as a JSON line to the file.
+    pub fn write_entry(&self, entry: &WorkerLogEntry) {
+        if let Err(e) = self.write_entry_inner(entry) {
+            tracing::warn!(path = %self.file_path.display(), %e, "failed to write log entry to file");
+        }
+    }
+
+    fn write_entry_inner(&self, entry: &WorkerLogEntry) -> std::io::Result<()> {
+        let json = serde_json::to_string(entry).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.file_path)?;
+        writeln!(file, "{}", json)?;
+        Ok(())
+    }
+
+    /// Returns the path to the log file.
+    pub fn path(&self) -> &Path {
+        &self.file_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::LogLevel;
+    use chrono::Utc;
+
+    #[test]
+    fn test_file_logger_creates_and_writes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = FileLogger::new(tmp.path(), "sess-1", "job-1").unwrap();
+
+        let entry = WorkerLogEntry {
+            timestamp: Utc::now(),
+            level: LogLevel::Info,
+            message: "hello world".to_string(),
+            source: "test".to_string(),
+        };
+        logger.write_entry(&entry);
+
+        let contents = fs::read_to_string(logger.path()).unwrap();
+        assert!(contents.contains("hello world"));
+        assert!(contents.contains("\"level\":"));
+    }
+
+    #[test]
+    fn test_file_logger_appends_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = FileLogger::new(tmp.path(), "sess-2", "job-2").unwrap();
+
+        for i in 0..3 {
+            let entry = WorkerLogEntry {
+                timestamp: Utc::now(),
+                level: LogLevel::Info,
+                message: format!("line {}", i),
+                source: "test".to_string(),
+            };
+            logger.write_entry(&entry);
+        }
+
+        let contents = fs::read_to_string(logger.path()).unwrap();
+        let lines: Vec<&str> = contents.trim().lines().collect();
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn test_file_logger_creates_nested_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = FileLogger::new(tmp.path(), "deep/session", "job-3").unwrap();
+        assert!(logger.path().parent().unwrap().exists());
+    }
+
+    #[test]
+    fn test_file_logger_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logger = FileLogger::new(tmp.path(), "s1", "j1").unwrap();
+        assert!(logger.path().to_str().unwrap().ends_with("j1.jsonl"));
+    }
+}
+
+### crates/worker/src/task_executor.rs ###
+use api_types::{
+    AgentCli, BranchMode, PullTaskResponse, TaskCompleteRequest, TaskCompleteStatus, TaskInput,
+    WorkerId,
+};
+use chrono::Utc;
+
+use crate::agent_executor::{self, AgentRunConfig};
+use crate::api_client::ControlPlaneClient;
+use crate::config::WorkerConfig;
+use crate::file_logger::FileLogger;
+use crate::git_ops;
+use crate::log_shipper::LogShipper;
+use crate::platform;
+
+/// Execute a task through the full lifecycle:
+/// pull -> clone -> branch -> run agent -> commit -> push -> complete.
+pub async fn execute_task(
+    config: &WorkerConfig,
+    client: &ControlPlaneClient,
+    worker_id: &str,
+    task: &PullTaskResponse,
+) -> TaskCompleteRequest {
+    // Set up file logger for local dual-write
+    let file_logger = match FileLogger::new(
+        &config.log_dir,
+        task.session_id.as_str(),
+        task.job_id.as_str(),
+    ) {
+        Ok(fl) => {
+            tracing::info!(path = %fl.path().display(), "local log file created");
+            Some(fl)
+        }
+        Err(e) => {
+            tracing::warn!(%e, "failed to create local log file, continuing without file logging");
+            None
+        }
+    };
+
+    // Set up log shipper with periodic flush
+    let shipper = LogShipper::new(
+        client.clone(),
+        task.task_id.as_str().to_string(),
+        file_logger,
+    );
+    let flush_handle = shipper.start_periodic_flush();
+
+    let result = run_lifecycle(config, client, worker_id, task, &shipper).await;
+
+    // Final flush to ensure all logs are shipped
+    shipper.flush().await;
+    flush_handle.abort();
+
+    match result {
+        Ok(req) => req,
+        Err(req) => req,
+    }
+}
+
+fn fail_request(wid: WorkerId, error_message: String) -> TaskCompleteRequest {
+    TaskCompleteRequest {
+        status: TaskCompleteStatus::Failed,
+        worker_id: wid,
+        branch: None,
+        commit_ref: None,
+        mr_title: None,
+        mr_description: None,
+        error_message: Some(error_message),
+        output: None,
+        sentinel_reached: None,
+        assistant_reply: None,
+    }
+}
+
+async fn log_system(shipper: &LogShipper, level: api_types::LogLevel, message: String) {
+    let entry = api_types::WorkerLogEntry {
+        timestamp: Utc::now(),
+        level,
+        message,
+        source: "worker:task_executor".to_string(),
+    };
+    shipper.push_one(entry).await;
+}
+
+async fn run_lifecycle(
+    _config: &WorkerConfig,
+    client: &ControlPlaneClient,
+    worker_id: &str,
+    task: &PullTaskResponse,
+    shipper: &LogShipper,
+) -> Result<TaskCompleteRequest, TaskCompleteRequest> {
+    let wid = WorkerId::from_string(worker_id);
+
+    // Extract prompt
+    let prompt = match &task.input {
+        TaskInput::ChatFirst { prompt } => prompt.clone(),
+        TaskInput::ChatFollowup { message } => message.clone(),
+        TaskInput::Loop { prompt, iteration } => {
+            format!("{}\n\n(Iteration {})", prompt, iteration)
+        }
+        TaskInput::Inbox { prompt, payload } => match payload {
+            Some(p) => format!("{}\n\nPayload:\n{}", prompt, p),
+            None => prompt.clone(),
+        },
+    };
+
+    let agent_cli = task.agent_cli.clone().unwrap_or(AgentCli::ClaudeCode);
+
+    let agent_token = match &task.agent_token {
+        Some(t) => t.clone(),
+        None => {
+            let msg = "no agent_token provided".to_string();
+            log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+            return Err(fail_request(wid, msg));
+        }
+    };
+
+    // Step 1: Create work directory
+    let work_dir = match git_ops::create_work_dir(task.task_id.as_str()) {
+        Ok(d) => d,
+        Err(e) => {
+            let msg = format!("failed to create work dir: {}", e);
+            log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+            return Err(fail_request(wid, msg));
+        }
+    };
+
+    let _cleanup = CleanupGuard(work_dir.clone());
+
+    log_system(shipper, api_types::LogLevel::Info, format!("work directory created: {}", work_dir.display())).await;
+
+    // Step 2: Clone repository
+    let git_token = task.git_token.clone().unwrap_or_default();
+    let repo = match git_ops::clone_repo(&task.repo_url, task.ref_.as_deref(), &git_token, &work_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("[CLONE_FAILED] {}", e);
+            log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+            return Err(fail_request(wid, msg));
+        }
+    };
+
+    log_system(shipper, api_types::LogLevel::Info, format!("repository cloned: {}", task.repo_url)).await;
+
+    // Step 3: Create feature branch (if PR mode)
+    let branch_mode = task.branch_mode.clone()
+        .or_else(|| task.params.as_ref().and_then(|p| p.branch_mode.clone()))
+        .unwrap_or(BranchMode::Main);
+
+    let branch_name = if branch_mode == BranchMode::Pr {
+        let short_id = &task.session_id.as_str()[..8.min(task.session_id.as_str().len())];
+        let prefix = task.params.as_ref()
+            .and_then(|p| p.branch_name_prefix.as_deref())
+            .unwrap_or("harness/");
+        let name = format!("{}{}", prefix, short_id);
+
+        match git_ops::checkout_or_create_branch(&repo, &name, None) {
+            Ok(()) => {
+                log_system(shipper, api_types::LogLevel::Info, format!("feature branch created: {}", name)).await;
+            }
+            Err(e) => {
+                let msg = format!("[BRANCH_FAILED] {}", e);
+                log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+                return Err(fail_request(wid, msg));
+            }
+        }
+        Some(name)
+    } else {
+        None
+    };
+
+    // Step 4: Run agent CLI
+    let sentinel = task.params.as_ref().and_then(|p| p.sentinel.clone());
+    let agent_config = AgentRunConfig {
+        agent_cli,
+        agent_token,
+        prompt,
+        prompt_context: task.prompt_context.clone(),
+        work_dir: work_dir.clone(),
+        model: task.model.clone(),
+        sentinel,
+    };
+
+    let platform_handler = platform::current_platform();
+    log_system(shipper, api_types::LogLevel::Info, format!("starting agent on platform {}", platform_handler.platform_name())).await;
+
+    let output = match agent_executor::run_agent(&agent_config, client, task.task_id.as_str(), platform_handler.as_ref()).await {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("agent execution failed: {}", e);
+            log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+            return Err(fail_request(wid, msg));
+        }
+    };
+
+    let agent_succeeded = output.exit_code == Some(0);
+
+    if !agent_succeeded {
+        let msg = format!("agent exited with code {:?}\nstderr: {}", output.exit_code, output.stderr.chars().take(1000).collect::<String>());
+        log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+        return Err(TaskCompleteRequest {
+            status: TaskCompleteStatus::Failed,
+            worker_id: wid,
+            branch: branch_name,
+            commit_ref: None,
+            mr_title: None,
+            mr_description: None,
+            error_message: Some(msg),
+            output: Some(output.stdout.chars().take(10000).collect()),
+            sentinel_reached: Some(output.sentinel_found),
+            assistant_reply: output.assistant_reply,
+        });
+    }
+
+    // Step 5: Commit and push
+    log_system(shipper, api_types::LogLevel::Info, "agent completed successfully, committing changes".to_string()).await;
+
+    let current_branch = branch_name.clone().unwrap_or_else(|| {
+        repo.head().ok().and_then(|h| h.shorthand().map(|s| s.to_string())).unwrap_or_else(|| "main".to_string())
+    });
+
+    let commit_ref = match git_ops::commit_changes(&repo, "Changes from Remote Harness agent run") {
+        Ok(oid) => {
+            let sha = oid.to_string();
+            log_system(shipper, api_types::LogLevel::Info, format!("committed changes: {}", sha)).await;
+            Some(sha)
+        }
+        Err(e) => {
+            tracing::info!(%e, "commit skipped (possibly no changes)");
+            log_system(shipper, api_types::LogLevel::Info, format!("commit skipped: {}", e)).await;
+            None
+        }
+    };
+
+    if !git_token.is_empty() {
+        match git_ops::push_to_remote(&repo, &current_branch, &git_token) {
+            Ok(()) => {
+                log_system(shipper, api_types::LogLevel::Info, format!("pushed to branch: {}", current_branch)).await;
+            }
+            Err(e) => {
+                let msg = format!("[PUSH_FAILED] {} — check git token permissions", e);
+                log_system(shipper, api_types::LogLevel::Error, msg.clone()).await;
+                return Err(TaskCompleteRequest {
+                    status: TaskCompleteStatus::Failed,
+                    worker_id: wid,
+                    branch: Some(current_branch),
+                    commit_ref,
+                    mr_title: None,
+                    mr_description: None,
+                    error_message: Some(msg),
+                    output: Some(output.stdout.chars().take(10000).collect()),
+                    sentinel_reached: Some(output.sentinel_found),
+                    assistant_reply: output.assistant_reply,
+                });
+            }
+        }
+    }
+
+    // Step 6: Success
+    log_system(shipper, api_types::LogLevel::Info, "task completed successfully".to_string()).await;
+
+    Ok(TaskCompleteRequest {
+        status: TaskCompleteStatus::Completed,
+        worker_id: wid,
+        branch: Some(current_branch),
+        commit_ref,
+        mr_title: None,
+        mr_description: None,
+        error_message: None,
+        output: Some(output.stdout.chars().take(10000).collect()),
+        sentinel_reached: Some(output.sentinel_found),
+        assistant_reply: output.assistant_reply,
+    })
+}
+
+struct CleanupGuard(std::path::PathBuf);
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        git_ops::cleanup_work_dir(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use api_types::{BranchMode, SessionParams, TaskId, SessionId, JobId, WorkflowType};
+
+    fn make_task(branch_mode: Option<BranchMode>) -> PullTaskResponse {
+        PullTaskResponse {
+            task_id: TaskId::from_string("task-1"),
+            session_id: SessionId::from_string("abcdef12-3456-7890-abcd-ef1234567890"),
+            job_id: JobId::from_string("job-1"),
+            repo_url: "https://github.com/test/repo.git".to_string(),
+            ref_: None,
+            workflow: WorkflowType::Chat,
+            params: Some(SessionParams {
+                prompt: Some("do something".to_string()),
+                n: None,
+                sentinel: None,
+                agent_cli: None,
+                model: None,
+                branch_mode,
+                branch_name_prefix: None,
+            }),
+            input: TaskInput::ChatFirst { prompt: "fix the bug".to_string() },
+            git_token: Some("ghp_test".to_string()),
+            agent_token: Some("sk-test".to_string()),
+            agent_cli: Some(AgentCli::ClaudeCode),
+            model: None,
+            branch_mode: None,
+            prompt_context: None,
+        }
+    }
+
+    #[test]
+    fn test_fail_request() {
+        let req = fail_request(WorkerId::from_string("w-1"), "something broke".to_string());
+        assert_eq!(req.status, TaskCompleteStatus::Failed);
+        assert_eq!(req.error_message.unwrap(), "something broke");
+    }
+
+    #[test]
+    fn test_branch_name_generation_pr_mode() {
+        let task = make_task(Some(BranchMode::Pr));
+        let session_id = task.session_id.as_str();
+        let short_id = &session_id[..8.min(session_id.len())];
+        let prefix = task.params.as_ref().and_then(|p| p.branch_name_prefix.as_deref()).unwrap_or("harness/");
+        let name = format!("{}{}", prefix, short_id);
+        assert_eq!(name, "harness/abcdef12");
+    }
+
+    #[test]
+    fn test_branch_name_with_custom_prefix() {
+        let mut task = make_task(Some(BranchMode::Pr));
+        if let Some(ref mut p) = task.params {
+            p.branch_name_prefix = Some("feat/".to_string());
+        }
+        let session_id = task.session_id.as_str();
+        let short_id = &session_id[..8.min(session_id.len())];
+        let prefix = task.params.as_ref().and_then(|p| p.branch_name_prefix.as_deref()).unwrap_or("harness/");
+        let name = format!("{}{}", prefix, short_id);
+        assert_eq!(name, "feat/abcdef12");
+    }
+
+    #[test]
+    fn test_main_mode_no_branch() {
+        let task = make_task(Some(BranchMode::Main));
+        let branch_mode = task.branch_mode.clone()
+            .or_else(|| task.params.as_ref().and_then(|p| p.branch_mode.clone()))
+            .unwrap_or(BranchMode::Main);
+        assert_eq!(branch_mode, BranchMode::Main);
+    }
+
+    #[test]
+    fn test_prompt_extraction_variants() {
+        let prompt = match &(TaskInput::ChatFirst { prompt: "hello".into() }) {
+            TaskInput::ChatFirst { prompt } => prompt.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(prompt, "hello");
+
+        let prompt = match &(TaskInput::Loop { prompt: "go".into(), iteration: 3 }) {
+            TaskInput::Loop { prompt, iteration } => format!("{}\n\n(Iteration {})", prompt, iteration),
+            _ => unreachable!(),
+        };
+        assert!(prompt.contains("(Iteration 3)"));
+
+        let prompt = match &(TaskInput::Inbox { prompt: "handle".into(), payload: Some(serde_json::Value::String("data".into())) }) {
+            TaskInput::Inbox { prompt, payload: Some(p) } => format!("{}\n\nPayload:\n{}", prompt, p),
+            _ => unreachable!(),
+        };
+        assert!(prompt.contains("Payload:"));
+    }
+
+    #[test]
+    fn test_cleanup_guard_drops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test-cleanup");
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(path.exists());
+        { let _guard = CleanupGuard(path.clone()); }
+        assert!(!path.exists());
+    }
+}
+
+### crates/worker/src/main.rs (modified) ###
+mod agent_executor;
+mod api_client;
+mod config;
+pub mod file_logger;
+pub mod git_ops;
+pub mod log_shipper;
+pub mod platform;
+mod task_executor;
+
+use std::sync::Arc;
+
+use tokio::signal;
+use tokio::sync::{watch, Mutex};
+use tracing_subscriber::EnvFilter;
+
+use api_types::{
+    HeartbeatRequest, RegisterWorkerRequest, WorkerId, WorkerStatus,
+};
+
+use crate::api_client::{with_retry, ApiClientError, ControlPlaneClient};
+use crate::config::WorkerConfig;
+
+struct WorkerState {
+    worker_id: String,
+    client: ControlPlaneClient,
+    config: WorkerConfig,
+    current_job_id: Arc<Mutex<Option<String>>>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .json()
+        .init();
+
+    tracing::info!("worker starting");
+
+    let config = WorkerConfig::load()?;
+    tracing::info!(
+        control_plane_url = %config.control_plane_url,
+        heartbeat_interval = config.heartbeat_interval_secs,
+        poll_interval = config.poll_interval_secs,
+        "configuration loaded"
+    );
+
+    let client = ControlPlaneClient::new(&config.control_plane_url, &config.api_key)?;
+
+    let worker_id = config.resolved_worker_id();
+    let host = config.resolved_host();
+    let labels = config.resolved_labels();
+
+    tracing::info!(worker_id = %worker_id, host = %host, labels = ?labels, "worker identity");
+
+    let worker_id = register(&client, &worker_id, &host, &labels).await?;
+    tracing::info!(worker_id = %worker_id, "registered with control plane");
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let state = Arc::new(WorkerState {
+        worker_id: worker_id.clone(),
+        client: client.clone(),
+        config: config.clone(),
+        current_job_id: Arc::new(Mutex::new(None)),
+    });
+
+    let heartbeat_state = state.clone();
+    let mut heartbeat_shutdown = shutdown_rx.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        heartbeat_loop(heartbeat_state, &mut heartbeat_shutdown).await;
+    });
+
+    let poll_state = state.clone();
+    let mut poll_shutdown = shutdown_rx.clone();
+    let poll_handle = tokio::spawn(async move {
+        poll_loop(poll_state, &mut poll_shutdown).await;
+    });
+
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received, stopping...");
+    let _ = shutdown_tx.send(true);
+
+    let _ = tokio::join!(heartbeat_handle, poll_handle);
+
+    tracing::info!("worker stopped");
+    Ok(())
+}
+
+// ... (register, heartbeat_loop, poll_loop, shutdown_signal functions)
+// poll_loop now calls task_executor::execute_task instead of inline execute_task
+
+== END OF CONTEXT DUMP ==

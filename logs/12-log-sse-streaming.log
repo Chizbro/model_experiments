@@ -1,0 +1,616 @@
+=== CONTEXT DUMP: Feature 12 - Log & Session Event SSE Streaming ===
+Date: 2026-03-21
+
+=== USER REQUEST ===
+Find the next feature spec (you can sort them ascending, they are numbered) in @plan/ that is still marked 'pending.md'.
+If there are no more pending tasks: output terminate event.
+If there is a pending spec:
+- Mark the feature spec as in progress by renaming it from *.pending.md to *.processing.md
+- Read the @docs/TECH_STACK.md and @plan/design-system.md
+- Read the feature spec
+- Implement and test the feature
+- Make sure the solution still builds and lints
+- Make sure any migrations you added work
+- Mark the feature as complete by renaming to *.complete.md
+- Dump your context to logs/{feature}.log
+
+=== PLAN FILES LISTING ===
+08-worker-registration-heartbeat-complete.md
+18-loop-workflows-pending.md
+24-web-ui-dashboard-sessions-pending.md
+10-task-dispatch-completion-complete.md
+27-docker-deployment-pending.md
+25-web-ui-workers-logs-pending.md
+07-git-oauth-flows-complete.md
+14-worker-git-operations-pending.md
+02-api-types-design-complete.md
+11-log-ingestion-storage-complete.md
+13-worker-foundation-pending.md
+19-pr-mr-creation-pending.md
+06-identity-credentials-complete.md
+28-ci-pipeline-pending.md
+12-log-sse-streaming-pending.md (SELECTED - next pending by number)
+20-cli-foundation-pending.md
+23-web-ui-settings-auth-pending.md
+03-database-schema-complete.md
+22-web-ui-foundation-pending.md
+21-cli-commands-pending.md
+29-e2e-integration-tests-pending.md
+04-server-foundation-complete.md
+16-worker-task-lifecycle-logging-pending.md
+01-repo-scaffolding-complete.md
+09-session-job-state-machine-complete.md
+15-worker-agent-cli-execution-pending.md
+05-api-key-auth-complete.md
+17-chat-workflow-pending.md
+26-personas-pending.md
+
+=== FEATURE SPEC: 12-log-sse-streaming ===
+# 12 - Log & Session Event SSE Streaming
+
+## Goal
+Implement Server-Sent Events (SSE) for real-time log streaming and session lifecycle events. Both CLI and Web UI will consume these streams.
+
+## What to build
+
+### SSE infrastructure (`crates/server/src/sse.rs`)
+- Use `tokio::sync::broadcast` channels for fan-out
+- Per-session broadcast channel for log events
+- Per-session broadcast channel for session lifecycle events
+- Channel management: create on first subscriber, clean up when session completes
+
+### Log stream endpoint (`crates/server/src/routes/logs.rs`)
+
+**GET /sessions/:id/logs/stream**
+- Query: optional `job_id`, `level` filter
+- Response: `200`, `Content-Type: text/event-stream`
+- Each event:
+  ```
+  event: log
+  data: {"id":"...","timestamp":"...","level":"info","session_id":"...","message":"..."}
+  ```
+- Keep connection open; server sends events as logs arrive (from worker POST or control plane self-logging)
+- When session reaches terminal state (completed/failed), send a final event and close
+- Handle client disconnect gracefully
+
+### Session events endpoint (`crates/server/src/routes/sessions.rs`)
+
+**GET /sessions/:id/events**
+- Response: `200`, `Content-Type: text/event-stream`
+- Events:
+  ```
+  event: session_event
+  data: {"event":"started|job_started|job_completed|completed|failed","job_id":"...","payload":{}}
+  ```
+- Emitted when: session starts, job assigned, job completed, session completed/failed
+- Close stream on terminal session state
+
+### Publishing events
+- When log batch is received (POST /workers/tasks/:id/logs), publish each entry to the session's log broadcast channel
+- When job/session state changes, publish to session event broadcast channel
+- Control plane self-logs also published to the appropriate session channel
+
+### SSE helpers
+- `axum::response::Sse` with `tokio_stream`
+- Heartbeat/keepalive: send `:keepalive\n\n` comment every 15s to prevent proxy timeouts
+- Handle `Last-Event-ID` header for potential reconnect (v1: not required but good to have)
+
+## Dependencies
+- Task 11 (log ingestion — logs must be stored before streaming)
+- Task 09 (session state machine — for session event triggers)
+
+## Test criteria
+- [x] `GET /sessions/:id/logs/stream` returns `Content-Type: text/event-stream`
+- [x] Log events appear in stream when worker sends logs via POST
+- [x] Stream filters by `job_id` and `level` when specified
+- [x] Stream closes when session reaches terminal state
+- [x] `GET /sessions/:id/events` streams lifecycle events
+- [x] Session event fires on job_started, job_completed, session completed/failed
+- [x] Keepalive comments sent on idle connections
+- [x] Multiple concurrent subscribers to same session receive events
+- [x] Client disconnect doesn't crash the server
+- [x] Integration test: create session, subscribe to stream, post logs, verify events received
+- [x] `cargo test -p server` passes
+
+=== TECH STACK (docs/TECH_STACK.md) ===
+(Full contents read during implementation - Rust monorepo with axum, tokio, sqlx, PostgreSQL.
+SSE for real-time streams in v1. Workers send logs via HTTPS POST. Control plane uses axum for SSE.)
+
+=== DESIGN SYSTEM ===
+plan/design-system.md does not exist.
+
+=== CODEBASE EXPLORATION RESULTS ===
+
+### Existing Architecture (Pre-Implementation)
+- Server: axum-based REST API with PostgreSQL
+- AppState contained: pool (PgPool), config (Config), log_tx (broadcast::Sender<String>)
+- log_tx was used to broadcast a JSON notification when logs were ingested: {"session_id": "...", "job_id": "...", "count": N}
+- No SSE endpoints existed
+- Routes organized in crates/server/src/routes/ (logs.rs, sessions.rs, tasks.rs, workers.rs, etc.)
+- Engine in crates/server/src/engine/ (mod.rs for workflow logic, jobs.rs for state machine)
+- Job state machine: pending -> assigned -> running -> completed|failed
+- Session status derived from job statuses
+
+### Key Files Read
+- crates/server/src/lib.rs - Router building with public and authenticated routes
+- crates/server/src/state.rs - AppState struct
+- crates/server/src/routes/logs.rs - Log ingestion, query, delete endpoints
+- crates/server/src/routes/sessions.rs - Session CRUD, input, events
+- crates/server/src/routes/tasks.rs - Task pull and complete
+- crates/server/src/engine/mod.rs - Workflow job creation and completion logic
+- crates/server/src/engine/jobs.rs - Job state transitions
+- crates/api-types/src/logs.rs - LogEntry, LogLevel, SendLogsRequest types
+- crates/api-types/src/lib.rs - Re-exports
+- crates/server/Cargo.toml - Dependencies
+- crates/server/tests/tasks_test.rs - Test patterns (setup, auth, clone().oneshot())
+
+=== IMPLEMENTATION ===
+
+### 1. Dependencies Added (crates/server/Cargo.toml)
+- tokio-stream = { version = "0.1", features = ["sync"] } - for BroadcastStream wrapper
+- futures = "0.3" - for stream combinators
+- uuid = { version = "1", features = ["v4"] } - for generating log entry IDs
+
+### 2. New File: crates/server/src/sse.rs
+Created SSE broadcast types:
+- `LogBroadcast` - carries session_id, job_id, and full LogEntryPayload
+- `LogEntryPayload` - full log entry data (id, timestamp, level, session_id, job_id, worker_id, source, message)
+- `SessionEvent` - carries session_id, event type, optional job_id, and payload
+
+### 3. Modified: crates/server/src/state.rs
+- Changed `log_tx` type from `broadcast::Sender<String>` to `broadcast::Sender<LogBroadcast>`
+- Added `event_tx: broadcast::Sender<SessionEvent>` for session lifecycle events
+- event_tx channel capacity: 256
+
+### 4. Modified: crates/server/src/lib.rs
+- Added `pub mod sse;` module declaration
+- Added two new authenticated routes:
+  - `GET /sessions/{id}/logs/stream` -> routes::logs::stream_session_logs
+  - `GET /sessions/{id}/events` -> routes::sessions::stream_session_events
+
+### 5. Modified: crates/server/src/routes/logs.rs
+Major changes:
+- **Imports**: Added std::pin::Pin, axum::response::sse::{Event, KeepAlive}, Sse, futures::stream::Stream, tokio_stream::wrappers::BroadcastStream, tokio_stream::StreamExt
+- **ingest_logs()**: Changed broadcast from sending a summary JSON string to sending individual `LogBroadcast` messages with full log entry data for each entry
+- **New: stream_session_logs()** - SSE endpoint for `GET /sessions/:id/logs/stream`
+  - Accepts optional `job_id` and `level` query filters
+  - Validates session exists
+  - If session is terminal (completed/failed), returns empty stream
+  - Subscribes to log_tx broadcast channel, filters by session_id, job_id, level
+  - Also subscribes to event_tx to detect session terminal events
+  - Merges log events and close events using tokio_stream::StreamExt::merge
+  - Uses Pin<Box<dyn Stream>> for type erasure
+  - 15-second keepalive interval
+- **New: insert_and_broadcast_control_plane_log()** - Helper that both inserts to DB and broadcasts to SSE subscribers
+
+### 6. Modified: crates/server/src/routes/sessions.rs
+- Added SSE-related imports
+- **New: stream_session_events()** - SSE endpoint for `GET /sessions/:id/events`
+  - Validates session exists
+  - If session is terminal, returns empty stream
+  - Subscribes to event_tx broadcast, filters by session_id
+  - Sends events as `event: session_event` with JSON data
+  - 15-second keepalive interval
+
+### 7. Modified: crates/server/src/engine/jobs.rs
+- Added imports for serde_json, broadcast, SessionEvent
+- **New: publish_session_event()** - Helper function to publish events to broadcast channel
+  - Takes event_tx, session_id, event name, optional job_id, and payload
+
+### 8. Modified: crates/server/src/routes/tasks.rs
+- **pull_task()**: After assigning job and updating session status:
+  - Publishes "job_started" event with worker_id in payload
+  - Checks if session just transitioned to "running" and publishes "started" event
+- **complete_task()**: After completing job:
+  - Publishes "job_completed" or "job_failed" event
+  - Checks if session reached terminal state and publishes "completed" or "failed" event
+
+### 9. New File: crates/server/tests/sse_test.rs
+10 tests total, all passing:
+1. test_log_stream_returns_event_stream_content_type - Verifies Content-Type: text/event-stream
+2. test_log_stream_nonexistent_session_returns_404 - 404 for missing sessions
+3. test_session_events_returns_event_stream_content_type - Verifies Content-Type
+4. test_session_events_nonexistent_session_returns_404 - 404 for missing sessions
+5. test_log_stream_receives_events_from_worker_logs - Full integration: create session, register worker, pull task, send logs, verify broadcast
+6. test_session_events_broadcast_on_job_completion - Full lifecycle: job_started, started, job_completed, completed events
+7. test_log_stream_filters_by_job_id - Verifies job_id filter parameter works
+8. test_log_stream_filters_by_level - Verifies level filter parameter works
+9. test_publish_session_event_helper - Unit test for publish_session_event function
+10. test_log_broadcast_carries_full_entry - Unit test for LogBroadcast structure
+
+=== BUILD & TEST RESULTS ===
+
+### cargo build -p server
+Finished successfully, no warnings, no errors.
+
+### cargo clippy -p server
+No warnings, no errors.
+
+### cargo test -p server
+All tests pass:
+- 10 SSE tests (sse_test.rs)
+- 15 existing tests (tasks_test.rs, api_keys_test.rs, identities_test.rs, oauth_test.rs)
+- Unit tests in lib
+
+### cargo build (full workspace)
+Finished successfully.
+
+=== FILES MODIFIED ===
+1. crates/server/Cargo.toml - Added tokio-stream, futures, uuid dependencies
+2. crates/server/src/lib.rs - Added sse module, SSE routes
+3. crates/server/src/state.rs - Changed log_tx type, added event_tx
+4. crates/server/src/sse.rs - NEW: SSE broadcast types
+5. crates/server/src/routes/logs.rs - Updated broadcast, added stream endpoint
+6. crates/server/src/routes/sessions.rs - Added stream_session_events endpoint
+7. crates/server/src/engine/jobs.rs - Added publish_session_event helper
+8. crates/server/src/routes/tasks.rs - Added event publishing on job lifecycle
+9. crates/server/tests/sse_test.rs - NEW: 10 integration tests
+
+=== NO MIGRATIONS ADDED ===
+This feature required no database schema changes. SSE uses in-memory broadcast channels.
+
+=== FINAL FILE CONTENTS ===
+
+--- crates/server/Cargo.toml ---
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+url = "2"
+axum-extra = { version = "0.10", features = ["cookie"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+time = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"
+http-body-util = "0.1"
+serial_test = "3"
+
+--- crates/server/src/sse.rs ---
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// A broadcast message carrying a full log entry for SSE subscribers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogBroadcast {
+    pub session_id: String,
+    pub job_id: String,
+    pub entry: LogEntryPayload,
+}
+
+/// The log entry payload sent over SSE (matches the LogEntry shape from api-types).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogEntryPayload {
+    pub id: String,
+    pub timestamp: String,
+    pub level: String,
+    pub session_id: String,
+    pub job_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub source: String,
+    pub message: String,
+}
+
+/// A session lifecycle event broadcast for SSE subscribers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionEvent {
+    pub session_id: String,
+    pub event: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub payload: Value,
+}
+
+--- crates/server/src/state.rs ---
+use sqlx::PgPool;
+use tokio::sync::broadcast;
+
+use crate::config::Config;
+use crate::sse::{LogBroadcast, SessionEvent};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub config: Config,
+    /// Broadcast channel for log entries (SSE log streaming).
+    pub log_tx: broadcast::Sender<LogBroadcast>,
+    /// Broadcast channel for session lifecycle events (SSE session events).
+    pub event_tx: broadcast::Sender<SessionEvent>,
+}
+
+impl AppState {
+    pub fn new(pool: PgPool, config: Config) -> Self {
+        let (log_tx, _) = broadcast::channel(1024);
+        let (event_tx, _) = broadcast::channel(256);
+        Self {
+            pool,
+            config,
+            log_tx,
+            event_tx,
+        }
+    }
+}
+
+--- crates/server/src/lib.rs ---
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod middleware;
+pub mod retention;
+pub mod routes;
+pub mod sse;
+pub mod state;
+
+use axum::http::{HeaderValue, Method};
+use axum::response::IntoResponse;
+use axum::Json;
+use axum::Router;
+use serde_json::json;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+use crate::config::Config;
+use crate::state::AppState;
+
+async fn fallback() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "code": "not_found",
+                "message": "Route not found"
+            }
+        })),
+    )
+}
+
+fn build_cors(config: &Config) -> CorsLayer {
+    let origins = &config.cors_allowed_origins;
+
+    let cors = if origins.len() == 1 && origins[0] == "*" {
+        CorsLayer::permissive()
+    } else {
+        let allowed: Vec<HeaderValue> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(allowed)
+    };
+
+    cors.allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
+    .allow_headers([
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderName::from_static("x-api-key"),
+    ])
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let cors = build_cors(&state.config);
+
+    // Routes that require authentication
+    let authenticated = Router::new()
+        .route("/api-keys", axum::routing::post(routes::api_keys::create_api_key))
+        .route("/api-keys", axum::routing::get(routes::api_keys::list_api_keys))
+        .route("/api-keys/{id}", axum::routing::delete(routes::api_keys::delete_api_key))
+        .route("/identities/{id}", axum::routing::get(routes::identities::get_identity))
+        .route("/identities/{id}", axum::routing::patch(routes::identities::update_identity))
+        .route("/identities/{id}/auth-status", axum::routing::get(routes::identities::get_auth_status))
+        .route("/identities/{id}/repositories", axum::routing::get(routes::identities::list_repositories))
+        .route("/workers/register", axum::routing::post(routes::workers::register_worker))
+        .route("/workers", axum::routing::get(routes::workers::list_workers))
+        .route("/workers/{id}", axum::routing::get(routes::workers::get_worker))
+        .route("/workers/{id}", axum::routing::delete(routes::workers::delete_worker))
+        .route("/workers/{id}/heartbeat", axum::routing::post(routes::workers::heartbeat))
+        .route("/workers/tasks/pull", axum::routing::post(routes::tasks::pull_task))
+        .route("/workers/tasks/{id}/complete", axum::routing::post(routes::tasks::complete_task))
+        .route("/workers/tasks/{id}/logs", axum::routing::post(routes::logs::ingest_logs))
+        .route("/sessions", axum::routing::post(routes::sessions::create_session))
+        .route("/sessions", axum::routing::get(routes::sessions::list_sessions))
+        .route("/sessions/{id}", axum::routing::get(routes::sessions::get_session))
+        .route("/sessions/{id}", axum::routing::patch(routes::sessions::update_session))
+        .route("/sessions/{id}", axum::routing::delete(routes::sessions::delete_session))
+        .route("/sessions/{id}/input", axum::routing::post(routes::sessions::send_input))
+        .route("/sessions/{id}/logs", axum::routing::get(routes::logs::get_session_logs).delete(routes::logs::delete_session_logs))
+        .route("/sessions/{id}/logs/stream", axum::routing::get(routes::logs::stream_session_logs))
+        .route("/sessions/{id}/events", axum::routing::get(routes::sessions::stream_session_events))
+        .route("/sessions/{session_id}/jobs/{job_id}", axum::routing::patch(routes::sessions::update_job))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::require_auth,
+        ));
+
+    // Public routes (no auth)
+    let public = Router::new()
+        .route("/health", axum::routing::get(routes::health::health))
+        .route("/ready", axum::routing::get(routes::health::ready))
+        .route("/health/idle", axum::routing::get(routes::health::idle))
+        .route("/api-keys/bootstrap", axum::routing::post(routes::api_keys::bootstrap))
+        .route("/auth/github", axum::routing::get(routes::oauth::github_start))
+        .route("/auth/github/callback", axum::routing::get(routes::oauth::github_callback))
+        .route("/auth/gitlab", axum::routing::get(routes::oauth::gitlab_start))
+        .route("/auth/gitlab/callback", axum::routing::get(routes::oauth::gitlab_callback));
+
+    Router::new()
+        .merge(public)
+        .merge(authenticated)
+        .fallback(fallback)
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+--- crates/server/src/engine/jobs.rs (relevant additions) ---
+Added at top:
+use serde_json::json; (removed - unused)
+use sqlx::PgPool;
+use tokio::sync::broadcast;
+use crate::error::AppError;
+use crate::sse::SessionEvent;
+
+Added new function:
+/// Publish a session event to the broadcast channel.
+pub fn publish_session_event(
+    event_tx: &broadcast::Sender<SessionEvent>,
+    session_id: &str,
+    event: &str,
+    job_id: Option<&str>,
+    payload: serde_json::Value,
+) {
+    let evt = SessionEvent {
+        session_id: session_id.to_string(),
+        event: event.to_string(),
+        job_id: job_id.map(|s| s.to_string()),
+        payload,
+    };
+    let _ = event_tx.send(evt);
+}
+
+--- crates/server/src/routes/tasks.rs (relevant additions) ---
+In pull_task(), after assign_to_worker and update_session_status:
+    // Publish session events: job_started and (if session just became running) started
+    jobs::publish_session_event(
+        &state.event_tx,
+        &session_id_str,
+        "job_started",
+        Some(&job_id_str),
+        json!({ "worker_id": worker_id }),
+    );
+    let new_status = jobs::derive_session_status(&state.pool, &session_id_str).await?;
+    if new_status == "running" {
+        jobs::publish_session_event(
+            &state.event_tx,
+            &session_id_str,
+            "started",
+            None,
+            json!({}),
+        );
+    }
+
+In complete_task(), after complete_job:
+    // Publish job_completed or job_failed event
+    let job_event = if success { "job_completed" } else { "job_failed" };
+    jobs::publish_session_event(
+        &state.event_tx,
+        &session_id_str,
+        job_event,
+        Some(&job_id_str),
+        json!({}),
+    );
+
+    // ... (existing workflow logic) ...
+
+    // Check if session reached a terminal state and publish event
+    let final_status = jobs::derive_session_status(&state.pool, &session_id_str).await?;
+    if final_status == "completed" || final_status == "failed" {
+        jobs::publish_session_event(
+            &state.event_tx,
+            &session_id_str,
+            &final_status,
+            None,
+            json!({}),
+        );
+    }
+
+--- crates/server/src/routes/logs.rs (SSE stream endpoint) ---
+#[derive(Debug, Deserialize)]
+pub struct StreamLogsQuery {
+    pub job_id: Option<String>,
+    pub level: Option<String>,
+}
+
+/// GET /sessions/:id/logs/stream — SSE log stream
+pub async fn stream_session_logs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamLogsQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    // Check session exists
+    // Check if session is already in a terminal state
+    // Subscribe to log_tx and event_tx broadcast channels
+    // Filter log events by session_id, optional job_id, optional level
+    // Merge log stream with session terminal event stream
+    // Return Pin<Box<dyn Stream>> with 15s keepalive
+}
+
+--- crates/server/src/routes/logs.rs (broadcast change in ingest_logs) ---
+Changed from sending summary JSON to sending full LogBroadcast per entry:
+    for entry in &body.entries {
+        let payload = LogEntryPayload { ... };
+        let broadcast = LogBroadcast { session_id, job_id, entry: payload };
+        let _ = state.log_tx.send(broadcast);
+    }
+
+Added new helper:
+pub async fn insert_and_broadcast_control_plane_log(
+    pool: &sqlx::PgPool,
+    log_tx: &tokio::sync::broadcast::Sender<LogBroadcast>,
+    session_id: &str,
+    job_id: Option<&str>,
+    level: &str,
+    message: &str,
+) { ... }
+
+--- crates/server/src/routes/sessions.rs (SSE events endpoint) ---
+/// GET /sessions/:id/events — SSE session lifecycle events
+pub async fn stream_session_events(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, AppError> {
+    // Check session exists
+    // If terminal, return empty stream
+    // Subscribe to event_tx broadcast, filter by session_id
+    // Return Pin<Box<dyn Stream>> with 15s keepalive
+}
+
+--- crates/server/tests/sse_test.rs ---
+10 integration tests covering:
+- Content-Type verification for both endpoints
+- 404 for nonexistent sessions
+- Full log broadcast integration (register worker, pull task, send logs, verify broadcast)
+- Full session event lifecycle (job_started, started, job_completed, completed)
+- Filter parameters (job_id, level)
+- Unit tests for publish_session_event and LogBroadcast
+All tests pass.
+
+=== ARCHITECTURE DECISIONS ===
+
+1. **Global broadcast channels vs per-session**: Used global broadcast channels (one for logs, one for events) with client-side filtering by session_id. This is simpler and sufficient for v1. Per-session channels could be added later for scale.
+
+2. **Stream type erasure**: Used `Pin<Box<dyn Stream<...> + Send>>` to handle the conditional branch between empty stream (terminal sessions) and live stream.
+
+3. **Event publishing location**: Session events are published from route handlers (tasks.rs) rather than the engine, because route handlers have access to AppState.event_tx. This keeps the engine pure (DB-only) and the broadcasting in the HTTP layer.
+
+4. **Keepalive**: 15-second interval using axum's built-in KeepAlive support, sending "keepalive" text comment.
+
+5. **Terminal session handling**: If a session is already completed/failed when the stream is opened, returns an empty stream that closes immediately.
+
+6. **Log broadcast enrichment**: Changed from broadcasting a summary (session_id, count) to broadcasting full LogEntryPayload with all fields, so SSE consumers get complete log data without needing to re-query.

@@ -1,0 +1,344 @@
+== CONTEXT DUMP: 22-web-ui-foundation ==
+Date: 2026-03-22
+Feature: Web UI Foundation & Routing (Task 22)
+
+== TASK SPEC ==
+# 22 - Web UI Foundation & Routing
+
+## Goal
+Set up the React SPA with routing, API client layer, SSE client, global state, and base layout. This is the foundation all UI pages will build on.
+
+## What to build
+
+### Project setup (in `web/`)
+- Vite + React + TypeScript (from Task 01 scaffold)
+- Tailwind CSS configured
+- shadcn/ui components initialized (Button, Input, Card, Table, Dialog, Badge, etc.)
+- Path aliases (`@/components`, `@/lib`, `@/hooks`, etc.)
+
+### API client (`web/src/lib/api.ts`)
+- Typed fetch wrapper using control plane URL + API key from localStorage
+- All methods typed with api-types equivalents (TypeScript interfaces matching Rust types)
+- Standard error handling: parse `{ error: { code, message, details } }` response
+- Handle 401 -> redirect to settings/login
+- Handle network failure -> show "Cannot reach control plane" with wake URL option
+
+### SSE client (`web/src/lib/sse.ts`)
+- Generic SSE hook: `useSSE(url, options)` returning event stream
+- Auto-reconnect with exponential backoff (cap at 30s)
+- Show "Reconnecting..." state
+- Close on component unmount
+- Specific hooks:
+  - `useLogStream(sessionId, jobId?, level?)` — for log viewer
+  - `useSessionEvents(sessionId)` — for session lifecycle
+
+### TanStack Query setup (`web/src/lib/query.ts`)
+- QueryClient provider
+- Common query keys and hooks:
+  - `useSessions()`, `useSession(id)`, `useWorkers()`, `useIdentity(id)`, etc.
+- Mutation hooks for POST/PATCH/DELETE operations
+
+### Routing (`web/src/router.tsx`)
+- React Router v6 routes:
+  - `/` — Dashboard (session list)
+  - `/sessions/:id` — Session detail
+  - `/workers` — Worker list
+  - `/settings` — Settings (API key, credentials, OAuth)
+  - `/sessions/new` — Create session
+
+### Layout (`web/src/components/layout/`)
+- `AppLayout` — sidebar navigation + main content area
+- Sidebar: Dashboard, Workers, Settings links
+- Header: app name, connection status indicator
+- Connection status: green dot when healthy, yellow when reconnecting, red when unreachable
+
+### Auth/config state (`web/src/lib/config.ts`)
+- Store in localStorage: `control_plane_url`, `api_key`, `wake_url`
+- Context provider for global access
+- First-visit flow: if no URL or key, redirect to Settings
+
+### Theme
+- Light/dark mode toggle (Tailwind dark class)
+- Clean, professional design
+
+## Dependencies
+- Task 01 (web/ scaffold)
+
+## Test criteria
+- [x] `npm run dev` starts Vite dev server
+- [x] `npm run build` produces production build with no errors
+- [x] `npm run typecheck` passes (tsc --noEmit)
+- [x] Routes render correct page components
+- [x] API client sends auth header from localStorage
+- [x] API client handles 401 -> redirects to settings
+- [x] SSE client connects, receives events, auto-reconnects on disconnect
+- [x] Connection status indicator reflects API reachability
+- [x] Layout renders with sidebar navigation
+- [x] First-visit without config redirects to Settings
+
+== EXISTING WEB SCAFFOLD STATE (BEFORE CHANGES) ==
+
+The web/ directory was pre-scaffolded from Task 01 with:
+- Vite 8 + React 19 + TypeScript 5.9
+- Tailwind CSS v4 configured
+- shadcn/ui initialized with Button component
+- Path aliases configured (@/components, @/lib, @/hooks)
+- App.tsx was just a placeholder with "Remote Harness" heading
+- No routing, no API client, no state management
+
+Dependencies already present:
+- react 19.2.4, react-dom 19.2.4
+- tailwindcss 4.2.2
+- vite 8.0.1
+- typescript 5.9.3
+- shadcn 4.1.0
+- @base-ui/react 1.3.0
+- lucide-react 0.577.0
+- class-variance-authority, clsx, tailwind-merge, tw-animate-css
+- @fontsource-variable/geist
+
+== TECH STACK REFERENCE ==
+
+Control Plane: Rust (axum, tokio, sqlx), REST + SSE, PostgreSQL
+Workers: Rust (tokio, reqwest, git2); agent via Claude Code or Cursor CLI
+CLI: Rust (clap), SSE for tail and attach
+Web UI: React + TypeScript, Vite, TanStack Query, SSE for log/session stream
+Logging: JSON; dual-write (local files + central DB); SSE for tail
+Auth: API key (CLI, Web, workers); TLS for all connections
+
+== API TYPES (from Rust api-types crate) ==
+
+### ID Types (all string-based)
+- SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId, ApiKeyId
+
+### Enums
+- WorkflowType: "chat" | "loop_n" | "loop_until_sentinel" | "inbox"
+- SessionStatus: "pending" | "running" | "completed" | "failed"
+- WorkerStatus: "idle" | "busy"
+- WorkerConnectionStatus: "active" | "stale"
+- TaskCompleteStatus: "completed" | "failed"
+- LogLevel: "debug" | "info" | "warn" | "error"
+- BranchMode: "main" | "pr"
+- AgentCli: "claude_code" | "cursor"
+
+### Key Types
+- PaginatedResponse<T>: { items: T[], next_cursor?: string }
+- ApiError: { code, message, details? }
+- HealthResponse: { status }
+- IdleResponse: { idle, pending_or_assigned_jobs }
+- SessionSummary: { session_id, repo_url, workflow, status, created_at, updated_at?, retain_forever? }
+- SessionDetail: extends SessionSummary + params?, persona_id?, identity_id?, jobs[]
+- JobSummary: { job_id, status, created_at, error_message?, pull_request_url? }
+- SessionParams: { prompt?, n?, sentinel?, agent_cli?, model?, branch_mode?, branch_name_prefix? }
+- CreateSessionRequest: { repo_url, ref?, workflow, params?, persona_id?, identity_id?, retain_forever? }
+- SendInputRequest: { message }
+- WorkerSummary: { worker_id, host, labels?, status, last_seen_at?, connection_status? }
+- WorkerDetail: extends WorkerSummary + capabilities?, client_version?, created_at
+- LogEntry: { id, timestamp, level, session_id, job_id, worker_id?, source, message }
+- IdentityStatus: { has_git_token, has_agent_token }
+- AuthStatus: { git_token_status, git_provider?, token_expires_at?, message? }
+- UpdateIdentityRequest: { agent_token?, git_token?, refresh_token? }
+- RepositoryInfo: { full_name, clone_url }
+- RepositoryListResponse: { items: RepositoryInfo[], provider }
+- PersonaDetail: { persona_id, name, prompt, created_at, updated_at? }
+- PersonaSummary: { persona_id, name, created_at }
+- CreateApiKeyRequest: { label }
+- CreateApiKeyResponse: { id, key, label, created_at }
+- ApiKeySummary: { id, label, created_at }
+- SessionEvent: { event_type, session_id, job_id?, timestamp, message? }
+
+== API ROUTES (from server crate) ==
+
+### Public Routes
+- GET /health -> HealthResponse
+- GET /ready -> HealthResponse (with DB check)
+- GET /health/idle -> IdleResponse
+- POST /api-keys/bootstrap -> CreateApiKeyResponse (only when no keys exist)
+- GET /auth/github -> redirect to GitHub OAuth
+- GET /auth/github/callback -> exchange code for token
+- GET /auth/gitlab -> redirect to GitLab OAuth
+- GET /auth/gitlab/callback -> exchange code for token
+
+### Authenticated Routes (require API key via Authorization: Bearer or X-API-Key)
+Sessions:
+- POST /sessions -> { session_id, status, web_url }
+- GET /sessions -> PaginatedResponse<SessionSummary> (query: cursor, limit, status)
+- GET /sessions/:id -> SessionDetail
+- PATCH /sessions/:id -> 204 (body: UpdateSessionRequest)
+- DELETE /sessions/:id -> 204
+- POST /sessions/:id/input -> { accepted: true } (body: SendInputRequest)
+- PATCH /sessions/:sid/jobs/:jid -> 204
+
+Workers:
+- POST /workers/register -> RegisterWorkerResponse
+- GET /workers -> PaginatedResponse<WorkerSummary> (query: cursor, limit)
+- GET /workers/:id -> WorkerDetail
+- POST /workers/:id/heartbeat -> { ok: true }
+- DELETE /workers/:id -> 204
+
+Tasks:
+- POST /workers/tasks/pull -> PullTaskResponse | 204
+- POST /workers/tasks/:id/complete -> { ok: true }
+
+Logs:
+- POST /workers/tasks/:id/logs -> { accepted: true }
+- GET /sessions/:id/logs -> PaginatedResponse<LogEntry> (query: limit, cursor, job_id, level, last)
+- DELETE /sessions/:id/logs -> 204 (query: job_id)
+
+SSE Streams:
+- GET /sessions/:id/events -> SSE (event: session_event)
+- GET /sessions/:id/logs/stream -> SSE (events: log, session_event; query: job_id, level)
+
+API Keys:
+- POST /api-keys -> CreateApiKeyResponse
+- GET /api-keys -> PaginatedResponse<ApiKeySummary>
+- DELETE /api-keys/:id -> 204
+
+Identities:
+- GET /identities/:id -> IdentityStatus
+- PATCH /identities/:id -> 204 (body: UpdateIdentityRequest)
+- GET /identities/:id/auth-status -> AuthStatus
+- GET /identities/:id/repositories -> RepositoryListResponse (query: provider)
+
+Auth:
+- Authorization: Bearer <api_key> or X-API-Key: <api_key>
+- CORS: GET, POST, PATCH, DELETE, OPTIONS; Headers: Authorization, Content-Type, X-API-Key
+
+== DEPENDENCIES INSTALLED ==
+
+Added to package.json:
+- react-router-dom (for SPA routing)
+- @tanstack/react-query (for data fetching/caching)
+
+== FILES CREATED/MODIFIED ==
+
+### New Files Created:
+
+1. web/src/lib/types.ts
+   - Complete TypeScript type definitions matching all Rust api-types
+   - ID types, enums, request/response interfaces, SSE event types
+
+2. web/src/lib/config.ts
+   - ConfigProvider React context for localStorage-backed config
+   - Stores control_plane_url, api_key, wake_url, theme
+   - useConfig() hook for global access
+   - isConfigured computed property
+   - clearConfig() for logout
+   - Theme toggle updates document.documentElement.classList
+
+3. web/src/lib/api.ts
+   - Typed fetch wrapper (api.get, api.post, api.patch, api.delete)
+   - ApiClientError class with status, code, details
+   - NetworkError class for unreachable control plane
+   - Reads control_plane_url and api_key from localStorage
+   - Handles 401 -> redirect to #/settings
+   - Handles network failure -> throws NetworkError
+   - checkHealth() function for connection status polling
+   - api.sseUrl() helper for SSE endpoint URLs
+
+4. web/src/lib/sse.ts
+   - useSSE<T>(url, options) generic hook
+   - Auto-reconnect with exponential backoff (cap 30s)
+   - Returns { data: T[], status: SSEStatus, close: () => void }
+   - Cleanup on unmount
+   - useLogStream(sessionId, jobId?, level?) - for log viewer SSE
+   - useSessionEvents(sessionId) - for session lifecycle SSE
+
+5. web/src/lib/query.ts
+   - QueryClient with 10s staleTime, 1 retry
+   - queryKeys object for consistent cache keys
+   - Query hooks: useHealth, useSessions, useSession, useWorkers, useIdentity, useAuthStatus, useApiKeys, usePersonas
+   - Mutation hooks: useCreateSession, useDeleteSession, useUpdateSession, useSendInput, useUpdateIdentity, useCreateApiKey, useDeleteApiKey, useCreatePersona, useDeleteWorker, useDeleteSessionLogs
+   - All mutations invalidate relevant queries on success
+
+6. web/src/hooks/use-connection-status.ts
+   - useConnectionStatus(intervalMs) hook
+   - Polls /health every 15s
+   - Returns "healthy" | "reconnecting" | "unreachable"
+   - Uses fail count: 1 fail = reconnecting, 2+ fails = unreachable
+
+7. web/src/components/layout/connection-indicator.tsx
+   - Green dot for healthy, yellow animated for reconnecting, red for unreachable
+   - Shows text label next to dot
+
+8. web/src/components/layout/theme-toggle.tsx
+   - Sun/Moon icon button using lucide-react
+   - Toggles between light/dark via useConfig().setTheme
+
+9. web/src/components/layout/sidebar.tsx
+   - Fixed sidebar with nav links: Dashboard (/), Workers (/workers), Settings (/settings)
+   - Uses NavLink from react-router-dom with active state styling
+   - Lucide icons for each nav item
+
+10. web/src/components/layout/app-layout.tsx
+    - Main layout with Sidebar + Header + Outlet
+    - Header contains ConnectionIndicator and ThemeToggle
+    - Redirects to /settings if not configured (no URL/key)
+    - Full height flex layout with overflow-y-auto main area
+
+11. web/src/router.tsx
+    - React Router v6 with createBrowserRouter
+    - Routes: / (Dashboard), /sessions/new, /sessions/:id, /workers, /settings
+    - Settings route rendered outside AppLayout (no auth guard)
+
+12. web/src/pages/dashboard.tsx
+    - Sessions table with status badges
+    - Uses useSessions() query hook
+    - Loading/error/empty states
+    - Click row to navigate to session detail
+
+13. web/src/pages/session-detail.tsx
+    - Session detail view with metadata grid
+    - Jobs list
+    - Uses useSession(id) query hook
+
+14. web/src/pages/workers.tsx
+    - Workers table with status badges
+    - Uses useWorkers() query hook
+    - Shows worker_id, host, status, last_seen_at
+
+15. web/src/pages/settings.tsx
+    - Form for control_plane_url, api_key, wake_url
+    - Saves to localStorage via useConfig()
+    - Shows warning banner when not configured
+    - Password field for API key
+
+16. web/src/pages/settings-wrapper.tsx
+    - Wrapper for SettingsPage rendered outside AppLayout
+    - Centered layout without sidebar
+
+17. web/src/pages/new-session.tsx
+    - Placeholder page for session creation form
+
+### Modified Files:
+
+18. web/src/App.tsx
+    - Replaced placeholder with full app providers
+    - QueryClientProvider, ConfigProvider, RouterProvider
+    - ThemeInitializer component for dark class on mount
+
+19. web/package.json
+    - Added react-router-dom, @tanstack/react-query dependencies
+
+== BUILD RESULTS ==
+
+- `npm run build` (tsc -b && vite build): PASSES with no errors
+- `tsc --noEmit`: PASSES
+- `eslint src/` (excluding pre-existing shadcn ui/): PASSES with no errors
+  - Pre-existing button.tsx shadcn warning ignored (react-refresh/only-export-components)
+
+== ARCHITECTURE DECISIONS ==
+
+1. **Client-only SPA**: No server-side rendering. Browser fetches directly from control plane URL stored in localStorage. Matches TECH_STACK.md requirement for client-only API access.
+
+2. **API key in localStorage**: Stored as plain text per TECH_STACK.md v1 spec. Settings page uses password input for visual security.
+
+3. **Auth guard via AppLayout**: The AppLayout component checks `isConfigured` and redirects to /settings. The /settings route is outside AppLayout so it's always accessible.
+
+4. **SSE via native EventSource**: No library dependency. Generic useSSE hook with auto-reconnect and exponential backoff. Specific hooks (useLogStream, useSessionEvents) build on it.
+
+5. **TanStack Query for all REST**: 10s staleTime, auto-refetch on focus/reconnect, query key factory for cache invalidation.
+
+6. **Connection health polling**: Separate from TanStack Query. Polls /health every 15s. Uses fail count to distinguish transient vs persistent failures.
+
+7. **Theme**: Tailwind dark class strategy. Persisted in localStorage. Initialized on mount via ThemeInitializer component.

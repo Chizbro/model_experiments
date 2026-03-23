@@ -1,0 +1,422 @@
+== CONTEXT DUMP: 17-chat-workflow ==
+== Date: 2026-03-22 ==
+
+== TASK ==
+Implement the chat workflow end-to-end: single-turn and multi-turn conversations with history assembly, history cap, and proper task_input construction.
+
+== FEATURE SPEC (plan/17-chat-workflow-complete.md) ==
+# 17 - Chat Workflow
+
+## Goal
+Implement the chat workflow end-to-end: single-turn and multi-turn conversations with history assembly, history cap, and proper task_input construction.
+
+## What to build
+
+### Server-side: chat job creation
+- **First job** (session create): task_input = `{ "prompt": session.params.prompt }`
+- **Follow-up job** (POST /sessions/:id/input): task_input = `{ "session_prompt", "message", "history", "history_assistant", "history_truncated" }`
+  - `session_prompt`: original prompt from session create
+  - `message`: the current follow-up message
+  - `history`: list of prior user follow-up messages (from previous inputs)
+  - `history_assistant`: list of prior assistant replies (from task complete `assistant_reply` fields)
+  - `history_truncated`: true if any turns were dropped due to cap
+
+### Server-side: history assembly (`crates/server/src/engine/chat.rs`)
+- Query all completed jobs for this session, ordered by creation
+- Extract user messages and assistant replies
+- Apply cap: keep last `CHAT_HISTORY_MAX_TURNS` entries per side
+- Set `history_truncated = true` when cap causes drops
+- Build TaskInput and store on the new job
+
+### Server-side: session state for chat
+- Session stays "running" until explicitly ended or no more input expected
+- New input creates a new job; session goes back to "pending" if worker isn't working on it
+- Session "completed" only when... (chat is open-ended; may need explicit close or timeout)
+  - For v1: session stays running, user can keep sending input
+
+### Worker-side: chat task handling
+- For first job: pass prompt directly to agent CLI
+- For follow-up: construct a combined prompt that includes session_prompt, history context, and current message
+- Pass persona prompt_context as system context
+- Capture assistant_reply from agent output
+- Include assistant_reply in task complete
+
+### Worker-side: prompt construction for multi-turn
+- Build a single prompt that represents the conversation:
+  ```
+  [Persona context if set]
+  Original goal: {session_prompt}
+
+  Conversation history:
+  User: {history[0]}
+  Assistant: {history_assistant[0]}
+  ...
+
+  User: {message}
+  ```
+- Or use Claude Code's built-in conversation support if available
+
+## Dependencies
+- Task 09 (session/job state machine — job creation)
+- Task 10 (task dispatch — pull/complete)
+- Task 16 (worker task lifecycle — full execution pipeline)
+
+## Test criteria
+- [x] Create chat session: first job has correct task_input with prompt
+- [x] Send input: follow-up job has session_prompt, message, history, history_assistant
+- [x] History correctly assembled from prior completed jobs
+- [x] History cap applies at configured limit (default 50)
+- [x] `history_truncated` is true when cap exceeded, false otherwise
+- [x] Worker passes prompt correctly to agent CLI
+- [x] Worker captures and returns assistant_reply
+- [x] Multi-turn conversation works: create session -> complete first job -> send input -> complete second job -> verify history grows
+- [x] Session status transitions correctly through chat lifecycle
+- [x] Integration test: full multi-turn chat workflow
+- [x] `cargo test -p server` and `cargo test -p worker` pass
+
+== TECH STACK (docs/TECH_STACK.md) ==
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). | — |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI ([API_OVERVIEW](API_OVERVIEW.md)). v1: SSE only. | Long-polling (fallback only) |
+
+---
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+---
+
+## 5. Logging (Unified)
+
+| Layer | Recommendation | Rationale |
+|-------|----------------|-----------|
+| **Format** | **Structured JSON** (e.g. `{"time":"...","level":"info","session_id":"...","job_id":"...","message":"..."}`) | Easy to parse, filter, index. |
+| **Transport from workers** | **HTTPS POST** to control plane log endpoint | Workers send log entries to the control plane; control plane aggregates and stores. No queue. |
+| **Tail API** | **SSE** (Server-Sent Events) with filters (`session_id`, `job_id`, `level`) | Same for CLI and Web. v1: SSE only; no WebSocket for log tail. |
+| **Persistence** | **Dual-write; all logs go to disk.** (1) **Local files:** Every log line is written to disk on the component that produced it (control plane → files on backend; each worker → files on that worker). (2) **Central store (PostgreSQL)** on the control plane: control plane writes its own logs and ingested worker logs to the DB so the CLI and Web UI can both show all logs from all places. If streaming or either client breaks, logs are still in files on backend or worker. | Retention and "retain forever" / manual delete apply to the central store. |
+
+---
+
+## 6. Security & Auth (control plane only)
+
+| Area | Recommendation |
+|------|----------------|
+| **Control plane API** | API key in header (`Authorization: Bearer <key>` or `X-API-Key`) for CLI and Web. |
+| **Workers** | API key (machine token) in env or config; sent with every request to the control plane. |
+| **TLS** | All connections to the control plane over HTTPS (TLS). |
+| **Secrets** | Git credentials in control plane or env; workers receive per-job. Agent execution uses user's Claude Code / Cursor token (BYOL), stored and refreshed by control plane. |
+
+**v1: API key only.** No OIDC or mTLS in v1.
+
+---
+
+## 7. Repo Layout (Rust Monorepo)
+
+```
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI with user token)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+│   ├── src/
+│   └── package.json
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TECH_STACK.md
+│   └── PRODUCT.md
+├── Cargo.toml               # Workspace root
+├── Cargo.lock
+├── Dockerfile               # Build and run control plane / services with Docker
+├── docker-compose.yml       # Compose for server, DB, and optional worker/UI
+└── README.md
+```
+
+---
+
+## 8. Summary Table
+
+| Component | Stack |
+|-----------|-----------------|
+| Control plane | **Rust** (axum, tokio, sqlx), REST + **SSE**, PostgreSQL (task queue in DB) |
+| Workers | **Rust** (tokio, reqwest, git2); agent via **Claude Code or Cursor CLI** (BYOL—user's token) |
+| CLI | **Rust** (clap), SSE for tail and attach, shares `api-types` with server |
+| Web UI | React + TypeScript, Vite, TanStack Query, SSE for log/session stream |
+| Logging | JSON; dual-write (local files + central DB); SSE for tail; retention and manual delete on central store |
+| Auth | API key (CLI, Web, workers); TLS for all connections |
+
+== PLAN FILES LISTING (sorted ascending) ==
+01-repo-scaffolding-complete.md
+02-api-types-design-complete.md
+03-database-schema-complete.md
+04-server-foundation-complete.md
+05-api-key-auth-complete.md
+06-identity-credentials-complete.md
+07-git-oauth-flows-complete.md
+08-worker-registration-heartbeat-complete.md
+09-session-job-state-machine-complete.md
+10-task-dispatch-completion-complete.md
+11-log-ingestion-storage-complete.md
+12-log-sse-streaming-complete.md
+13-worker-foundation-complete.md
+14-worker-git-operations-complete.md
+15-worker-agent-cli-execution-complete.md
+16-worker-task-lifecycle-logging-complete.md
+17-chat-workflow-complete.md  ← THIS TASK
+18-loop-workflows-pending.md
+19-pr-mr-creation-pending.md
+20-cli-foundation-pending.md
+21-cli-commands-pending.md
+22-web-ui-foundation-pending.md
+23-web-ui-settings-auth-pending.md
+24-web-ui-dashboard-sessions-pending.md
+25-web-ui-workers-logs-pending.md
+26-personas-pending.md
+27-docker-deployment-pending.md
+28-ci-pipeline-pending.md
+29-e2e-integration-tests-pending.md
+
+== INITIAL CODEBASE STATE (pre-implementation) ==
+
+The codebase already had the following infrastructure in place:
+- TaskInput enum with ChatFirst { prompt }, ChatFollowup { message }, Loop, Inbox variants
+- Server routes: POST /sessions, POST /sessions/:id/input, POST /workers/tasks/pull, POST /workers/tasks/:id/complete
+- Worker task executor pipeline: clone -> branch -> run agent -> commit -> push -> complete
+- Agent executor with stream-json parsing and assistant_reply extraction
+- Session/job state machine with transitions
+- History assembly inline in send_input route
+- Database schema with jobs.task_input (JSONB), jobs.assistant_reply columns
+
+== CHANGES MADE ==
+
+### 1. api-types/src/workers.rs - Expanded TaskInput::ChatFollowup
+Before:
+```rust
+ChatFollowup {
+    message: String,
+},
+```
+After:
+```rust
+ChatFollowup {
+    session_prompt: String,
+    message: String,
+    #[serde(default)]
+    history: Vec<String>,
+    #[serde(default)]
+    history_assistant: Vec<String>,
+    #[serde(default)]
+    history_truncated: bool,
+},
+```
+This makes the worker receive the full chat context (session_prompt, history, history_assistant, history_truncated) when processing a followup job, instead of just the message.
+
+### 2. worker/src/task_executor.rs - Multi-turn prompt construction
+Added `build_chat_followup_prompt()` function that constructs a combined prompt:
+```
+Original goal: {session_prompt}
+
+Conversation history:
+User: {history[0]}
+Assistant: {history_assistant[0]}
+...
+
+User: {message}
+```
+
+Updated the prompt extraction match arm for ChatFollowup to use this function instead of just returning `message`.
+
+Also added 4 unit tests:
+- test_build_chat_followup_prompt_basic
+- test_build_chat_followup_prompt_truncated
+- test_build_chat_followup_prompt_no_history
+- test_chat_followup_prompt_extraction
+
+### 3. server/src/engine/chat.rs - NEW MODULE
+Created `engine/chat.rs` with:
+- `ChatHistory` struct: session_prompt, user_messages, assistant_replies, truncated
+- `assemble_history()`: queries completed jobs, extracts user messages and assistant replies, applies cap (max_turns), sets truncated flag
+- `update_chat_session_status()`: chat sessions stay "running" after job completion to allow follow-up input (never auto-complete)
+
+### 4. server/src/engine/mod.rs - Chat-specific job completion handling
+Updated `on_job_completed()` to handle chat workflow specially:
+- Chat sessions call `chat::update_chat_session_status()` instead of the generic `update_session_status()`
+- This keeps the session in "running" state after job completion
+
+### 5. server/src/routes/sessions.rs - Refactored send_input
+Replaced the inline history assembly logic in `send_input()` with a call to `engine::chat::assemble_history()`. The JSON structure is the same but the code is cleaner and reusable.
+
+### 6. server/tests/tasks_test.rs - Fixed existing test
+Updated `test_session_status_updates_after_completion` to expect "running" instead of "completed" for chat sessions.
+
+### 7. server/tests/chat_workflow_test.rs - NEW TEST FILE
+Added 8 integration tests:
+- test_chat_first_job_has_correct_task_input: verifies first job has chat_first with prompt
+- test_chat_followup_has_history: verifies followup job has session_prompt, message, history, history_assistant
+- test_chat_multi_turn_history_grows: verifies history grows across 3 turns
+- test_chat_history_truncation: verifies cap (max_turns=2) truncates correctly
+- test_chat_session_stays_running_after_job_completion: verifies session doesn't auto-complete
+- test_chat_input_rejected_for_non_chat_workflow: verifies input rejected for loop_n
+- test_chat_worker_captures_assistant_reply: verifies assistant_reply stored in DB
+- test_chat_session_transitions_correctly: full lifecycle test (pending → running → stays running)
+
+== FILES MODIFIED ==
+- crates/api-types/src/workers.rs (expanded ChatFollowup variant)
+- crates/worker/src/task_executor.rs (multi-turn prompt construction + tests)
+- crates/server/src/engine/mod.rs (chat workflow handling in on_job_completed)
+- crates/server/src/routes/sessions.rs (refactored send_input to use chat module)
+- crates/server/tests/tasks_test.rs (fixed existing test expectation)
+
+== FILES CREATED ==
+- crates/server/src/engine/chat.rs (history assembly + chat session status)
+- crates/server/tests/chat_workflow_test.rs (8 integration tests)
+
+== TEST RESULTS ==
+- cargo test -p api-types: 36 passed
+- cargo test -p worker: 73 passed
+- cargo test -p server --lib: 19 passed
+- cargo test -p server --test tasks_test: 15 passed
+- cargo test -p server --test sse_test: 10 passed
+- cargo test -p server --test chat_workflow_test: 8 passed
+- cargo clippy: no new warnings (only pre-existing ones)
+- cargo check: clean compilation
+
+== KEY DESIGN DECISIONS ==
+
+1. **Chat sessions never auto-complete**: Unlike other workflows, chat sessions stay in "running" state after all jobs complete. This allows users to keep sending follow-up input indefinitely. The session only transitions away from "running" if there are pending jobs (goes to "pending") or active jobs (stays "running").
+
+2. **Full context in TaskInput**: The ChatFollowup variant now carries the complete conversation context (session_prompt, history, history_assistant, history_truncated) so the worker can construct a meaningful multi-turn prompt. The `#[serde(default)]` annotations ensure backward compatibility if any fields are missing.
+
+3. **History assembly in engine/chat.rs**: Extracted the history assembly logic from the inline `send_input` handler into a dedicated module. This makes it reusable and testable, and follows the existing pattern of engine modules for workflow-specific logic.
+
+4. **Worker prompt format**: The worker builds a structured prompt with "Original goal", "Conversation history" (interleaved User/Assistant turns), and the current "User" message. The persona prompt_context is prepended separately by the agent_executor.
+
+5. **No migration needed**: All changes are in application code. The existing JSONB `task_input` column accommodates the new fields, and `assistant_reply` was already present in the jobs table.
+
+== READING LIST (files read during implementation) ==
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/plan/17-chat-workflow-processing.md
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/docs/TECH_STACK.md
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/workers.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/lib.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/ids.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/common.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/sessions.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/api-types/src/logs.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/routes/sessions.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/routes/tasks.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/routes/logs.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/routes/workers.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/engine/mod.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/engine/jobs.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/config.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/state.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/lib.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/src/sse.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/migrations/20240101000001_initial_schema.sql
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/tests/tasks_test.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/server/tests/sse_test.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/worker/src/task_executor.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/worker/src/agent_executor.rs
+- /Users/chizbro/Desktop/code/utils/remote_harness_sonnet/crates/worker/src/main.rs
+
+== TOOL CALLS LOG ==
+
+1. Bash: ls plan/ - listed all plan files
+2. Read: docs/TECH_STACK.md - read tech stack
+3. Bash: mv plan/17-chat-workflow-pending.md → processing.md
+4. Read: plan/17-chat-workflow-processing.md - read feature spec
+5. Read: plan/design-system.md - file not found (doesn't exist)
+6. Agent(Explore): Full codebase exploration - read all relevant source files
+7. Read: crates/server/src/routes/sessions.rs
+8. Read: crates/server/src/engine/mod.rs
+9. Read: crates/worker/src/task_executor.rs
+10. Read: crates/api-types/src/workers.rs
+11. Read: crates/worker/src/agent_executor.rs
+12. Read: crates/server/src/engine/jobs.rs
+13. Read: crates/server/src/routes/tasks.rs
+14. Read: crates/server/src/config.rs
+15. Glob: crates/server/tests/*.rs
+16. Glob: crates/worker/tests/*.rs
+17. Read: crates/server/tests/tasks_test.rs
+18. Edit: crates/api-types/src/workers.rs - expanded ChatFollowup
+19. Edit: crates/worker/src/task_executor.rs - updated prompt extraction
+20. Edit: crates/worker/src/task_executor.rs - added build_chat_followup_prompt
+21. Edit: crates/server/src/engine/mod.rs - chat handling in on_job_completed
+22. Edit: crates/server/src/engine/mod.rs - added pub mod chat
+23. Write: crates/server/src/engine/chat.rs - created chat module
+24. Edit: crates/server/src/routes/sessions.rs - refactored send_input
+25. Edit: crates/worker/src/task_executor.rs - added worker tests
+26. Bash: cargo check - compilation check (success)
+27. Bash: cargo test -p api-types - 36 passed
+28. Bash: cargo test -p worker - 73 passed
+29. Bash: cargo test -p server --lib - 19 passed
+30. Bash: pg_isready / docker ps - checked postgres availability
+31. Bash: cargo test -p server --test tasks_test - 1 failure (expected)
+32. Edit: crates/server/tests/tasks_test.rs - fixed test expectation
+33. Bash: cargo test -p server --test tasks_test - 15 passed
+34. Write: crates/server/tests/chat_workflow_test.rs - created integration tests
+35. Bash: cargo test -p server --test chat_workflow_test - 8 passed
+36. Bash: cargo test - all tests pass
+37. Bash: cargo test -p server - all server tests pass
+38. Bash: cargo test -p server --test sse_test - 10 passed
+39. Bash: cargo clippy - no new warnings
+40. Bash: mv plan/17-chat-workflow-processing.md → complete.md
+
+== END OF CONTEXT DUMP ==

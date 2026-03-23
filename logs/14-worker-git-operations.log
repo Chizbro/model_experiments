@@ -1,0 +1,741 @@
+== CONTEXT DUMP: 14-worker-git-operations ==
+== Date: 2026-03-21 ==
+
+== TASK ==
+Implement Git clone, checkout, commit, and push using libgit2 (git2 crate) following GIT_CLONE_SPEC.md exactly. This is the worker's interface to repositories — must handle token embedding, redirect following, and credential callbacks.
+
+== INPUT FILES READ ==
+
+=== plan/14-worker-git-operations-processing.md (now complete) ===
+# 14 - Worker Git Operations
+
+## Goal
+Implement Git clone, checkout, commit, and push using libgit2 (git2 crate) following GIT_CLONE_SPEC.md exactly. This is the worker's interface to repositories — must handle token embedding, redirect following, and credential callbacks.
+
+## What to build
+
+### Git operations module (`crates/worker/src/git_ops.rs`)
+
+**Token-embedded URL builder**
+- `embed_token_into_url(repo_url, git_token) -> String`
+- For http:// and https:// URLs: `{scheme}://git:{percent_encoded_token}@{host}{path}`
+- Use `urlencoding::encode()` for token only
+- Strip existing `user@` from authority before re-embedding
+- Username: `git` for GitHub, `oauth2` for `*.gitlab.com`, configurable via `REMOTE_HARNESS_GIT_HTTPS_USER`
+
+**Clone**
+- `clone_repo(repo_url, ref_, git_token, work_dir) -> Result<Repository>`
+- Build token-embedded URL
+- Create `FetchOptions` with:
+  - `follow_redirects(RemoteRedirect::All)`
+  - `RemoteCallbacks::credentials` callback returning `Cred::userpass_plaintext("git", token)`
+- Clone into work_dir
+- Checkout specified ref (branch or commit)
+- Fail fast with clear error on: invalid URL, auth failure, ref not found
+
+**Checkout branch**
+- `checkout_or_create_branch(repo, branch_name, from_ref) -> Result<()>`
+- For PR/MR mode: create feature branch from HEAD after checkout
+- Branch naming: `harness/{short_session_id}` or custom prefix from params
+
+**Commit**
+- `commit_changes(repo, message) -> Result<Oid>`
+- Stage all changes (`git add -A` equivalent)
+- Create commit with configured author/committer
+- Author: from env or default "Remote Harness <harness@local>"
+
+**Push**
+- `push_to_remote(repo, branch, git_token) -> Result<()>`
+- Build token-embedded URL for push
+- Create `PushOptions` with:
+  - `follow_redirects(RemoteRedirect::All)`
+  - `RemoteCallbacks::credentials` callback
+- Push to origin
+- Return clear error on auth failure, rejected push, etc.
+
+### Work directory management
+- Create temp work directories per task (e.g. `/tmp/harness-{task_id}/`)
+- Clean up after task completes (success or failure)
+
+## Dependencies
+- Task 13 (worker foundation — needs worker binary to run in)
+
+## Design decisions
+- Always use token-embedded URL + credential callback (belt and suspenders per GIT_CLONE_SPEC)
+- Never rely on host's global git config
+- Clone into a fresh directory per task (no reuse of prior clones)
+
+## Test criteria
+- [ ] `embed_token_into_url` correctly builds URLs for GitHub and GitLab
+- [ ] Token with special characters (`@`, `/`, `%`) is properly percent-encoded
+- [ ] Existing `user@` in URL is stripped before re-embedding
+- [ ] Clone with valid token succeeds (test against a real or mock git server)
+- [ ] Clone with invalid token fails with clear error message
+- [ ] Checkout to specific branch/ref works
+- [ ] Create and checkout new branch works
+- [ ] Commit stages all changes and creates commit
+- [ ] Push with valid token succeeds
+- [ ] Push with `follow_redirects(All)` set on PushOptions
+- [ ] FetchOptions and PushOptions both set credential callback
+- [ ] Work directory is cleaned up after task
+- [ ] Unit tests for URL embedding logic
+- [ ] `cargo test -p worker` passes
+
+=== docs/TECH_STACK.md ===
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+| **Platform-specific CLI integration** | **Per-platform handling required** | The Claude Code and Cursor CLIs behave differently on Windows (native), WSL, macOS, and Linux—invocation, argument passing, output streaming. Workers must have **specific handling per platform** for: (1) discovering and invoking the CLI, (2) passing arguments in (quoting, stdin vs argv; Windows is especially different), (3) streaming results out (stdout/stderr, PTY vs non-PTY, Windows console). Implement one worker variant per platform (Windows native, WSL, macOS, Linux) or clear platform modules in one codebase. See [Architecture §4c](ARCHITECTURE.md). | — |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI ([API_OVERVIEW](API_OVERVIEW.md)). v1: SSE only. | Long-polling (fallback only) |
+
+**CLI surface (conceptual):** Commands map to operations in [API_OVERVIEW.md](API_OVERVIEW.md); do not restate parameters or status codes here ([API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+- `remote-harness config show` — show resolved config and precedence
+- `remote-harness session start [--repo URL] [--workflow type] [--params ...]`
+- `remote-harness session list` / `remote-harness session show <id>` / `remote-harness session delete <id>`
+- `remote-harness attach <session_id>`
+- `remote-harness logs tail [--session-id id] [--job-id id]` — loads full history then SSE stream; same client contract as Web ([API_OVERVIEW §6](API_OVERVIEW.md#6-rest--logs))
+- `remote-harness logs delete [--session-id id] [--job-id id]` — maps to **`DELETE /sessions/:id/logs`**; omit `--job-id` to delete all logs for the session in the central store ([API_OVERVIEW §6 — Delete session logs](API_OVERVIEW.md#delete-session-logs))
+- `remote-harness workers list` / `remote-harness workers clear <worker_id>`
+- `remote-harness credentials show` / `remote-harness credentials set` — identity tokens (BYOL)
+- `remote-harness inbox send <agent_id>` (with `--payload` or `--prompt`; optional `--persona-id`) / `remote-harness inbox list <agent_id>` (optional `--limit`, `--cursor`)
+- `remote-harness session start --workflow inbox --agent-id <id>` (and optional `--repo`, `--agent-cli`, `--model`, `--branch-mode`)
+
+---
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+**Key views:** Dashboard (sessions list, workers), Session detail (log tail, attach, inputs; delete session, delete logs, retain_forever), Worker list, Inbox / agent list, **Settings** — control plane URL and API key (e.g. for Tailscale URL when opening the UI from anywhere); BYOL credentials (identity tokens) and GitHub/GitLab OAuth sign-in for storing git_token on an identity. Same API as the CLI ([AGENTS.md](../AGENTS.md), [API_OVERVIEW — Spec delivery](API_OVERVIEW.md#spec-delivery-implementation-requirement)).
+
+**Client-only API access:** When the UI is hosted publicly (e.g. on an always-on host) while the control plane is only reachable via Tailscale (or a private network), the browser must talk to the control plane directly. The UI must **not** use server-side code in the framework to proxy or fetch from the control plane (no Next.js server components, Nuxt server routes, etc. that call the API). Use a **client-side only** pattern: SPA with browser-based **REST + SSE** to the control plane URL. See [Hosting §4b](HOSTING.md#4b-ui-hosting-public-url-client-only-api-access).
+
+**UI security (API keys):** The v1 UI stores the control plane API key in **browser storage** (e.g. localStorage) for simplicity. Treat the UI as a **high-trust** surface: no untrusted third-party scripts, strong **Content-Security-Policy** where deployed, and HTTPS in production. A future iteration may move to **httpOnly** cookies or short-lived tokens. **Normative operator and UX expectations:** [HOSTING §14 — Web UI threat model](HOSTING.md#14-web-ui-threat-model-api-key-in-browser) and [CLIENT_EXPERIENCE §11](CLIENT_EXPERIENCE.md#11-web-ui-and-api-key-operator-expectations).
+
+---
+
+## 5. Logging (Unified)
+
+| Layer | Recommendation | Rationale |
+|-------|----------------|-----------|
+| **Format** | **Structured JSON** (e.g. `{"time":"...","level":"info","session_id":"...","job_id":"...","message":"..."}`) | Easy to parse, filter, index. |
+| **Transport from workers** | **HTTPS POST** to control plane log endpoint | Workers send log entries to the control plane; control plane aggregates and stores. No queue. |
+| **Tail API** | **SSE** (Server-Sent Events) with filters (`session_id`, `job_id`, `level`) | Same for CLI and Web. v1: SSE only; no WebSocket for log tail. |
+| **Persistence** | **Dual-write; all logs go to disk.** (1) **Local files:** Every log line is written to disk on the component that produced it (control plane → files on backend; each worker → files on that worker). (2) **Central store (PostgreSQL)** on the control plane: control plane writes its own logs and ingested worker logs to the DB so the CLI and Web UI can both show all logs from all places. If streaming or either client breaks, logs are still in files on backend or worker. See [Architecture §6](ARCHITECTURE.md#6-logging-architecture). | Retention and "retain forever" / manual delete apply to the central store. |
+
+---
+
+## 6. Security & Auth (control plane only)
+
+This section is about **auth to the Remote Harness control plane** (who can use the API, which workers are trusted). Auth to Git and to the agent CLI (BYOL) are separate; see [Architecture §8](ARCHITECTURE.md#8-three-auth-concerns).
+
+| Area | Recommendation |
+|------|----------------|
+| **Control plane API** | API key in header (`Authorization: Bearer <key>` or `X-API-Key`) for CLI and Web. |
+| **Workers** | API key (machine token) in env or config; sent with every request to the control plane. |
+| **TLS** | All connections to the control plane over HTTPS (TLS). |
+| **Secrets** | Git credentials in control plane or env; workers receive per-job. Agent execution uses user's Claude Code / Cursor token (BYOL), stored and refreshed by control plane. |
+
+**v1: API key only.** No OIDC or mTLS in v1.
+
+### Control plane auth: configuration (API key)
+
+Configuration must be clear and consistent across components.
+
+| Component | Where the API key is set | How it's used |
+|-----------|---------------------------|----------------|
+| **Server** | Server stores issued API keys (e.g. in DB or config). Keys are created via CLI or Web UI (e.g. `remote-harness api-key create` or Settings in UI). Server validates the key on every request. | Validates `Authorization` or `X-API-Key` header. |
+| **CLI** | **Env:** `REMOTE_HARNESS_API_KEY` (or `API_KEY`). **Config file:** `~/.config/remote-harness/config.yaml` with `api_key: <key>`. **Precedence:** CLI flag > env > config file. Document in CLI help and README. | Sent on every request to the control plane URL. |
+| **Web UI** | User enters the API key once (e.g. Login or Set API key in UI). Stored in browser **localStorage** (control plane URL and API key); logout clears them. | Sent in `Authorization: Bearer <key>` or `X-API-Key` on every API call. |
+| **Worker** | **Env:** `REMOTE_HARNESS_API_KEY` or `API_KEY`. **Config file:** e.g. `config.yaml` or `~/.config/remote-harness-worker/config.yaml` with `control_plane_url` and `api_key`. **Precedence:** env > config file (no flags for worker). Document in worker README. | Sent on every request (register, heartbeat, pull task, send logs). |
+
+**Current implementation:** Server accepts keys from env (`API_KEY`, `API_KEYS`), config file, and **issued keys** stored in the DB (created via `remote-harness api-key create` or Web UI Settings → Create API key). Issued keys are stored as SHA-256 hashes; the plain key is shown only once at creation. Worker reads config from a **YAML** file; default path when `REMOTE_HARNESS_CONFIG` is unset is `~/.config/remote-harness-worker/config.yaml` (env overrides file).
+
+**Control plane URL** (for CLI and worker): env `REMOTE_HARNESS_URL` or `CONTROL_PLANE_URL`, or config file `control_plane_url`. Same precedence as api_key (CLI: flag > env > config; worker: env > config). Document alongside `api_key` so both are in one place.
+
+---
+
+## 7. Repo Layout (Rust Monorepo)
+
+Control plane, workers, and CLI are all **Rust** in one workspace; shared types and API contracts live in a common crate.
+
+```
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI with user token)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+│   ├── src/
+│   └── package.json
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TECH_STACK.md
+│   └── PRODUCT.md
+├── Cargo.toml               # Workspace root
+├── Cargo.lock
+├── Dockerfile               # Build and run control plane / services with Docker
+├── docker-compose.yml       # Compose for server, DB, and optional worker/UI
+└── README.md
+```
+
+Each binary is built with `cargo build -p server`, `cargo build -p worker`, `cargo build -p cli`. The `api-types` crate keeps REST JSON payloads in sync between server, worker, and CLI. For containerized build and run, use the repo root **Dockerfile** and **docker-compose.yml**; see [GETTING_STARTED.md §1](GETTING_STARTED.md#1-docker-compose-recommended).
+
+---
+
+## 8. Summary Table
+
+| Component | Stack |
+|-----------|-----------------|
+| Control plane | **Rust** (axum, tokio, sqlx), REST + **SSE**, PostgreSQL (task queue in DB) |
+| Workers | **Rust** (tokio, reqwest, git2); agent via **Claude Code or Cursor CLI** (BYOL—user's token) |
+| CLI | **Rust** (clap), SSE for tail and attach, shares `api-types` with server |
+| Web UI | React + TypeScript, Vite, TanStack Query, SSE for log/session stream |
+| Logging | JSON; dual-write (local files + central DB); SSE for tail; retention and manual delete on central store |
+| Auth | API key (CLI, Web, workers); TLS for all connections |
+
+---
+
+*Previous: [Architecture](ARCHITECTURE.md) | Next: [Product & Features](PRODUCT.md) | [Client experience](CLIENT_EXPERIENCE.md)*
+
+=== docs/GIT_CLONE_SPEC.md ===
+# Git clone and push: avoiding "too many redirects or authentication replays"
+
+When clone or push fails in production, surface a **clear** message to the user (job/session error + link to Settings for Git credentials). See [CLIENT_EXPERIENCE.md §6](CLIENT_EXPERIENCE.md#6-jobs-failures-outside-the-users-control).
+
+**Implementation checklist (end of this doc):** This is a **release / code-review gate** for the worker: every box should be verifiable before declaring Git HTTPS support done. It is **not** a public operator checklist; unchecked items here do **not** mean the spec is optional—only that the implementer has not yet confirmed the code path. The canonical file path is **`crates/worker/src/git_ops.rs`** in the **implementation** monorepo ([docs/README — Repository layout](README.md#repository-layout)).
+
+## Problem
+
+When the worker clones a repo over HTTP/HTTPS using libgit2 (via the Rust `git2` crate), clone or push can fail with:
+
+```text
+clone failed: too many redirects or authentication replays; class=Http (34)
+```
+
+This happens when:
+
+1. **Redirects**: The server responds with HTTP redirects (e.g. HTTP→HTTPS, or through a load balancer/CDN). libgit2 follows redirects but has an internal limit; if the credential callback is invoked again on each redirect, it counts as "authentication replays" and triggers the error.
+2. **Credential callback only**: If credentials are supplied only via a `RemoteCallbacks::credentials` callback (and not in the URL), libgit2 may call the callback again after each redirect. Multiple redirects or auth challenges then hit the replay limit.
+
+## Required solution (do not regress)
+
+The worker **must** implement all of the following. In the standard monorepo, implementation lives in **`crates/worker/src/git_ops.rs`** (or an equivalent module if renamed—keep behavior identical).
+
+### 1. Embed the token in the clone URL (HTTP and HTTPS)
+
+- For both `http://` and `https://` repo URLs, build a URL that includes the token in the authority so that the **first** request and any **redirected** request carry credentials without re-invoking the callback.
+- Format: `{scheme}://git:{ENCODED_TOKEN}@{host}{path}`
+  Example: `https://git:ghp_xxxx%40encoded@github.com/org/repo.git`
+- Use username **`git`** for GitHub; **`oauth2`** for **gitlab.com** (and `*.gitlab.com`) with a PAT — GitLab's documented HTTPS form. Self‑hosted or other hosts: set **`REMOTE_HARNESS_GIT_HTTPS_USER`** if needed. The password is the token.
+- If the repo URL already contains a user (e.g. from a previous embed), strip it and use only the host part before re-embedding (e.g. take the segment after the last `@` in the authority).
+
+### 2. URL-encode the token
+
+- Tokens can contain characters that are invalid or meaningful in a URL (e.g. `@`, `/`, `%`, `#`, `?`). The token **must** be percent-encoded when placed in the URL.
+- Use a single, consistent encoding (e.g. `urlencoding::encode` in Rust) for the token segment only. Do not double-encode.
+- Do not encode the rest of the URL (scheme, host, path) beyond the token.
+
+### 3. Follow redirects at all stages (fetch and push)
+
+- libgit2's default is to follow redirects only on the **initial** request. Multi-step redirects (e.g. HTTP→HTTPS then to a CDN) can still trigger "too many redirects" or replay limits.
+- Set **fetch** options: `FetchOptions::follow_redirects(RemoteRedirect::All)` for all clone operations.
+- Set **push** options: `PushOptions::follow_redirects(RemoteRedirect::All)` for all push operations.
+
+### 4. Set a credential callback in addition to URL embedding
+
+- Some servers or redirect targets do not receive or use credentials from the URL (e.g. redirect to another host strips them), and libgit2 then reports "remote authentication required but no callback set". So **always** set `RemoteCallbacks::credentials` that returns `Cred::userpass_plaintext("git", token)` for fetch (and push). The URL embedding still helps by satisfying the first request and same-URL redirects without invoking the callback; the callback covers redirects or 401s where URL credentials are not used.
+- If you see "too many redirects or authentication replays" again, the cause may be an unusually long redirect chain or a server that repeatedly challenges auth; keep `follow_redirects(RemoteRedirect::All)` and URL embedding; consider checking the repo URL (avoid unnecessary redirects) or the git host's docs.
+
+## Implementation checklist
+
+- [ ] **Embed token in URL** (`embed_token_into_url`): For `http://` and `https://` URLs, produce `scheme://git:{percent_encoded_token}@{host}{path}`; strip any existing `user@` from the authority before adding `git:token@`.
+- [ ] **Token encoding**: Use URL percent-encoding for the token only (e.g. `urlencoding::encode(git_token)` in Rust).
+- [ ] **FetchOptions**: Every clone path uses `fetch_opts.follow_redirects(RemoteRedirect::All)` and sets `remote_callbacks.credentials` to return the same token (so redirects that lose URL credentials still get auth).
+- [ ] **PushOptions**: Every push path uses `push_opts.follow_redirects(RemoteRedirect::All)` and sets credentials callback (push uses the same token).
+- [ ] **Credentials callback**: Always set for fetch and push when a git token is used (required for "remote authentication required" when URL creds are not sent on redirect).
+
+## References
+
+- libgit2: [git_remote_redirect_t](https://libgit2.org/docs/reference/main/remote/) — `GIT_REMOTE_REDIRECT_INITIAL` (default) vs `GIT_REMOTE_REDIRECT_ALL`.
+- git2 crate: [FetchOptions::follow_redirects](https://docs.rs/git2/latest/git2/struct.FetchOptions.html), [PushOptions::follow_redirects](https://docs.rs/git2/latest/git2/struct.PushOptions.html), [RemoteRedirect](https://docs.rs/git2/latest/git2/enum.RemoteRedirect.html).
+- Error: `class=Http (34)` corresponds to libgit2's HTTP "too many redirects or authentication replays" condition.
+
+=== crates/worker/src/main.rs (before modification) ===
+mod api_client;
+mod config;
+
+use std::sync::Arc;
+
+use tokio::signal;
+use tokio::sync::{watch, Mutex};
+use tracing_subscriber::EnvFilter;
+
+use api_types::{
+    HeartbeatRequest, RegisterWorkerRequest, TaskCompleteRequest, TaskCompleteStatus, WorkerId,
+    WorkerStatus,
+};
+
+use crate::api_client::{with_retry, ApiClientError, ControlPlaneClient};
+use crate::config::WorkerConfig;
+
+struct WorkerState {
+    worker_id: String,
+    client: ControlPlaneClient,
+    config: WorkerConfig,
+    current_job_id: Arc<Mutex<Option<String>>>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Init tracing: JSON to stdout
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .json()
+        .init();
+
+    tracing::info!("worker starting");
+
+    let config = WorkerConfig::load()?;
+    tracing::info!(
+        control_plane_url = %config.control_plane_url,
+        heartbeat_interval = config.heartbeat_interval_secs,
+        poll_interval = config.poll_interval_secs,
+        "configuration loaded"
+    );
+
+    let client = ControlPlaneClient::new(&config.control_plane_url, &config.api_key)?;
+
+    let worker_id = config.resolved_worker_id();
+    let host = config.resolved_host();
+    let labels = config.resolved_labels();
+
+    tracing::info!(worker_id = %worker_id, host = %host, labels = ?labels, "worker identity");
+
+    // Register with control plane
+    let worker_id = register(&client, &worker_id, &host, &labels).await?;
+    tracing::info!(worker_id = %worker_id, "registered with control plane");
+
+    // Shutdown signal
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let state = Arc::new(WorkerState {
+        worker_id: worker_id.clone(),
+        client: client.clone(),
+        config: config.clone(),
+        current_job_id: Arc::new(Mutex::new(None)),
+    });
+
+    // Spawn heartbeat loop
+    let heartbeat_state = state.clone();
+    let mut heartbeat_shutdown = shutdown_rx.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        heartbeat_loop(heartbeat_state, &mut heartbeat_shutdown).await;
+    });
+
+    // Spawn poll loop
+    let poll_state = state.clone();
+    let mut poll_shutdown = shutdown_rx.clone();
+    let poll_handle = tokio::spawn(async move {
+        poll_loop(poll_state, &mut poll_shutdown).await;
+    });
+
+    // Wait for shutdown signal
+    shutdown_signal().await;
+    tracing::info!("shutdown signal received, stopping...");
+    let _ = shutdown_tx.send(true);
+
+    // Wait for loops to finish
+    let _ = tokio::join!(heartbeat_handle, poll_handle);
+
+    tracing::info!("worker stopped");
+    Ok(())
+}
+
+async fn register(
+    client: &ControlPlaneClient,
+    worker_id: &str,
+    host: &str,
+    labels: &[String],
+) -> anyhow::Result<String> {
+    let request = RegisterWorkerRequest {
+        id: WorkerId::from_string(worker_id),
+        host: host.to_string(),
+        labels: Some(labels.to_vec()),
+        capabilities: None,
+        client_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    };
+
+    let resp = with_retry(5, || async {
+        client.register(&request).await
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to register: {}", e))?;
+
+    Ok(resp.worker_id.0)
+}
+
+async fn heartbeat_loop(state: Arc<WorkerState>, shutdown: &mut watch::Receiver<bool>) {
+    let interval = tokio::time::Duration::from_secs(state.config.heartbeat_interval_secs);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            _ = shutdown.changed() => {
+                tracing::info!("heartbeat loop shutting down");
+                return;
+            }
+        }
+
+        if *shutdown.borrow() {
+            return;
+        }
+
+        let current_job = state.current_job_id.lock().await.clone();
+        let status = if current_job.is_some() {
+            WorkerStatus::Busy
+        } else {
+            WorkerStatus::Idle
+        };
+
+        let request = HeartbeatRequest {
+            status,
+            current_job_id: current_job.map(|id| api_types::JobId::from_string(id)),
+        };
+
+        match state.client.heartbeat(&state.worker_id, &request).await {
+            Ok(()) => {
+                tracing::debug!("heartbeat sent");
+            }
+            Err(ApiClientError::WorkerNotFound) => {
+                tracing::warn!("worker not found on heartbeat — re-registering");
+                match register(
+                    &state.client,
+                    &state.worker_id,
+                    &state.config.resolved_host(),
+                    &state.config.resolved_labels(),
+                )
+                .await
+                {
+                    Ok(new_id) => {
+                        tracing::info!(worker_id = %new_id, "re-registered successfully");
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "failed to re-register");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(%e, "heartbeat failed");
+            }
+        }
+    }
+}
+
+async fn poll_loop(state: Arc<WorkerState>, shutdown: &mut watch::Receiver<bool>) {
+    let interval = tokio::time::Duration::from_secs(state.config.poll_interval_secs);
+
+    loop {
+        if *shutdown.borrow() {
+            tracing::info!("poll loop shutting down");
+            return;
+        }
+
+        match state.client.pull_task(&state.worker_id).await {
+            Ok(Some(task)) => {
+                tracing::info!(
+                    task_id = %task.task_id,
+                    session_id = %task.session_id,
+                    job_id = %task.job_id,
+                    workflow = ?task.workflow,
+                    "received task"
+                );
+
+                // Set current job
+                *state.current_job_id.lock().await = Some(task.job_id.0.clone());
+
+                // Stub executor: log and complete as success
+                tracing::info!(task_id = %task.task_id, "executing task (stub — completing immediately)");
+
+                let complete_request = TaskCompleteRequest {
+                    status: TaskCompleteStatus::Completed,
+                    worker_id: WorkerId::from_string(&state.worker_id),
+                    branch: None,
+                    commit_ref: None,
+                    mr_title: None,
+                    mr_description: None,
+                    error_message: None,
+                    output: Some("stub: task completed by worker".to_string()),
+                    sentinel_reached: None,
+                    assistant_reply: None,
+                };
+
+                match state
+                    .client
+                    .complete_task(task.task_id.as_str(), &complete_request)
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(task_id = %task.task_id, "task completed");
+                    }
+                    Err(e) => {
+                        tracing::error!(task_id = %task.task_id, %e, "failed to complete task");
+                    }
+                }
+
+                // Clear current job
+                *state.current_job_id.lock().await = None;
+
+                // Don't wait between tasks if there might be more
+                continue;
+            }
+            Ok(None) => {
+                tracing::debug!("no tasks available");
+            }
+            Err(e) => {
+                tracing::warn!(%e, "failed to pull task");
+            }
+        }
+
+        // Wait before next poll
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {},
+            _ = shutdown.changed() => {
+                tracing::info!("poll loop shutting down");
+                return;
+            }
+        }
+    }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install ctrl+c handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_worker_state_creation() {
+        // Verify we can construct the types used in main
+        let _req = RegisterWorkerRequest {
+            id: WorkerId::from_string("test-worker"),
+            host: "test-host".to_string(),
+            labels: Some(vec!["platform=macos".to_string()]),
+            capabilities: None,
+            client_version: Some("0.1.0".to_string()),
+        };
+    }
+
+    #[test]
+    fn test_heartbeat_request_variants() {
+        let idle = HeartbeatRequest {
+            status: WorkerStatus::Idle,
+            current_job_id: None,
+        };
+        assert_eq!(idle.status, WorkerStatus::Idle);
+
+        let busy = HeartbeatRequest {
+            status: WorkerStatus::Busy,
+            current_job_id: Some(api_types::JobId::from_string("job-1")),
+        };
+        assert_eq!(busy.status, WorkerStatus::Busy);
+    }
+
+    #[test]
+    fn test_complete_request_stub() {
+        let req = TaskCompleteRequest {
+            status: TaskCompleteStatus::Completed,
+            worker_id: WorkerId::from_string("w-1"),
+            branch: None,
+            commit_ref: None,
+            mr_title: None,
+            mr_description: None,
+            error_message: None,
+            output: Some("stub: done".to_string()),
+            sentinel_reached: None,
+            assistant_reply: None,
+        };
+        assert_eq!(req.status, TaskCompleteStatus::Completed);
+    }
+}
+
+=== crates/worker/Cargo.toml (before modification) ===
+[package]
+name = "worker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-types = { path = "../api-types" }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+git2 = "0.19"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+hostname = "0.4"
+rand = "0.8"
+dirs = "5"
+
+=== crates/worker/src/config.rs (read by explore agent) ===
+Configuration module with WorkerConfig::load(), resolved_worker_id(), resolved_host(), resolved_labels(), detect_platform(), parse_labels_from_env().
+Config sources: env > config file > defaults.
+Required: REMOTE_HARNESS_URL/CONTROL_PLANE_URL, REMOTE_HARNESS_API_KEY/API_KEY.
+Optional: WORKER_ID, WORKER_HOST, WORKER_LABELS, HEARTBEAT_INTERVAL_SECS, POLL_INTERVAL_SECS, LOG_DIR, REMOTE_HARNESS_CONFIG.
+
+=== crates/worker/src/api_client.rs (read by explore agent) ===
+ControlPlaneClient with methods: register, heartbeat, pull_task, send_logs, complete_task.
+ApiClientError enum: WorkerNotFound, ServerError, RequestFailed, Other.
+with_retry function for exponential backoff retries.
+
+=== api-types crate (read by explore agent) ===
+Key types: SessionId, JobId, WorkerId, TaskId, PullTaskResponse, TaskCompleteRequest, TaskInput, WorkflowType, BranchMode, AgentCli, etc.
+PullTaskResponse contains: task_id, session_id, job_id, repo_url, ref_, workflow, params, input, git_token, agent_token, agent_cli, model, branch_mode, prompt_context.
+TaskCompleteRequest contains: status, worker_id, branch, commit_ref, mr_title, mr_description, error_message, output, sentinel_reached, assistant_reply.
+
+== CHANGES MADE ==
+
+### 1. crates/worker/Cargo.toml
+Added dependencies:
+- `urlencoding = "2"` — for percent-encoding git tokens in URLs
+- `tempfile = "3"` — for test temp directories
+
+### 2. crates/worker/src/main.rs
+Added module declaration:
+```rust
+pub mod git_ops;
+```
+
+### 3. crates/worker/src/git_ops.rs (NEW FILE)
+Created the complete git operations module with:
+
+**Functions:**
+- `https_username_for_host(host) -> String` — Returns "git" for GitHub, "oauth2" for *.gitlab.com, or env override via REMOTE_HARNESS_GIT_HTTPS_USER
+- `embed_token_into_url(repo_url, git_token) -> Result<String>` — Builds token-embedded HTTPS URL, strips existing user info, percent-encodes token
+- `make_credentials_callbacks(git_token) -> RemoteCallbacks` — Creates credential callback returning Cred::userpass_plaintext
+- `make_fetch_options(git_token) -> FetchOptions` — Creates FetchOptions with RemoteRedirect::All and credential callback
+- `clone_repo(repo_url, ref_, git_token, work_dir) -> Result<Repository>` — Clones with token-embedded URL + credential callback + redirect following
+- `checkout_or_create_branch(repo, branch_name, from_ref) -> Result<()>` — Checks out existing or creates new branch from HEAD
+- `commit_changes(repo, message) -> Result<Oid>` — Stages all changes (add -A) and commits with configurable author
+- `make_signature() -> Signature` — Builds signature from GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL env or defaults to "Remote Harness <harness@local>"
+- `push_to_remote(repo, branch, git_token) -> Result<()>` — Pushes with token-embedded URL + credential callback + RemoteRedirect::All
+- `create_work_dir(task_id) -> Result<PathBuf>` — Creates /tmp/harness-{task_id}/ directory
+- `cleanup_work_dir(path)` — Removes work directory, logs warning on failure
+
+**Tests (all pass):**
+- test_embed_github_https — Basic GitHub HTTPS URL embedding
+- test_embed_http — HTTP (non-HTTPS) URL embedding
+- test_embed_gitlab_uses_oauth2 — GitLab uses oauth2 username
+- test_embed_gitlab_subdomain — GitLab subdomains also use oauth2
+- test_embed_strips_existing_user — Strips user@ before re-embedding
+- test_embed_strips_existing_user_pass — Strips user:pass@ before re-embedding
+- test_embed_special_chars_encoded — Token with @, /, %, # is properly percent-encoded and round-trips
+- test_embed_ssh_passthrough — SSH URLs are returned unchanged
+- test_embed_no_path — URL without path works
+- test_embed_env_override — REMOTE_HARNESS_GIT_HTTPS_USER env var overrides username
+- test_create_and_cleanup_work_dir — Creates and removes temp dir
+- test_cleanup_nonexistent_is_noop — No panic on missing dir
+- test_commit_and_branch_in_local_repo — Full flow: bare repo → clone → create branch → write file → commit → verify
+- test_checkout_existing_branch — Create and checkout branches
+- test_make_fetch_options_does_not_panic — FetchOptions construction
+- test_make_credentials_callbacks_does_not_panic — Callback construction
+
+**GIT_CLONE_SPEC.md compliance:**
+✅ Embed token in URL (embed_token_into_url)
+✅ Token encoding (urlencoding::encode for token only)
+✅ FetchOptions with follow_redirects(RemoteRedirect::All) + credentials callback
+✅ PushOptions with follow_redirects(RemoteRedirect::All) + credentials callback
+✅ Credentials callback always set for both fetch and push
+
+== BUILD OUTPUT ==
+cargo build -p worker: SUCCESS (1 warning fixed — unused mut)
+cargo build --workspace: SUCCESS (pre-existing warnings only, none from git_ops.rs)
+cargo test -p worker: 30 tests passed, 0 failed
+
+== TEST OUTPUT ==
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s

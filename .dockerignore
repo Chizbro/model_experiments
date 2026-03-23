@@ -1,0 +1,12 @@
+target/
+web/node_modules/
+web/dist/
+.git/
+.env
+.env.*
+logs/
+plan/
+docs/
+prompts/
+*.md
+.DS_Store

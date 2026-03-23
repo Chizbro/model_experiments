@@ -1,0 +1,1087 @@
+================================================================================
+CONTEXT DUMP: 05-api-key-auth
+Date: 2026-03-21
+Feature: API Key Auth System
+Status: COMPLETE
+================================================================================
+
+## TASK DESCRIPTION (from plan/05-api-key-auth-complete.md)
+
+# 05 - API Key Auth System
+
+## Goal
+Implement the full API key lifecycle (bootstrap, create, list, revoke) and the auth middleware that protects all authenticated endpoints. This is auth concern 1 (control plane auth) — completely separate from Git/agent tokens.
+
+## What to build
+
+### Auth middleware (`crates/server/src/middleware/auth.rs`)
+- Extract API key from `Authorization: Bearer <key>` or `X-API-Key: <key>` header
+- Check against: (1) env-based keys from `API_KEY`/`API_KEYS` config, (2) DB-issued keys (hash comparison)
+- Hash incoming key with SHA-256 and compare to stored `key_hash` in `api_keys` table
+- Return `401 { "error": { "code": "unauthorized", "message": "..." } }` on failure
+- Apply to all routes except: `/health`, `/ready`, `/health/idle`, `/auth/*`, `/api-keys/bootstrap`
+
+### API key routes (`crates/server/src/routes/api_keys.rs`)
+
+**POST /api-keys/bootstrap**
+- No auth required
+- Check if ANY keys exist (env + DB). If yes, return `403 { "code": "forbidden", "message": "Keys already exist" }`
+- Generate random key, hash it, store hash in DB, return plain key once
+- Response: `201 { "id", "key", "label", "created_at" }`
+
+**POST /api-keys** (authenticated)
+- Generate random key (e.g. `rh_` prefix + 32 random bytes base62)
+- Store SHA-256 hash in `api_keys` table
+- Return plain key in response (only time it's shown)
+- Response: `201 { "id", "key", "label", "created_at" }`
+
+**GET /api-keys** (authenticated)
+- Paginated list of keys (id, label, created_at — no secret)
+- Response: `200 { "items": [...], "next_cursor": ... }`
+
+**DELETE /api-keys/:id** (authenticated)
+- Delete key from DB. `204` on success, `404` if not found.
+- Key stops working immediately.
+
+### Key generation utility
+- Generate cryptographically random keys with recognizable prefix (e.g. `rh_...`)
+- SHA-256 hashing function for storage
+
+## Dependencies
+- Task 04 (server foundation — axum router, DB pool, error handling)
+
+## Test criteria
+- [x] Without any keys configured: `POST /api-keys/bootstrap` returns `201` with a key
+- [x] After bootstrap: `POST /api-keys/bootstrap` returns `403`
+- [x] Authenticated request with valid key returns `200`
+- [x] Request with invalid/missing key returns `401`
+- [x] `POST /api-keys` creates a new key (returned once)
+- [x] `GET /api-keys` lists keys without secrets
+- [x] `DELETE /api-keys/:id` revokes key, subsequent auth with that key returns `401`
+- [x] Env-based `API_KEY` works without any DB keys
+- [x] Both `Authorization: Bearer` and `X-API-Key` headers accepted
+- [x] Integration tests for the full key lifecycle
+- [x] `cargo test -p server` passes
+
+================================================================================
+
+## REFERENCE DOCS READ
+
+### docs/TECH_STACK.md (full contents)
+
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API (e.g. `POST /workers/tasks/pull` or long-poll). No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. No "files vs DB" choice for central—it's always DB.  | Structured JSON; index by session_id, job_id, timestamp. Later: ClickHouse/Loki/Elasticsearch for scale. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+**Default:** **Rust** + **PostgreSQL** (task queue in DB). **SSE** for real-time streams in v1.
+
+---
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. Communicates with control plane via **REST** (register, heartbeat, pull task, logs, complete)—no need to share code with the server. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | The **main** agent work runs in those CLIs (not a first-party model API). The control plane stores the user's **agent** token; the worker runs the CLI in the clone. The worker may also run a **short auxiliary** model/CLI step for branch/MR messaging before or after the main run (see [Architecture §9](ARCHITECTURE.md#9-git-integration-workers)). See [Product: BYOL](PRODUCT.md#bring-your-own-licence-byol). v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. Mature; good support for credential callbacks (HTTPS + token). See [Git auth](#git-auth-github--gitlab) below. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. Optional later: Docker per job. | Containers (Docker/Podman) from day one if you need strong isolation |
+
+**Rust worker crates (suggested):** `tokio` (async runtime), `reqwest` (HTTP to control plane), `serde` / `serde_json` (contracts), `git2`, `tracing` (structured logs), `anyhow` / `thiserror` (errors). Worker runs Claude Code or Cursor CLI (subprocess) with user's token for the **main agent run**. v1: workers do **not** open WebSocket/SSE to the control plane—logs are **batched via HTTPS POST** ([API_OVERVIEW](API_OVERVIEW.md)).
+
+Workers need: **control plane URL** (env/config), **auth token** (API key or mTLS), **optional labels** (e.g. `gpu=true`, `env=staging`).
+
+### Git auth (GitHub / GitLab)
+
+Git operations target **GitHub** and **GitLab**. Auth is platform-managed; workers never perform login.
+
+- **Sign-in:** Users sign in to GitHub/GitLab via the platform (OAuth in Web UI or CLI). The **control plane** stores and refreshes tokens (OAuth refresh or PAT).
+- **Credentials per job:** The control plane either includes a job-scoped token in the task payload or provides an endpoint for the worker to request credentials for a repo. Workers use the token only for that job.
+- **Worker:** Receives a token and uses it for clone/push. GitHub and GitLab support HTTPS with token-as-password; the worker uses `git2` with credentials supplied by the platform (e.g. `Cred::userpass_plaintext` or credential callback)—no reliance on the host's global Git config.
+
+---
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code with control plane and workers in the same repo. | Go (Cobra), Python (Click/Typer) |
+| **Config** | **Env vars + config file** (e.g. `~/.config/remote-harness/config.yaml`) | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI ([API_OVERVIEW](API_OVERVIEW.md)). v1: SSE only. | Long-polling (fallback only) |
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+## 5. Logging (Unified)
+
+| Layer | Recommendation | Rationale |
+|-------|----------------|-----------|
+| **Format** | **Structured JSON** (e.g. `{"time":"...","level":"info","session_id":"...","job_id":"...","message":"..."}`) | Easy to parse, filter, index. |
+| **Transport from workers** | **HTTPS POST** to control plane log endpoint | Workers send log entries to the control plane; control plane aggregates and stores. No queue. |
+| **Tail API** | **SSE** (Server-Sent Events) with filters (`session_id`, `job_id`, `level`) | Same for CLI and Web. v1: SSE only; no WebSocket for log tail. |
+| **Persistence** | **Dual-write; all logs go to disk.** (1) **Local files:** Every log line is written to disk on the component that produced it (control plane → files on backend; each worker → files on that worker). (2) **Central store (PostgreSQL)** on the control plane: control plane writes its own logs and ingested worker logs to the DB so the CLI and Web UI can both show all logs from all places. If streaming or either client breaks, logs are still in files on backend or worker. See [Architecture §6](ARCHITECTURE.md#6-logging-architecture). | Retention and "retain forever" / manual delete apply to the central store. |
+
+## 6. Security & Auth (control plane only)
+
+| Area | Recommendation |
+|------|----------------|
+| **Control plane API** | API key in header (`Authorization: Bearer <key>` or `X-API-Key`) for CLI and Web. |
+| **Workers** | API key (machine token) in env or config; sent with every request to the control plane. |
+| **TLS** | All connections to the control plane over HTTPS (TLS). |
+| **Secrets** | Git credentials in control plane or env; workers receive per-job. Agent execution uses user's Claude Code / Cursor token (BYOL), stored and refreshed by control plane. |
+
+**v1: API key only.** No OIDC or mTLS in v1.
+
+### Control plane auth: configuration (API key)
+
+| Component | Where the API key is set | How it's used |
+|-----------|---------------------------|----------------|
+| **Server** | Server stores issued API keys (e.g. in DB or config). Keys are created via CLI or Web UI (e.g. `remote-harness api-key create` or Settings in UI). Server validates the key on every request. | Validates `Authorization` or `X-API-Key` header. |
+| **CLI** | **Env:** `REMOTE_HARNESS_API_KEY` (or `API_KEY`). **Config file:** `~/.config/remote-harness/config.yaml` with `api_key: <key>`. **Precedence:** CLI flag > env > config file. Document in CLI help and README. | Sent on every request to the control plane URL. |
+| **Web UI** | User enters the API key once (e.g. Login or Set API key in UI). Stored in browser **localStorage** (control plane URL and API key); logout clears them. | Sent in `Authorization: Bearer <key>` or `X-API-Key` on every API call. |
+| **Worker** | **Env:** `REMOTE_HARNESS_API_KEY` or `API_KEY`. **Config file:** e.g. `config.yaml` or `~/.config/remote-harness-worker/config.yaml` with `control_plane_url` and `api_key`. **Precedence:** env > config file (no flags for worker). Document in worker README. | Sent on every request (register, heartbeat, pull task, send logs). |
+
+## 7. Repo Layout (Rust Monorepo)
+
+```
+remote_harness/
+├── crates/
+│   ├── server/              # Control plane (axum, API, engine, sessions, logs)
+│   ├── worker/              # Worker (reqwest, git2, runs Claude Code / Cursor CLI with user token)
+│   ├── cli/                 # CLI (clap, API client, log tail)
+│   └── api-types/           # Shared: request/response types, IDs, contracts (serde)
+├── web/                     # Web UI (Vite + React)
+│   ├── src/
+│   └── package.json
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── TECH_STACK.md
+│   └── PRODUCT.md
+├── Cargo.toml               # Workspace root
+├── Cargo.lock
+├── Dockerfile               # Build and run control plane / services with Docker
+├── docker-compose.yml       # Compose for server, DB, and optional worker/UI
+└── README.md
+```
+
+## 8. Summary Table
+
+| Component | Stack |
+|-----------|-----------------|
+| Control plane | **Rust** (axum, tokio, sqlx), REST + **SSE**, PostgreSQL (task queue in DB) |
+| Workers | **Rust** (tokio, reqwest, git2); agent via **Claude Code or Cursor CLI** (BYOL—user's token) |
+| CLI | **Rust** (clap), SSE for tail and attach, shares `api-types` with server |
+| Web UI | React + TypeScript, Vite, TanStack Query, SSE for log/session stream |
+| Logging | JSON; dual-write (local files + central DB); SSE for tail; retention and manual delete on central store |
+| Auth | API key (CLI, Web, workers); TLS for all connections |
+
+================================================================================
+
+## EXISTING CODEBASE STATE (PRE-IMPLEMENTATION)
+
+### plan/ directory listing (sorted ascending):
+01-repo-scaffolding-complete.md
+02-api-types-design-complete.md
+03-database-schema-complete.md
+04-server-foundation-complete.md
+05-api-key-auth-pending.md  <-- THIS TASK
+06-identity-credentials-pending.md
+07-git-oauth-flows-pending.md
+08-worker-registration-heartbeat-pending.md
+09-session-job-state-machine-pending.md
+10-task-dispatch-completion-pending.md
+11-log-ingestion-storage-pending.md
+12-log-sse-streaming-pending.md
+13-worker-foundation-pending.md
+14-worker-git-operations-pending.md
+15-worker-agent-cli-execution-pending.md
+16-worker-task-lifecycle-logging-pending.md
+17-chat-workflow-pending.md
+18-loop-workflows-pending.md
+19-pr-mr-creation-pending.md
+20-cli-foundation-pending.md
+21-cli-commands-pending.md
+22-web-ui-foundation-pending.md
+23-web-ui-settings-auth-pending.md
+24-web-ui-dashboard-sessions-pending.md
+25-web-ui-workers-logs-pending.md
+26-personas-pending.md
+27-docker-deployment-pending.md
+28-ci-pipeline-pending.md
+29-e2e-integration-tests-pending.md
+
+### Existing Database Schema (migrations/20240101000001_initial_schema.sql)
+
+-- Initial schema for Remote Harness v1
+
+-- API Keys
+CREATE TABLE api_keys (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key_hash TEXT NOT NULL,
+    label TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Identities
+CREATE TABLE identities (
+    id TEXT PRIMARY KEY DEFAULT 'default',
+    agent_token TEXT,
+    git_token TEXT,
+    refresh_token TEXT,
+    token_expires_at TIMESTAMPTZ,
+    git_provider TEXT,
+    git_base_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Personas
+CREATE TABLE personas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Workers
+CREATE TABLE workers (
+    id TEXT PRIMARY KEY,
+    host TEXT NOT NULL,
+    labels JSONB NOT NULL DEFAULT '{}',
+    capabilities JSONB NOT NULL DEFAULT '[]',
+    client_version TEXT,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Sessions
+CREATE TABLE sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    repo_url TEXT NOT NULL,
+    ref TEXT NOT NULL DEFAULT 'main',
+    workflow TEXT NOT NULL,
+    params JSONB NOT NULL DEFAULT '{}',
+    persona_id UUID REFERENCES personas(id),
+    identity_id TEXT NOT NULL DEFAULT 'default' REFERENCES identities(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    retain_forever BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Jobs
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    worker_id TEXT REFERENCES workers(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    task_input JSONB NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    branch TEXT,
+    commit_ref TEXT,
+    mr_title TEXT,
+    mr_description TEXT,
+    pull_request_url TEXT,
+    output TEXT,
+    sentinel_reached BOOLEAN DEFAULT false,
+    assistant_reply TEXT,
+    reclaim_count INTEGER NOT NULL DEFAULT 0,
+    assigned_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Logs
+CREATE TABLE logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    job_id UUID REFERENCES jobs(id) ON DELETE CASCADE,
+    worker_id TEXT,
+    level TEXT NOT NULL DEFAULT 'info',
+    source TEXT NOT NULL DEFAULT 'control_plane',
+    message TEXT NOT NULL,
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Indexes
+CREATE INDEX idx_logs_session_timestamp ON logs (session_id, timestamp);
+CREATE INDEX idx_logs_job_timestamp ON logs (job_id, timestamp);
+CREATE INDEX idx_jobs_session_id ON jobs (session_id);
+CREATE INDEX idx_jobs_status ON jobs (status);
+CREATE INDEX idx_jobs_worker_status ON jobs (worker_id, status);
+CREATE INDEX idx_workers_last_seen ON workers (last_seen_at);
+CREATE INDEX idx_sessions_status_created ON sessions (status, created_at);
+
+-- Seed default identity
+INSERT INTO identities (id) VALUES ('default');
+
+### Existing api-types/src/api_keys.rs (pre-existing shared types)
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::ids::ApiKeyId;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyResponse {
+    pub id: ApiKeyId,
+    pub key: String,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeySummary {
+    pub id: ApiKeyId,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+}
+
+### Existing api-types/src/ids.rs
+
+Uses macro: id_type!(ApiKeyId); among others (SessionId, JobId, WorkerId, TaskId, PersonaId, IdentityId)
+
+### Existing api-types/src/common.rs
+
+PaginatedResponse<T> { items: Vec<T>, next_cursor: Option<String> }
+
+### Existing server/src/config.rs
+
+Config struct reads:
+- DATABASE_URL (default: postgres://harness:harness@localhost:5432/remote_harness)
+- PORT (default: 3000)
+- CORS_ALLOWED_ORIGINS (default: *)
+- API_KEY or API_KEYS (comma-separated, stored in api_keys: Vec<String>)
+- WORKER_STALE_SECONDS (default: 90)
+- MAX_JOB_RECLAIMS (default: 3)
+- JOB_LEASE_SECONDS (default: 0)
+- LOG_RETENTION_DAYS (default: 7)
+- CHAT_HISTORY_MAX_TURNS (default: 50)
+
+### Existing server/src/state.rs
+
+AppState { pool: PgPool, config: Config, log_tx: broadcast::Sender<String> }
+
+### Existing server/src/error.rs (pre-implementation)
+
+AppError with constructors: bad_request, unauthorized, not_found, conflict, internal
+Implements IntoResponse (JSON error format) and From<sqlx::Error>
+
+### Existing server/src/routes/
+
+Only health.rs with: health(), ready(), idle()
+
+### Existing server/src/main.rs (pre-implementation)
+
+Build router with health routes only, CORS, TraceLayer. No auth middleware.
+
+### docker-compose.yml
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: harness
+      POSTGRES_DB: remote_harness
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+================================================================================
+
+## IMPLEMENTATION DETAILS
+
+### Files Created
+
+1. **crates/server/src/lib.rs** — New library entry point (extracted from main.rs)
+   - Re-exports config, error, middleware, routes, state modules
+   - Contains build_router() with public/authenticated route split
+   - Contains fallback() and build_cors() functions
+
+2. **crates/server/src/middleware/mod.rs** — Module declaration
+   - `pub mod auth;`
+
+3. **crates/server/src/middleware/auth.rs** — Auth middleware
+   - `hash_api_key(key: &str) -> String` — SHA-256 hash to hex
+   - `extract_api_key(req: &Request) -> Option<String>` — extracts from Authorization: Bearer or X-API-Key headers
+   - `require_auth(State, Request, Next) -> Result<Response, (StatusCode, Json)>` — axum middleware fn
+   - Checks env-based keys first (plain text), then DB-issued keys (hash comparison)
+
+4. **crates/server/src/routes/api_keys.rs** — API key CRUD routes
+   - `generate_api_key() -> String` — rh_ prefix + 32 random bytes as hex
+   - `bootstrap(State) -> Result<201, AppError>` — creates first key, 403 if keys exist
+   - `create_api_key(State, Json<CreateApiKeyRequest>) -> Result<201, AppError>` — authenticated
+   - `list_api_keys(State, Query<ListApiKeysQuery>) -> Result<Json<PaginatedResponse>, AppError>` — paginated, no secrets
+   - `delete_api_key(State, Path<id>) -> Result<204, AppError>` — revoke key
+
+5. **crates/server/tests/api_keys_test.rs** — 14 integration tests
+   - setup() and setup_with_env_key() helpers
+   - All tests marked #[serial] for database isolation
+   - Tests cover: bootstrap, bootstrap rejection (DB/env), valid auth, invalid auth, missing auth,
+     create key, list keys (no secrets), delete + revoke, env key, X-API-Key header,
+     health no-auth, 404 on nonexistent delete, full lifecycle
+
+### Files Modified
+
+1. **crates/server/src/main.rs** — Refactored to thin binary wrapper
+   - Uses `server::config::Config`, `server::state::AppState`, `server::build_router`
+   - All logic moved to lib.rs
+
+2. **crates/server/src/error.rs** — Added `forbidden()` constructor
+   - StatusCode::FORBIDDEN, code: "forbidden"
+
+3. **crates/server/src/routes/mod.rs** — Added `pub mod api_keys;`
+
+4. **crates/server/Cargo.toml** — Added dependencies:
+   - sha2 = "0.10" (SHA-256 hashing)
+   - rand = "0.8" (key generation)
+   - chrono = "0.4" with serde (timestamps)
+   - [dev-dependencies]: tower with "util", hyper, http-body-util, serial_test
+
+### Architecture Decisions
+
+1. **Lib + binary split**: Extracted server logic into lib.rs so integration tests can import `server::build_router`. Main.rs is a thin wrapper that just sets up tracing, database, and starts listening.
+
+2. **Route grouping for auth**: Used axum's Router::merge() pattern — public routes (health, bootstrap) in one router, authenticated routes (api-key CRUD) in another with middleware layer applied only to authenticated routes.
+
+3. **Key format**: `rh_` prefix + 64 hex chars (32 random bytes). Initially tried base62 encoding but the `base62` crate only accepts u128, so used hex encoding instead.
+
+4. **Middleware approach**: Used `axum::middleware::from_fn_with_state` for the auth middleware, which integrates cleanly with axum's layered architecture.
+
+5. **Test isolation**: Tests share a PostgreSQL database. Each test cleans the `api_keys` table in setup(). The `serial_test` crate ensures tests don't run concurrently.
+
+### Build & Test Results
+
+```
+$ cargo build -p server
+   Compiling server v0.1.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.68s
+
+$ cargo test -p server
+running 2 tests
+test config::tests::test_config_defaults ... ok
+test error::tests::test_error_constructors ... ok
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+running 14 tests
+test test_bootstrap_creates_key_when_none_exist ... ok
+test test_bootstrap_fails_when_db_keys_exist ... ok
+test test_bootstrap_fails_when_env_keys_exist ... ok
+test test_authenticated_request_with_valid_db_key ... ok
+test test_request_with_invalid_key_returns_401 ... ok
+test test_request_with_missing_key_returns_401 ... ok
+test test_create_api_key_authenticated ... ok
+test test_list_api_keys_no_secrets ... ok
+test test_delete_api_key_revokes_access ... ok
+test test_env_based_api_key_works ... ok
+test test_x_api_key_header_works ... ok
+test test_health_endpoints_no_auth_required ... ok
+test test_delete_nonexistent_key_returns_404 ... ok
+test test_full_key_lifecycle ... ok
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+$ cargo build  (full workspace)
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+```
+
+All 16 tests pass. Full workspace builds cleanly.
+
+================================================================================
+
+## FINAL FILE CONTENTS
+
+### crates/server/Cargo.toml
+
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+api-types = { path = "../api-types" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "uuid", "migrate"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+hyper = "1"
+http-body-util = "0.1"
+serial_test = "3"
+
+### crates/server/src/lib.rs
+
+pub mod config;
+pub mod error;
+pub mod middleware;
+pub mod routes;
+pub mod state;
+
+use axum::http::{HeaderValue, Method};
+use axum::response::IntoResponse;
+use axum::Json;
+use axum::Router;
+use serde_json::json;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
+
+use crate::config::Config;
+use crate::state::AppState;
+
+async fn fallback() -> impl IntoResponse {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": {
+                "code": "not_found",
+                "message": "Route not found"
+            }
+        })),
+    )
+}
+
+fn build_cors(config: &Config) -> CorsLayer {
+    let origins = &config.cors_allowed_origins;
+
+    let cors = if origins.len() == 1 && origins[0] == "*" {
+        CorsLayer::permissive()
+    } else {
+        let allowed: Vec<HeaderValue> = origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new().allow_origin(allowed)
+    };
+
+    cors.allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::PATCH,
+        Method::DELETE,
+        Method::OPTIONS,
+    ])
+    .allow_headers([
+        axum::http::header::AUTHORIZATION,
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderName::from_static("x-api-key"),
+    ])
+}
+
+pub fn build_router(state: AppState) -> Router {
+    let cors = build_cors(&state.config);
+
+    // Routes that require authentication
+    let authenticated = Router::new()
+        .route("/api-keys", axum::routing::post(routes::api_keys::create_api_key))
+        .route("/api-keys", axum::routing::get(routes::api_keys::list_api_keys))
+        .route("/api-keys/{id}", axum::routing::delete(routes::api_keys::delete_api_key))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth::require_auth,
+        ));
+
+    // Public routes (no auth)
+    let public = Router::new()
+        .route("/health", axum::routing::get(routes::health::health))
+        .route("/ready", axum::routing::get(routes::health::ready))
+        .route("/health/idle", axum::routing::get(routes::health::idle))
+        .route("/api-keys/bootstrap", axum::routing::post(routes::api_keys::bootstrap));
+
+    Router::new()
+        .merge(public)
+        .merge(authenticated)
+        .fallback(fallback)
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state)
+}
+
+### crates/server/src/main.rs
+
+use sqlx::postgres::PgPoolOptions;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
+
+use server::config::Config;
+use server::state::AppState;
+
+#[tokio::main]
+async fn main() {
+    let is_dev = std::env::var("RUST_LOG").is_err();
+
+    if is_dev {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("info,tower_http=debug"))
+            .with_span_events(FmtSpan::CLOSE)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .json()
+            .init();
+    }
+
+    let config = Config::from_env();
+    tracing::info!(port = config.port, "server starting");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&config.database_url)
+        .await
+        .expect("failed to connect to database");
+
+    tracing::info!("connected to database");
+
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .expect("failed to run migrations");
+
+    tracing::info!("migrations applied");
+
+    let state = AppState::new(pool, config.clone());
+    let app = server::build_router(state);
+
+    let addr = format!("0.0.0.0:{}", config.port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind");
+
+    tracing::info!("listening on {}", addr);
+
+    axum::serve(listener, app).await.expect("server error");
+}
+
+### crates/server/src/middleware/mod.rs
+
+pub mod auth;
+
+### crates/server/src/middleware/auth.rs
+
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::Response,
+};
+use sha2::{Digest, Sha256};
+
+use crate::state::AppState;
+
+/// Hash a raw API key with SHA-256 and return the hex string.
+pub fn hash_api_key(key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Extract API key from request headers.
+/// Checks `Authorization: Bearer <key>` and `X-API-Key: <key>`.
+fn extract_api_key(req: &Request) -> Option<String> {
+    // Try Authorization: Bearer <key>
+    if let Some(auth) = req.headers().get("authorization") {
+        if let Ok(val) = auth.to_str() {
+            if let Some(key) = val.strip_prefix("Bearer ") {
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
+            }
+        }
+    }
+
+    // Try X-API-Key header
+    if let Some(key_header) = req.headers().get("x-api-key") {
+        if let Ok(val) = key_header.to_str() {
+            let val = val.trim();
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+/// Auth middleware that validates API keys against env-based keys and DB-issued keys.
+pub async fn require_auth(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, axum::Json<serde_json::Value>)> {
+    let key = extract_api_key(&req).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "code": "unauthorized",
+                    "message": "Missing API key"
+                }
+            })),
+        )
+    })?;
+
+    // Check env-based keys first (plain text comparison)
+    if state.config.api_keys.iter().any(|k| k == &key) {
+        return Ok(next.run(req).await);
+    }
+
+    // Check DB-issued keys (hash comparison)
+    let key_hash = hash_api_key(&key);
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM api_keys WHERE key_hash = $1)",
+    )
+    .bind(&key_hash)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(false);
+
+    if exists {
+        return Ok(next.run(req).await);
+    }
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        axum::Json(serde_json::json!({
+            "error": {
+                "code": "unauthorized",
+                "message": "Invalid API key"
+            }
+        })),
+    ))
+}
+
+### crates/server/src/routes/mod.rs
+
+pub mod api_keys;
+pub mod health;
+
+### crates/server/src/routes/api_keys.rs
+
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use chrono::{DateTime, Utc};
+use rand::Rng;
+use serde::Deserialize;
+
+use api_types::{ApiKeyId, ApiKeySummary, CreateApiKeyRequest, CreateApiKeyResponse, PaginatedResponse};
+
+use crate::error::AppError;
+use crate::middleware::auth::hash_api_key;
+use crate::state::AppState;
+
+/// Generate a cryptographically random API key with `rh_` prefix.
+/// Uses 32 random bytes encoded as hex (64 chars).
+fn generate_api_key() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 32] = rng.gen();
+    let encoded: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("rh_{encoded}")
+}
+
+/// POST /api-keys/bootstrap — create the first API key (no auth required).
+pub async fn bootstrap(
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, AppError> {
+    // Check if ANY keys exist (env + DB)
+    if !state.config.api_keys.is_empty() {
+        return Err(AppError::forbidden("Keys already exist"));
+    }
+
+    let db_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
+            .fetch_one(&state.pool)
+            .await?;
+
+    if db_count > 0 {
+        return Err(AppError::forbidden("Keys already exist"));
+    }
+
+    // Generate and store key
+    let raw_key = generate_api_key();
+    let key_hash = hash_api_key(&raw_key);
+    let label = "bootstrap";
+
+    let row = sqlx::query_as::<_, (sqlx::types::Uuid, DateTime<Utc>)>(
+        "INSERT INTO api_keys (key_hash, label) VALUES ($1, $2) RETURNING id, created_at",
+    )
+    .bind(&key_hash)
+    .bind(label)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let resp = CreateApiKeyResponse {
+        id: ApiKeyId::from_string(row.0.to_string()),
+        key: raw_key,
+        label: label.to_string(),
+        created_at: row.1,
+    };
+
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+/// POST /api-keys — create a new API key (authenticated).
+pub async fn create_api_key(
+    State(state): State<AppState>,
+    Json(body): Json<CreateApiKeyRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let raw_key = generate_api_key();
+    let key_hash = hash_api_key(&raw_key);
+
+    let row = sqlx::query_as::<_, (sqlx::types::Uuid, DateTime<Utc>)>(
+        "INSERT INTO api_keys (key_hash, label) VALUES ($1, $2) RETURNING id, created_at",
+    )
+    .bind(&key_hash)
+    .bind(&body.label)
+    .fetch_one(&state.pool)
+    .await?;
+
+    let resp = CreateApiKeyResponse {
+        id: ApiKeyId::from_string(row.0.to_string()),
+        key: raw_key,
+        label: body.label,
+        created_at: row.1,
+    };
+
+    Ok((StatusCode::CREATED, Json(resp)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListApiKeysQuery {
+    pub cursor: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// GET /api-keys — list API keys (no secrets).
+pub async fn list_api_keys(
+    State(state): State<AppState>,
+    Query(query): Query<ListApiKeysQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let limit = query.limit.unwrap_or(50).min(100);
+
+    let rows = if let Some(ref cursor) = query.cursor {
+        // cursor is the created_at of the last item
+        let cursor_time: DateTime<Utc> = cursor
+            .parse()
+            .map_err(|_| AppError::bad_request("Invalid cursor"))?;
+
+        sqlx::query_as::<_, (sqlx::types::Uuid, Option<String>, DateTime<Utc>)>(
+            "SELECT id, label, created_at FROM api_keys WHERE created_at < $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(cursor_time)
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    } else {
+        sqlx::query_as::<_, (sqlx::types::Uuid, Option<String>, DateTime<Utc>)>(
+            "SELECT id, label, created_at FROM api_keys ORDER BY created_at DESC LIMIT $1",
+        )
+        .bind(limit + 1)
+        .fetch_all(&state.pool)
+        .await?
+    };
+
+    let has_more = rows.len() as i64 > limit;
+    let items: Vec<ApiKeySummary> = rows
+        .into_iter()
+        .take(limit as usize)
+        .map(|(id, label, created_at)| ApiKeySummary {
+            id: ApiKeyId::from_string(id.to_string()),
+            label: label.unwrap_or_default(),
+            created_at,
+        })
+        .collect();
+
+    let next_cursor = if has_more {
+        items.last().map(|item| item.created_at.to_rfc3339())
+    } else {
+        None
+    };
+
+    Ok(Json(PaginatedResponse { items, next_cursor }))
+}
+
+/// DELETE /api-keys/:id — revoke an API key.
+pub async fn delete_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let id_uuid: sqlx::types::Uuid = id
+        .parse()
+        .map_err(|_| AppError::bad_request("Invalid API key ID"))?;
+
+    let result = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+        .bind(id_uuid)
+        .execute(&state.pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(AppError::not_found("API key not found"));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+### crates/server/src/error.rs (with forbidden added)
+
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use serde_json::json;
+
+#[derive(Debug)]
+pub struct AppError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+}
+
+impl AppError {
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "bad_request".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "conflict".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error".into(),
+            message: message.into(),
+            details: None,
+        }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let mut body = json!({
+            "error": {
+                "code": self.code,
+                "message": self.message,
+            }
+        });
+
+        if let Some(details) = self.details {
+            body["error"]["details"] = details;
+        }
+
+        (self.status, axum::Json(body)).into_response()
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        tracing::error!(?err, "database error");
+        Self::internal("Internal database error")
+    }
+}
+
+### crates/server/tests/api_keys_test.rs
+
+(Full content included above in the read output — 14 tests all passing with #[serial] annotation)
+
+================================================================================
+
+## TEST COVERAGE MATRIX
+
+| Test | Spec Criterion | Status |
+|------|---------------|--------|
+| test_bootstrap_creates_key_when_none_exist | Bootstrap returns 201 | PASS |
+| test_bootstrap_fails_when_db_keys_exist | After bootstrap, bootstrap returns 403 | PASS |
+| test_bootstrap_fails_when_env_keys_exist | Env keys block bootstrap | PASS |
+| test_authenticated_request_with_valid_db_key | Valid key returns 200 | PASS |
+| test_request_with_invalid_key_returns_401 | Invalid key returns 401 | PASS |
+| test_request_with_missing_key_returns_401 | Missing key returns 401 | PASS |
+| test_create_api_key_authenticated | POST /api-keys creates key | PASS |
+| test_list_api_keys_no_secrets | GET /api-keys lists without secrets | PASS |
+| test_delete_api_key_revokes_access | DELETE revokes, subsequent auth 401 | PASS |
+| test_env_based_api_key_works | Env API_KEY works | PASS |
+| test_x_api_key_header_works | X-API-Key header accepted | PASS |
+| test_health_endpoints_no_auth_required | Health endpoints skip auth | PASS |
+| test_delete_nonexistent_key_returns_404 | DELETE nonexistent returns 404 | PASS |
+| test_full_key_lifecycle | Full lifecycle integration | PASS |
+
+================================================================================
+END OF CONTEXT DUMP
+================================================================================

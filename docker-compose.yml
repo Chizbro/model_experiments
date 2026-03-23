@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: remote_harness
+      POSTGRES_USER: harness
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-harness_dev}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harness -d remote_harness"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      target: server-runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://harness:${POSTGRES_PASSWORD:-harness_dev}@postgres:5432/remote_harness
+      PORT: "3000"
+      RUST_LOG: ${RUST_LOG:-info}
+      API_KEY: ${API_KEY:-}
+      API_KEYS: ${API_KEYS:-}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:5173,http://localhost:3000}
+      WORKER_STALE_TIMEOUT_SECS: ${WORKER_STALE_TIMEOUT_SECS:-90}
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+      GITLAB_CLIENT_ID: ${GITLAB_CLIENT_ID:-}
+      GITLAB_CLIENT_SECRET: ${GITLAB_CLIENT_SECRET:-}
+      GITLAB_REDIRECT_URI: ${GITLAB_REDIRECT_URI:-}
+      GITLAB_BASE_URL: ${GITLAB_BASE_URL:-https://gitlab.com}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
+      REDIRECT_AFTER_AUTH: ${REDIRECT_AFTER_AUTH:-/}
+      WEB_UI_BASE_URL: ${WEB_UI_BASE_URL:-}
+    ports:
+      - "${SERVER_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker-runtime
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      REMOTE_HARNESS_URL: http://server:3000
+      REMOTE_HARNESS_API_KEY: ${API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+      WORKER_LABELS: ${WORKER_LABELS:-}
+      POLL_INTERVAL_SECS: ${POLL_INTERVAL_SECS:-5}
+      HEARTBEAT_INTERVAL_SECS: ${HEARTBEAT_INTERVAL_SECS:-30}
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./web
+    ports:
+      - "${WEB_PORT:-5173}:80"
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  pgdata:

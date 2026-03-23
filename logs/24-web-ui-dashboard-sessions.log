@@ -1,0 +1,446 @@
+== CONTEXT DUMP: 24-web-ui-dashboard-sessions ==
+== Date: 2026-03-22 ==
+
+== TASK ==
+Implement Task 24: Web UI Dashboard, Sessions & Creation
+- Dashboard / Session List (web/src/pages/Dashboard.tsx)
+- Session Detail (web/src/pages/SessionDetail.tsx)
+- Session Creation (web/src/pages/CreateSession.tsx)
+- Repo picker component
+- Real-time updates via SSE
+- CLIENT_EXPERIENCE §8 compliance for Git/PR outcome display
+
+== PLAN FILES READ ==
+
+plan/24-web-ui-dashboard-sessions-processing.md (now complete):
+# 24 - Web UI Dashboard, Sessions & Creation
+
+## Goal
+Build the main dashboard (session list), session detail page, and session creation form. This is the primary UI for managing workflows.
+
+## What to build
+
+### Dashboard / Session List (`web/src/pages/Dashboard.tsx`)
+- Fetch sessions: GET /sessions with pagination
+- Table columns: session_id (truncated), workflow type, status (badge), repo, created_at
+- Status badges: pending (yellow), running (blue), completed (green), failed (red)
+- Click row -> navigate to session detail
+- "New Session" button -> navigate to create form
+- Status filter dropdown (all, pending, running, completed, failed)
+- Auto-refresh with TanStack Query (poll every 5s for active sessions)
+
+### Session Detail (`web/src/pages/SessionDetail.tsx`)
+- Fetch: GET /sessions/:id
+- Header: session_id, workflow type, status badge, repo_url, ref, created_at
+- Jobs table: job_id | status | error_message | branch | commit_ref | PR URL | created_at
+  - `error_message` prominently displayed when set (not hidden behind "Failed")
+  - `pull_request_url` as clickable link
+  - If PR expected but missing: show explanation per CLIENT_EXPERIENCE §8
+- Actions:
+  - "Retain forever" toggle (PATCH /sessions/:id)
+  - "Delete" button with confirmation dialog (DELETE /sessions/:id)
+  - "Delete logs" button with confirmation (DELETE /sessions/:id/logs)
+- Chat input (if workflow === "chat" and session is running):
+  - Text input + "Send" button
+  - POST /sessions/:id/input
+  - Show "history_truncated" warning when applicable (per CLIENT_EXPERIENCE §12)
+- Log panel (embedded log viewer — see Task 25)
+- Session events via SSE (useSessionEvents): update status, jobs in real-time
+
+### Git & PR/MR outcome display
+- Follow CLIENT_EXPERIENCE §8 strictly:
+  - Job failed + error_message: show error prominently with action hints
+  - Job completed, no commit_ref: explain push didn't complete
+  - PR mode but no pull_request_url: show reason (job not successful / missing branch / provider error)
+  - Agent exited non-zero with commits: explain distinction
+
+### Session Creation (`web/src/pages/CreateSession.tsx`)
+- Form fields:
+  - **Repo URL**: input or repo picker (GET /identities/default/repositories)
+  - **Ref**: input (default "main")
+  - **Workflow**: dropdown (Chat, Loop N, Loop Until Sentinel)
+  - **Prompt**: textarea
+  - **Agent CLI**: dropdown (Claude Code, Cursor)
+  - **Model**: input (optional)
+  - **Branch mode**: radio (Main, PR)
+  - **Branch name prefix**: input (optional, shown when PR mode)
+  - Workflow-specific:
+    - Loop N: **N** number input
+    - Loop Until Sentinel: **Sentinel** text input
+  - **Persona**: dropdown (GET /personas, optional)
+  - **Identity**: dropdown (default "default")
+  - **Retain forever**: checkbox
+- Validation: repo_url required, prompt required, n > 0 for loop_n
+- Check credentials before submit: warn if identity missing tokens
+- POST /sessions -> navigate to session detail on success
+
+### Repo picker component
+- Dropdown/combobox that fetches repos from GET /identities/:id/repositories
+- Searchable
+- Shows full_name + sets clone_url
+
+## Dependencies
+- Task 22 (web UI foundation — routing, layout, API client, query hooks)
+- Task 09 (sessions API — server endpoints)
+
+## Test criteria
+- [ ] Dashboard loads and displays sessions in table
+- [ ] Pagination works (load more / cursor-based)
+- [ ] Status filter works
+- [ ] Session detail shows all fields correctly
+- [ ] Jobs table displays error_message, branch, commit_ref, PR URL
+- [ ] PR missing explanation shown when applicable
+- [ ] Chat input works for chat sessions
+- [ ] History truncated warning appears when flag is true
+- [ ] Retain forever toggle works
+- [ ] Delete with confirmation works
+- [ ] Session creation form validates and submits
+- [ ] Repo picker loads repos from identity
+- [ ] Real-time updates via session events SSE
+
+== DOCS READ ==
+
+docs/TECH_STACK.md:
+# Tech Stack
+
+Recommended technologies for the agentic task manager (control plane, workers, CLI, Web UI). Alternatives are noted where relevant.
+
+---
+
+## 1. Control Plane (Server) — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language / Runtime** | **Rust** | Single binary, no runtime; same language as workers and CLI for shared types and one toolchain. Strong concurrency (tokio), great for HTTP + **SSE** streaming (log tail, session events). | Go, Python (FastAPI) |
+| **API** | **REST + SSE (v1)** | REST for CRUD and worker polling; **Server-Sent Events** for log tail and session events. WebSocket is **not** part of the v1 real-time contract. | gRPC + streaming for more rigid RPC |
+| **Registry / State DB** | **PostgreSQL** or **SQLite** (dev) | Sessions, workers, jobs, inbox metadata, config. PostgreSQL for production scale. | SQLite for single-node / dev only |
+| **Task queue / dispatch** | **PostgreSQL table** | Task queue lives in a Postgres table (same DB as registry/sessions). Workers get tasks by **polling** the API. No Redis, NATS, or DB LISTEN/NOTIFY in v1. | — |
+| **Log storage** | **v1: Dual-write.** (1) Local files on each component (control plane + workers), with rotation (size or time; implementation-defined). (2) Central store = **PostgreSQL** on the control plane for all logs that reach it. | — |
+
+**Rust control-plane crates (suggested):** `axum` (HTTP + SSE), `tokio`, `sqlx` (PostgreSQL), `serde` / `serde_json`, `tracing`, `tower` (middleware).
+
+## 2. Workers (Rust)
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** | Single binary, no runtime; great for long-running workers and resource control. | Go, Python |
+| **Agent runtime** | **Claude Code or Cursor CLI** (BYOL) | v1 supports these two CLIs only. | — |
+| **Git** | **`git2`** (libgit2 bindings) | Clone, checkout, commit, push from worker. | Shell-out to `git` CLI |
+| **Execution isolation** | **Process per task** (or container later) | One clone + one agent run per process; clear cleanup. | Containers |
+
+## 3. CLI — Rust
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Language** | **Rust** (`clap`) | One binary, easy to ship; shares types and API client code | Go, Python |
+| **Config** | **Env vars + config file** | `CONTROL_PLANE_URL`, `API_KEY`; optional profile per environment. | Env only |
+| **Real-time** | **SSE** for `logs tail` and `attach` | Same endpoints as Web UI. | Long-polling |
+
+## 4. Web UI
+
+| Layer | Recommendation | Rationale | Alternatives |
+|-------|----------------|-----------|--------------|
+| **Stack** | **React** (or **Vite + React**) + **TypeScript** | Component model fits dashboards; TypeScript for API types. | Vue, Svelte |
+| **State / data** | **TanStack Query (React Query)** + **SSE** for live data | REST for sessions, workers, jobs; **SSE** for log tail and session events. | SWR, Redux + thunk |
+| **UI components** | **Tailwind CSS** + **shadcn/ui** or **Radix** | Fast, accessible, good DX. | MUI, Chakra, custom |
+| **Real-time** | **SSE** for log stream and session updates | Same as CLI. v1: SSE only for tail/attach. | Polling (fallback) |
+
+## 7. Repo Layout (Rust Monorepo)
+
+```
+remote_harness/
+├── crates/
+│   ├── server/
+│   ├── worker/
+│   ├── cli/
+│   └── api-types/
+├── web/
+│   ├── src/
+│   └── package.json
+├── docs/
+├── Cargo.toml
+├── Cargo.lock
+├── Dockerfile
+├── docker-compose.yml
+└── README.md
+```
+
+docs/CLIENT_EXPERIENCE.md:
+# Client experience (CLI & Web UI)
+
+## 1. Principles
+| Principle | Meaning |
+|-----------|---------|
+| **Same truth everywhere** | CLI and Web UI surface the same session/job state and errors from the API. |
+| **Fail loud, classify** | On failure, show a **clear message**, the server **`error.code`** when present, and whether the user can fix it. |
+| **Streaming resilience** | Log and session **SSE** streams disconnect; clients **reconnect with backoff**. |
+| **No silent CORS or network** | Distinguish **network / CORS / DNS** from **401** from **5xx**. |
+
+## 2. API errors (REST)
+### 2.1 Web UI mapping
+| Situation | What to show | Action hints |
+|-----------|----------------|--------------|
+| **`401`** | "Not authorized" + server `message` | Check Settings → API key |
+| **`400`** | Server `message` + field hints | Fix form input |
+| **`404`** | Resource missing | Link back to list view |
+| **`409`** | e.g. session not accepting input | Explain state; suggest refresh |
+| **`500`** | "Something went wrong on the server" | Retry |
+| **`503` on OAuth start** | "Sign-in is not configured on this server" | Admin must set OAuth env vars |
+
+## 5. Credentials and BYOL
+| Situation | UX |
+|-----------|-----|
+| **Session create rejected** (missing git or agent token) | Direct user to Settings → Credentials |
+| **Token health** | Use auth-status for Git expiry messaging |
+
+## 8. Git commit, push, and PR/MR outcomes
+### 8.1 Mapping API state to user-visible copy
+| Situation | Web UI / CLI requirement |
+|-----------|---------------------------|
+| **Job failed** (`failed`, `error_message` set) | Show error_message prominently; link to Settings → Credentials when auth-related |
+| **Job completed, no `commit_ref`** | Explain that push/commit did not complete; point to logs |
+| **Job completed with commit, no `pull_request_url`** when PR mode | Show one-line reason: job not successful; missing branch/title; provider not GitHub/GitLab; provider API error |
+| **Agent exited non-zero but commits may exist** | Explain job status reflects agent exit, Git may still show commits |
+
+### 8.2 Operator signals (logs)
+| Data from API | UI / CLI behavior |
+|---------------|-------------------|
+| `jobs[].error_message` | Always visible on job row when set; never hide behind "Failed" alone |
+| `jobs[].status` + `pull_request_url` | If expected MR missing after completion, show explanation per §8.1 |
+| `commit_ref` / branch fields | If missing when push expected, point to logs |
+
+## 12. Long chat sessions
+When `task_input.history_truncated` is `true`, show that only the latest N turns are sent.
+
+== EXISTING WEB UI CODEBASE ANALYSIS ==
+
+### Project Structure
+```
+web/src/
+├── App.tsx                    # Root with providers
+├── main.tsx                   # Entry
+├── router.tsx                 # Routes
+├── index.css                  # Tailwind + OkLCh theme
+├── components/
+│   ├── layout/
+│   │   ├── app-layout.tsx     # Layout with sidebar + header
+│   │   ├── connection-indicator.tsx
+│   │   ├── sidebar.tsx
+│   │   └── theme-toggle.tsx
+│   └── ui/
+│       └── button.tsx         # CVA button (Base UI + CVA)
+├── hooks/
+│   └── use-connection-status.ts
+├── lib/
+│   ├── api.ts                 # HTTP client (get/post/patch/delete/sseUrl)
+│   ├── config.ts              # Context for localStorage config
+│   ├── query.ts               # TanStack Query hooks
+│   ├── sse.ts                 # SSE hooks (useSSE, useLogStream, useSessionEvents)
+│   ├── types.ts               # TS types mirroring Rust api-types
+│   └── utils.ts               # cn() utility
+└── pages/
+    ├── dashboard.tsx          # Session list (was basic)
+    ├── new-session.tsx        # Was placeholder
+    ├── session-detail.tsx     # Session detail (was basic)
+    ├── settings.tsx           # Full settings (auth, credentials, API keys)
+    ├── settings-wrapper.tsx
+    └── workers.tsx            # Worker list
+```
+
+### Dependencies
+- react ^19.2.4, react-router-dom ^7.13.1
+- @tanstack/react-query ^5.94.5
+- @base-ui/react ^1.3.0, shadcn ^4.1.0
+- tailwindcss ^4.2.2, class-variance-authority ^0.7.1
+- lucide-react ^0.577.0
+- Vite ^8.0.1
+
+### Existing Query Hooks (lib/query.ts)
+- useHealth(), useSessions(status?), useSession(id), useWorkers()
+- useIdentity(id), useAuthStatus(id), useApiKeys(), usePersonas()
+- useCreateSession(), useDeleteSession(), useUpdateSession(id)
+- useSendInput(sessionId), useUpdateIdentity(id)
+- useCreateApiKey(), useDeleteApiKey(), useCreatePersona()
+- useDeleteWorker(), useDeleteSessionLogs(sessionId), useBootstrapApiKey()
+
+### Existing SSE Hooks (lib/sse.ts)
+- useSSE<T>(url, options) - Generic with auto-reconnect + exponential backoff
+- useLogStream(sessionId, jobId?, level?) - Log streaming (event: "log")
+- useSessionEvents(sessionId) - Session events (event: "session_event")
+
+### Existing Types (lib/types.ts)
+All ID types as opaque strings. Enums: WorkflowType, SessionStatus, WorkerStatus, etc.
+SessionSummary, SessionDetail, JobSummary, WorkerSummary, WorkerDetail, LogEntry, SessionEvent,
+IdentityStatus, AuthStatus, RepositoryInfo, RepositoryListResponse, PersonaSummary, PersonaDetail,
+ApiKeySummary, CreateSessionRequest, SendInputRequest, UpdateSessionRequest, etc.
+
+### Router (router.tsx)
+```
+/settings -> SettingsWrapper (no auth guard)
+/ -> AppLayout (checks isConfigured)
+  / -> DashboardPage (index)
+  /sessions/new -> NewSessionPage
+  /sessions/:id -> SessionDetailPage
+  /workers -> WorkersPage
+```
+
+### API Client (lib/api.ts)
+- api.get<T>(path), api.post<T>(path, body), api.patch<T>(path, body), api.delete<T>(path)
+- Auto auth header from localStorage, auto-redirect to /settings on 401
+- checkHealth(), testConnection(), checkBootstrapAvailable(), bootstrapApiKey(), checkApiKeyValid()
+
+== RUST BACKEND API CONTRACT ==
+
+### API Types (crates/api-types/src/)
+- All IDs are UUID strings
+- SessionStatus: Pending, Running, Completed, Failed
+- WorkflowType: Chat, LoopN, LoopUntilSentinel, Inbox
+- SessionParams: prompt, n, sentinel, agent_cli, model, branch_mode, branch_name_prefix
+- CreateSessionRequest: repo_url, ref?, workflow, params?, persona_id?, identity_id?, retain_forever?
+- SessionSummary: session_id, repo_url, workflow, status, created_at, updated_at?, retain_forever?
+- SessionDetail: extends SessionSummary + params, persona_id, identity_id, jobs[]
+- JobSummary: job_id, status, created_at, error_message?, pull_request_url?, branch?, commit_ref? (added in this task)
+- SendInputRequest: message
+- TaskCompleteRequest: status, worker_id, branch?, commit_ref?, mr_title?, mr_description?, error_message?, output?, sentinel_reached?, assistant_reply?
+
+### Session Routes (crates/server/src/routes/sessions.rs)
+- POST /sessions - Create session
+- GET /sessions - List sessions (?status=&cursor=&limit=50)
+- GET /sessions/:id - Get session detail with jobs
+- PATCH /sessions/:id - Update (retain_forever)
+- DELETE /sessions/:id - Delete session cascade
+- POST /sessions/:id/input - Send chat follow-up
+- GET /sessions/:id/events - SSE session events
+
+### Identity Routes
+- GET /identities/:id - Identity status (token presence)
+- GET /identities/:id/auth-status - Token health
+- GET /identities/:id/repositories?provider= - List repos
+- PATCH /identities/:id - Update identity tokens
+
+### Log Routes
+- GET /sessions/:id/logs - Get session logs paginated
+- GET /sessions/:id/logs/stream - SSE log stream
+- DELETE /sessions/:id/logs - Delete logs
+
+### Database Schema (jobs table)
+```sql
+CREATE TABLE jobs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    worker_id TEXT REFERENCES workers(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    task_input JSONB NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    branch TEXT,
+    commit_ref TEXT,
+    mr_title TEXT,
+    mr_description TEXT,
+    pull_request_url TEXT,
+    output TEXT,
+    sentinel_reached BOOLEAN DEFAULT false,
+    assistant_reply TEXT,
+    ...
+);
+```
+
+== CHANGES MADE ==
+
+### 1. Rust API Types: crates/api-types/src/sessions.rs
+- Added `branch: Option<String>` and `commit_ref: Option<String>` to `JobSummary` struct with `#[serde(skip_serializing_if = "Option::is_none")]`
+- Updated test `test_session_detail_roundtrip` to include the new fields
+
+### 2. Server SQL Query: crates/server/src/routes/sessions.rs
+- Updated the SQL query in `get_session()` to SELECT `branch` and `commit_ref` from jobs table
+- Updated the tuple destructuring from 5 fields to 7 fields: `(jid, jstatus, jcreated, jerr, jpr, jbranch, jcommit)`
+- Added `branch: jbranch` and `commit_ref: jcommit` to the `JobSummary` construction
+
+### 3. TypeScript Types: web/src/lib/types.ts
+- Added `branch?: string` and `commit_ref?: string` to `JobSummary` interface
+
+### 4. Query Hooks: web/src/lib/query.ts
+- Added `RepositoryListResponse` import
+- Added `repositories` key to `queryKeys`
+- Added `useRepositories(identityId, provider, enabled)` hook that fetches from `/identities/:id/repositories?provider=`
+
+### 5. Dashboard Page: web/src/pages/dashboard.tsx (REWRITTEN)
+- Added status filter with buttons (All, Pending, Running, Completed, Failed)
+- Passes status filter to `useSessions(statusFilter)` hook
+- Added Repo column to table (strips github.com/gitlab.com prefix for readability)
+- Changed navigation from `window.location.href` to `useNavigate()` for SPA navigation
+- Uses `<Button>` component for "New Session"
+- Shows pagination hint when `next_cursor` is present
+
+### 6. Session Detail Page: web/src/pages/session-detail.tsx (REWRITTEN)
+Full implementation with:
+- **Header**: session_id (truncated), status badge, workflow type
+- **Actions**: Retain forever toggle (PATCH), Delete session (with confirmation dialog), Delete logs (with confirmation dialog)
+- **Session info grid**: repo_url, created_at, agent_cli, model, branch_mode, persona_id
+- **Jobs table**: job_id, status badge, branch, commit_ref (truncated to 7 chars), PR link, created_at
+- **CLIENT_EXPERIENCE §8 compliance** via `JobOutcomeHint` component:
+  - Job failed + error_message: shows error prominently with credential hints for auth-related errors
+  - Job completed, no commit_ref: explains push didn't complete
+  - PR mode but no pull_request_url: explains possible reasons
+- **Chat input**: shown only for `workflow === "chat"` and `status === "running"`, with text input + Send button
+- **SSE real-time updates**: `useSessionEvents(id)` invalidates session query on new events
+- **Confirm dialog**: reusable component for destructive actions
+- **Log panel placeholder**: notes Task 25
+
+### 7. Create Session Page: web/src/pages/new-session.tsx (REWRITTEN)
+Full form implementation with:
+- **RepoPicker component**:
+  - Text input for direct URL entry
+  - Dropdown that fetches repos from `GET /identities/:id/repositories?provider=`
+  - Provider selector (GitHub/GitLab)
+  - Searchable filtered list
+  - Click to select sets clone_url
+- **Form fields**:
+  - Repo URL (with RepoPicker)
+  - Ref (default "main")
+  - Workflow dropdown (Chat, Loop N, Loop Until Sentinel)
+  - Prompt textarea
+  - Conditional fields: Loop N shows N input, Loop Until Sentinel shows sentinel input
+  - Agent CLI dropdown (Claude Code, Cursor)
+  - Model input (optional)
+  - Branch mode radio (Main, PR)
+  - Branch name prefix (shown only in PR mode)
+  - Persona dropdown (fetches from /personas)
+  - Retain forever checkbox
+- **Credential warnings**: shows warning when identity missing git_token or agent_token, links to Settings
+- **Token expiry warning**: shows when git_token_status is expired_needs_reauth
+- **Validation**: repo_url required, prompt required, n > 0 for loop_n, sentinel required for loop_until_sentinel
+- **Submission**: POST /sessions -> navigate to session detail on success
+- **Error display**: form validation errors + API errors
+
+== VERIFICATION ==
+
+### TypeScript
+- `npx tsc --noEmit` - PASS (no errors)
+
+### Vite Build
+- `npx vite build` - PASS
+  - 1830 modules transformed
+  - dist/assets/index-ocKWk2Qt.js 403.53 kB (gzip: 123.39 kB)
+
+### ESLint
+- `npx eslint src/pages/new-session.tsx` - PASS (0 errors after fixing useMemo deps)
+- Pre-existing lint error in button.tsx (react-refresh/only-export-components) - not introduced by this task
+
+### Rust
+- `cargo check -p api-types` - PASS
+- `cargo check -p server` - PASS
+- `cargo test -p api-types` - PASS (36 tests passed)
+
+### Migrations
+- No new migrations needed - `branch` and `commit_ref` columns already exist in initial schema
+- Only change was to the SELECT query and Rust/TS types to expose them
+
+== FILES MODIFIED ==
+
+1. crates/api-types/src/sessions.rs - Added branch, commit_ref to JobSummary + updated test
+2. crates/server/src/routes/sessions.rs - Updated SQL query + tuple destructuring
+3. web/src/lib/types.ts - Added branch, commit_ref to JobSummary interface
+4. web/src/lib/query.ts - Added RepositoryListResponse import, repositories queryKey, useRepositories hook
+5. web/src/pages/dashboard.tsx - Full rewrite with status filter, repo column, proper navigation
+6. web/src/pages/session-detail.tsx - Full rewrite with all features per spec
+7. web/src/pages/new-session.tsx - Full rewrite with complete form + repo picker
