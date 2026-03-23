@@ -1,0 +1,14 @@
+target/
+node_modules/
+.git/
+.gitignore
+*.md
+docs/
+plan/
+logs/
+.env
+.env.*
+!.env.example
+.DS_Store
+web/node_modules/
+web/dist/

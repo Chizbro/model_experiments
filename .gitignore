@@ -1,0 +1,28 @@
+# Rust
+target/
+Cargo.lock
+
+# Node / Web
+web/node_modules/
+web/dist/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+
+# Logs
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+.claude/worktrees/**/*

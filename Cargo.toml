@@ -1,0 +1,27 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+anyhow = "1"
+thiserror = "2"
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json"] }
+reqwest = { version = "0.12", features = ["json"] }
+git2 = "0.19"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+sha2 = "0.10"
+hex = "0.4"
+urlencoding = "2"
+rand = "0.8"
+api-types = { path = "crates/api-types" }
