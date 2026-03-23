@@ -1,0 +1,20 @@
+name: E2E Compose smoke
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly UTC — full image builds; keep off the default PR path (see docs/CICD_DESIGN.md §2.3).
+    - cron: "0 6 * * *"
+
+jobs:
+  compose-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Bust cached `RUN cargo build` layers so the job always picks up current Rust sources.
+      RH_DOCKER_SRC_TS: ${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compose smoke (stub agent + file remote)
+        run: ./scripts/compose-smoke.sh

@@ -1,0 +1,6 @@
+/target
+.compose-smoke-fixture/
+web/node_modules
+web/dist
+.env
+.env.local

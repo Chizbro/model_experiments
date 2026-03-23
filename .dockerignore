@@ -1,0 +1,10 @@
+target
+.git
+.gitignore
+web/node_modules
+web/dist
+logs
+plan
+prompts
+*.md
+!README.md

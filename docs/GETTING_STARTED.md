@@ -123,6 +123,8 @@ cargo run -p cli -- identity repos default --provider github
 
 Or `~/.config/remote-harness/config.yaml` with `control_plane_url` and `api_key`. Run `cargo run -p cli -- config show` to see resolved values and which source won (CLI → env → file).
 
+**End-to-end CLI smoke (local):** with the control plane up, run `./scripts/e2e_cli.sh` from the repo root. It exercises the shipped subcommands in order, uses `api-key bootstrap` when no working key is in the environment (only if the server allows bootstrap), and tears down the session and worker it creates. Override session fields with `E2E_REPO_URL`, `E2E_AGENT_CLI` (`cursor` or `claude_code`), `E2E_PROMPT`, and `E2E_IDENTITY_ID` if needed.
+
 The Web UI **Identities (BYOL)** section calls the same endpoints once you paste an API key.
 
 Sessions and logs use the same API from CLI and Web (`session …`, **Logs** section in the dev UI). The server exposes SSE log tail and session events (`docs/SSE_EVENTS.md`); CLI/Web streaming UX is covered in later plan tasks.
